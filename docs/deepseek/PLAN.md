@@ -50,10 +50,38 @@ be measured), one V100 32 GB, weights from an **MXFP4 GGUF**. Consequences:
   whole 289 GB.
 - **CPU kernels: AVX-512 + VNNI (`vpdpbusd`), no VBMI** (Cascade Lake). MXFP4 needs a nibble → int8 lookup
   (`vpshufb` on 4-bit indices), which AVX-512BW has; AVX2 fallback for other machines.
-- **NUMA from day one.** Each expert's rows are split between the sockets (w1/w3: 1152 rows each, w2: 2560 rows
-  each), each socket's workers compute only their local half, and the 2304-float intermediate is exchanged once
-  per expert. Every miss is then computed by both sockets in parallel at local bandwidth, with no load imbalance
-  from which experts a token routes to. `numactl --interleave=all` is the measured baseline it has to beat.
+- **NUMA and the GPU's socket, from day one** (Dell Precision 7920, 2x Xeon Gold 6226: 12 cores each, 6 channels
+  each; the user measures **90-120 GB/s**, under half of the ~256 GB/s theoretical — the signature of reads
+  crossing the UPI link, which carries roughly 40 GB/s per direction on this platform; confirm with Intel MLC
+  `mlc --bandwidth_matrix`, which prints local vs remote bandwidth per node pair).
+
+  Who moves how many bytes per token decides the layout:
+
+  | Traffic | Bytes per token (h = 0.5) | Bound |
+  |---|---|---|
+  | CPU cores reading missed experts | **~2.3 GB** | DRAM / UPI |
+  | GPU cache promotions (adaptive swaps) | rate-limited, ~0.2 GB/s | PCIe Gen3 (~12 GB/s) |
+  | activations / expert results CPU ↔ GPU | 40 layers × ~20 KB | latency |
+  | Engram rows | 48 × 136 B (+ page reads on a miss) | SSD / page cache |
+
+  So the cross-socket traffic that matters is the CPU's own expert reads, not the GPU's. The layout:
+  1. **Detect the GPU's node** at start (`/sys/bus/pci/devices/<bdf>/numa_node` from `cudaDeviceGetPCIBusId`;
+     `nvidia-smi topo -m` shows the same) and the NVMe drive's (`/sys/block/nvme*/device/numa_node`).
+  2. **GPU-node duties:** the host thread that drives the GPU, the page-locked staging pool for cache fills, the
+     mapped doorbell/activation buffers, and the PCIe-fed queue of promotion candidates live on the GPU's socket;
+     Engram I/O threads on the drive's socket.
+  3. **Experts are row-split across both sockets** (w1/w3: 1152 rows each, w2: 2560 rows each): each socket's
+     workers compute only their local half and the 2304-float intermediate is exchanged once per expert. Every
+     miss is computed by both sockets at local bandwidth, with no UPI traffic for compute and no imbalance from
+     which experts a token routes to.
+  4. **"Secondary hot" experts next to the GPU** (the user's idea): putting the next-hottest experts *only* on the
+     GPU's socket would send most CPU misses to that one socket — half the box's bandwidth doing most of the work
+     while the other socket idles — so it loses to (3) for compute. Where GPU-locality does pay is the bytes that
+     go to the GPU: promotions into VRAM and any misses the GPU fetches itself (`--pcie-frac`). With (3) half of
+     such a copy crosses UPI, at no more than PCIe Gen3's ~12 GB/s and only while it lasts. Option, off by
+     default and measured before it is kept: a full extra copy of the top promotion candidates on the GPU's node,
+     paid for in RAM that otherwise caches Engram.
+  5. Baseline to beat: `numactl --interleave=all` (no code change).
 - **Which GGUF:** DS-B reads GGUF (Strata already has a reader) as the primary input and the official safetensors
   as the reference. MXFP4 experts are GGML MXFP4 in every published GGUF, but tensor names and the Engram table's
   format differ between them (Q8_0, FP8, Q5_K...). **Needed from you: the Hugging Face repo (or file names) of
@@ -83,7 +111,7 @@ the artifact, refuse rather than mis-index), sharing the model-agnostic infrastr
 | DS-A oracle | `ref/ds41/` | numpy reference of every op (router, expert with clamps, MXFP4/FP8 dequant, RMSNorm 1e-20, partial RoPE + YaRN + inverse, MQA with sink over window + selection, compressor r1/r2, indexer + top-k + candidate pool, mHC incl. single-pass lag, Engram normaliser/hash/combine, block forward) | unit tests against the vendored **official torch code** on small random shapes (CPU torch); Engram primes sum to `engram_num_embeddings` |
 | DS-B pack | `tools/ds41/` | stdlib safetensors reader; pack layout (expert blobs w1·w3·w2 + scales, aligned; dense tensors as stored; Engram mapped in place via an index); converter with `--dry-run` that plans the whole pack from `tensors.json.gz`; validator | dry-run on the vendored inventory; byte totals = 510,286,023,000; round-trip on a synthetic mini-checkpoint |
 | DS-C CPU experts | `src/ds41/cpu/`, `include/strata/ds41/` | MXFP4 expert kernel (gate/up 5120→2304, clamp-SwiGLU, down) AVX-512 / AVX2 / scalar, single- and multi-token, Q8 activations | parity vs the numpy oracle and a scalar fp64 path; GB/s microbenchmark (this CPU; re-run on the Xeon) |
-| DS-D GPU hot experts | `src/ds41/cuda/`, `include/strata/ds41/` | sm_70 MXFP4 grouped GEMV for cached experts (dp4a + int8 LUT), sqrtsoftplus/noaux router (top-6, renorm, ×1.5), hit/miss split on `ExpertCache` residency | `compile_one.py` (no spills, no traps); GPU parity program for the V100 |
+| DS-D GPU hot experts | `src/ds41/cuda/`, `include/strata/ds41/` | sm_70 MXFP4 grouped GEMV for cached experts — two candidates benchmarked against each other on the V100: dp4a + int8 LUT (scales in fp32) and an m8n8k4 tensor-core GEMV after 1Cat-vLLM's `mxfp4_qpn_m1_sm70` (reimplemented; see `docs/volta/NINFER_STUDY.md`) — one launch for all hit experts with device-side ids; sqrtsoftplus/noaux router (top-6, renorm, ×1.5); hit/miss split on `ExpertCache` residency | `compile_one.py` (no spills, no traps); GPU parity program for the V100 |
 
 **DS-1 — one correct token.** FP8-block GEMV (dequant in registers), MQA attention decode (window + selected
 compressed KV, sink), compressor/indexer (exact top-k by brute force first), mHC, Engram (RAM-resident first),

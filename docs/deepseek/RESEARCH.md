@@ -177,3 +177,49 @@ All-miss worst case: 240 expert reads/token × 18.8 MB = 4.51 GB/token.
 High for §1-6 (primary files; the totals reproduce HF's parameter and byte counts). Medium for everything
 tagged [3RD]. UNVERIFIED: any V4.1-on-V100 measurement, fp16 range safety of V4.1 activations, hit rates at ~1,000
 residents, quality of re-quantised Engram tables.
+
+## 10. The GGUF this port targets: `mxxm-t/DeepSeek-V4.1-Flash-GGUF` (MXFP4) [PRIMARY: its shard headers]
+
+Read 2026-10-01 from the 12 shard headers and the DSpark sidecar by HTTP range requests
+(`tools/ds41_gguf_remote_headers.py`); the parsed headers are kept in
+`third_party/deepseek-v41-flash-reference/gguf-headers-mxxm-t-MXFP4.json.gz` (and the vcruz305 Q2_K ones beside it).
+
+- 375.8 GiB in 12 shards + `DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf` (7.43 GiB, `general.architecture = dflash`).
+  Built for the `mx-llama.cpp` fork; text only (no vision). MIT.
+- `general.architecture = deepseek41`; 1,006 tensors. **Every constant the port needs is in the metadata**: the
+  CSA2 layer maps (`attention.compress_ratios`, `kv_source_layer_ids`, `index_source_layer_ids`,
+  `candidate_*`), mHC (`hyper_connection.count/sinkhorn_iterations/epsilon`), and Engram's `primes` (48),
+  `offsets` (48), `multipliers` (8) and `token_map` (129,280 → compressed ids) — so the tokenizer normaliser does
+  not have to be re-implemented, only checked against `engram.py`.
+- Types (per block `N` unless stated):
+
+| Tensor | Type | ggml dims (ne0, ne1[, ne2]) | Notes |
+|---|---|---|---|
+| `ffn_gate_exps` / `ffn_up_exps` | **MXFP4** | 5120, 2304, 384 | expert e = slice e: 2304 rows × 160 blocks × 17 B = 6,266,880 B |
+| `ffn_down_exps` | **MXFP4** | 2304, 5120, 384 | 5120 rows × 72 blocks × 17 B = 6,266,880 B → **18,800,640 B per expert** |
+| `ffn_{gate,up,down}_shexp` | Q8_0 | 5120×2304 / 2304×5120 | shared expert |
+| `ffn_gate_inp` | BF16 | 5120, 384 | router; `exp_probs_b.bias` F32 [384] (no `_vl` bias: no vision) |
+| `attn_q_a` / `attn_q_b` | Q8_0 | 5120×1280 / 1280×32768 | `attn_q_a_norm` F32 [1280] |
+| `attn_kv` | Q8_0 | 5120×512 | `attn_kv_a_norm` F32 [512]; the SWA KV projection |
+| `attn_output_a` / `attn_output_b` | Q8_0 | 4096×8192 / 8192×5120 | grouped wo_a: 8 groups × (4096 → 1024) |
+| `attn_sinks` | F32 | 64 | |
+| `attn_compressor_{kv,gate,norm}` | BF16/F32 | 5120×512 | kv+norm on L2/8/14/20, gate on L2/8/14 (ratio 2) |
+| `indexer.attn_q_b` / `indexer.proj` | Q8_0 / BF16 | 1280×4096 / 5120×32 | on the 8 indexer layers |
+| `indexer_compressor_{kv,norm}` | BF16/F32 | 512×128 | index-K from the compressed latent (L2/8/14/20) |
+| `hc_{attn,ffn}_{fn,base,scale}` | F32 | 20480×24, 24, 3 | mHC |
+| `engram_embed` (L1, L14) | **MXFP4** | 256 × 384,006,168 / 384,016,682 | 8 blocks × 17 B = **136 B per row**; 52.2 GB per table |
+| `engram_wkv` / `engram_{q,k}` | Q8_0 / BF16 | 6144×25600 / 5120×4 | |
+| `token_embd` / `output` | BF16 | 5120 × 129,280 | 1.32 GB each |
+
+- **Format notes for the port.** The FP8 tensors were dequantised and stored as **Q8_0** (lossless to ~8 bits;
+  good for Volta: dp4a kernels exist). The routed experts are a lossless re-pack of DeepSeek's FP4. **The Engram
+  tables are MXFP4, not DeepSeek's FP8** — a lossy re-quantisation by the GGUF's author (effect UNVERIFIED; the
+  reference oracle can measure it per row). Per token Engram reads 48 rows × 136 B.
+- **vcruz305/DeepSeek-V4.1-Flash-GGUF** (Q2_K…Q8_0, no MXFP4) uses the same architecture and shapes but differs in
+  names (`engram_embd`, `indexer.attn_k`/`indexer.k_norm` for `indexer_compressor_{kv,norm}`, extra
+  `exp_probs_b_vl`) and metadata keys (no CSA2 layer maps; `engram.head_count/key_length/pad_id`). The pack tool
+  accepts both spellings; only mxxm-t's has MXFP4 experts.
+
+**Memory on the target box (384 GB):** experts 288.8 GB (268.9 GiB) + Engram 104.4 GB (97.3 GiB) = 393 GB — just
+over. With the experts resident and ~10 GiB for the OS and engine, ~80 % of Engram stays in the page cache; the
+rest is read from the SSD (the GGUF author measured NVMe ≈ 2× SATA for prompt processing).

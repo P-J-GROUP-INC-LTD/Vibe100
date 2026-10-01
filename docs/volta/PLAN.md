@@ -64,8 +64,10 @@ Candidate Phase-3 kernel work, only if the profile shows it: Volta HMMA version 
 
 ### The target box's CPU side (from the user, 2026-10-01)
 
-Dual Intel Xeon **Cascade Lake**, 24 DIMM slots, **384 GB DDR4-2666** (Cascade Lake-SP has 6 channels per socket:
-12 channels, 2 DIMMs each, ≈ 256 GB/s theoretical, ~100 GB/s per socket in practice — to be measured). Two facts
+Dell Precision 7920, 2x Xeon **Gold 6226** (Cascade Lake, 12 cores each), 24 DIMM slots, **384 GB DDR4-2666**
+(6 channels per socket: 12 channels, 2 DIMMs each, ≈ 256 GB/s theoretical; **measured 90-120 GB/s** — likely
+reads crossing the UPI link; Phase 0 runs `mlc --bandwidth_matrix` and `nvidia-smi topo -m` to see local vs
+remote bandwidth and which socket the V100 hangs off). Two facts
 from the source that matter on this box, both CPU-side and independent of the GPU port:
 
 1. **Strata's own AVX-512 expert kernels are off on Cascade Lake.** `cpu_avx512_ok()` requires AVX512-VBMI
