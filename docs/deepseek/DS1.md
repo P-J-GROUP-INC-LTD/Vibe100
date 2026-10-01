@@ -117,3 +117,11 @@ the mini model; the real-model half of the gate needs the owner's box (runbook s
   `ds41_mhc_gpu_test` / `ds41_engram_gpu_test --golden <build>/ds1d_golden` (after `ctest -R ds1d_golden`) are not in ctest: add them to
   `tools/volta/run_parity.sh` and runbook step 9c. Known benign difference: the combine's dot can give +0.0 where numpy gives -0.0 for an
   all-zero key.
+- **DS1-A done** (2424de7): `Ds41Model<G>::load(dev, shard, LoadOptions)` in `include/strata/ds41/model/model.hpp` (config + role map,
+  `weights.at(l)` of `DevTensor{p, nbytes, type, ne0..2}`, head / output_norm on the device, `token_embd` mapped with `token_row_f32`,
+  Engram tables mapped, CPU arena `arena.half(h, l, e)`, GPU cache `slots()` / `residency()` (-1 initialised) / `fill_*` / `evict`,
+  `DeviceRope`, `engram_constants_as<T>`). `ds41_model_info <shard>` prints config, role map, tensor validation and the memory plan: run it
+  first on the box. Real plan: dense 8.33 GiB on the GPU, 1,121 cache slots, experts 268.95 GiB (134.47 per socket), Engram 98.6 % cached.
+  Open: `Dev` has no memory query and `CudaDev` exits on a failed `cudaMalloc` (pass the VRAM total in `LoadOptions.plan.vram_total`; add
+  `Dev::mem_info()` in DS1-E); KV is 6,400 B/token with FP32 caches; Q8_0 blocks are 34 B, so every other block's int8 payload is
+  2 mod 4 aligned (DS1-B's dp4a loads realign; told).
