@@ -19,6 +19,13 @@ The brief planned for a "DeepSeek-family" model (MLA, DSA, no SSD table). The re
 
 The brief's principles stand: correctness before speed, change one variable at a time, gates.
 
+**Decided (2026-10-01): the routed experts run in MXFP4** — the format DeepSeek released them in, so the experts are
+used bit for bit as trained, with no re-quantisation step and no quality question to measure. Every expert kernel
+(CPU and GPU), the pack layout and the cache sizing target exactly one format: per expert, `w1`/`w3` as 2304 rows of
+2560 packed e2m1 bytes + 160 E8M0 scales, `w2` as 5120 rows of 1152 bytes + 72 scales — 18,800,640 bytes, identical
+to GGML's MXFP4 blocks (17 bytes per 32 values), so an MXFP4 GGUF of the experts maps onto the same kernels.
+Q4_K / Q2_K / i-quant experts are out of scope.
+
 ## 2. Memory map on one V100 32 GB + host RAM
 
 | Where | What | Size |
@@ -32,7 +39,9 @@ The brief's principles stand: correctness before speed, change one variable at a
 | CPU | computes missed experts in place (AVX-512/AVX2 MXFP4 kernels), overlapped with the GPU | |
 
 With less RAM than ~520 GB, the routed experts use Strata 0.1.31's RAM-budget + file tier with routing prefetch
-(`--resident-budget-gib`) and Engram stays on SSD. **Needed from you: RAM size, CPU model (AVX-512? VNNI?), SSD.**
+(`--resident-budget-gib`) and Engram stays on SSD. MXFP4 fixes the expert footprint at 288.8 GB, so RAM below
+~300 GB means some experts are read from the SSD on a miss. **Needed from you: RAM size, CPU model (AVX-512?
+VNNI?), SSD, and whether the weights come from the official safetensors or an MXFP4 GGUF (which one).**
 
 Decode budget [estimate, from RESEARCH §6-7]: GPU reads ≈ 7.2 GB of dense weights + 240·h × 18.8 MB of hit
 experts per token (≈ 10-11 ms at 900 GB/s); CPU reads 240·(1-h) × 18.8 MB (h = 0.5 → 2.26 GB → 16.5 ms at
