@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "dense_dev.cuh"
+#include "ds41_math.cuh"                      // DS-D: dev::quantize_block_warp (the activation quantiser, shared with the expert path)
 #include "strata/ds41/cuda/dense.hpp"
 
 namespace strata::ds41::cuda::dense {
@@ -36,16 +37,6 @@ inline constexpr int kTopMaxK = 64;
 // =====================================================================================================================================================
 // kernels
 // =====================================================================================================================================================
-
-// ---- the activation quantiser (natural order): one warp per (token, 32-block) ----------------------------------------------------------------------
-DS41_KERNEL DS41_LAUNCH_BOUNDS(kThreads) void quantize_kernel(const float* DS41_RESTRICT x, int T, int nb, int8_t* DS41_RESTRICT xq, float* DS41_RESTRICT xs) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int gw = blockIdx.x * kNW + warp;
-    if (gw >= T * nb) return;                              // warp-uniform
-    const int t = gw / nb, b = gw - t * nb;
-    const float v = dev::ldgf(x + (size_t) t * nb * 32 + (size_t) b * 32 + lane);
-    quantize_block_nat(v, lane, xq + ((size_t) t * nb + b) * 32, xs + (size_t) t * nb + b);
-}
 
 // ---- Q8_0 super-block helpers ------------------------------------------------------------------------------------------------------------------
 /// The 68 words of super-block data of one row: `nblk` (1..8) blocks starting at `p`.  FAST: p is 16-byte aligned and the super-block is complete: 17 LDG.128.
@@ -464,7 +455,7 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(kThreads) void swiglu_kernel(float* g, const floa
         const int t = gw / nb, b = gw - t * nb;
         const size_t i = (size_t) t * width + (size_t) b * 32 + lane;
         const float h = swiglu_h(dev::ldgf(g + i), dev::ldgf(u + i), limit);
-        quantize_block_nat(h, lane, hq + ((size_t) t * nb + b) * 32, hs + (size_t) t * nb + b);
+        dev::quantize_block_warp<false>(h, lane, hq + ((size_t) t * nb + b) * 32, hs + (size_t) t * nb + b);   // DS-D's quantiser, natural order
     }
 }
 
@@ -737,20 +728,6 @@ inline bool q8_fast_ok(const void* w, int k) { return k % 256 == 0 && reinterpre
 namespace strata::ds41::cuda {
 
 template <class G>
-void ds41_dense_quantize(Dev& dev, const float* x, int T, int width, int8_t* xq, float* xs, Stream stream) {
-    static_assert(geom_ok<G>(), "G violates the kernel constraints of geom.hpp");
-    if (T < 1 || width < 32 || width % 32 != 0) throw std::invalid_argument("ds41_dense_quantize: need T >= 1 and width a positive multiple of 32");
-    dense::check_ptr(x, 4, "x");
-    dense::check_ptr(xq, 16, "xq");
-    dense::check_ptr(xs, 4, "xs");
-    stream = stream_or_default(dev, stream);
-    const int nb = width / 32;
-    const unsigned grid = (unsigned) (((size_t) T * nb + dense::kNW - 1) / dense::kNW);
-    dev::launch(dense::quantize_kernel, dim3(grid), dim3(dense::kThreads), 0, stream, x, T, nb, xq, xs);
-    dev::check_launch("ds41_dense_quantize");
-}
-
-template <class G>
 void ds41_gemv_q8_int8_pair(Dev& dev, const void* w_a, const void* w_b, int n, int k, const int8_t* xq, const float* xs, int T, float* y_a, float* y_b, Stream stream) {
     static_assert(geom_ok<G>(), "G violates the kernel constraints of geom.hpp");
     dense::check_q8_args(n, k, T, "gemv_q8_int8");
@@ -937,7 +914,7 @@ void ds41_shared_expert(Dev& dev, const SharedExpertWeights& w, const float* x, 
     if (T < 1) throw std::invalid_argument("ds41_shared_expert: T < 1");
     stream = stream_or_default(dev, stream);
     if (int8_act) {
-        ds41_dense_quantize<G>(dev, x, T, G::kHidden, s.xq, s.xs, stream);
+        ds41_quantize_acts<G>(dev, x, T, G::kHidden, s.xq, s.xs, stream, ActOrder::kNatural);       // DS-D / DS1-G's quantiser, plain per-32 layout
         ds41_shared_expert_q<G>(dev, w, s.xq, s.xs, T, y, s, swiglu_limit, stream);
     } else {
         ds41_gemv_q8_f32<G>(dev, w.w1, G::kFF, G::kHidden, x, T, s.g, stream);
@@ -1008,7 +985,6 @@ void ds41_f32_scale(Dev& dev, const float* a, float s, int n, float* out, Stream
 /// Explicit instantiation of every host entry point for geometry G (dense.cu: RealGeom; dense_emu_impl.cpp: RealGeom and MiniGeom).
 #define DS41_INSTANTIATE_DENSE(G)                                                                                                                        \
     namespace strata::ds41::cuda {                                                                                                                       \
-    template void ds41_dense_quantize<G>(Dev&, const float*, int, int, int8_t*, float*, Stream);                                                         \
     template void ds41_gemv_q8_int8<G>(Dev&, const void*, int, int, const int8_t*, const float*, int, float*, Stream);                                   \
     template void ds41_gemv_q8_int8_pair<G>(Dev&, const void*, const void*, int, int, const int8_t*, const float*, int, float*, float*, Stream);        \
     template void ds41_gemv_q8_f32<G>(Dev&, const void*, int, int, const float*, int, float*, Stream);                                                   \

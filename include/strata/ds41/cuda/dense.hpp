@@ -22,7 +22,7 @@
 //  * Q8_0 weights are read VERBATIM as the GGUF stores them: blocks of 34 bytes = fp16 d + 32 int8 (no padding between blocks or rows; row r starts at
 //    r * (k / 32) * 34).  fp16 -> FP32 is exact (zero, subnormals, Inf, NaN).
 //  * INT8-ACTIVATION GEMV (the `linear(act_quant=True)` sites: wq_a, wq_b, wkv, wo_b, the shared expert, indexer.wq_b, engram.wkv): the input is quantised
-//    by CONTRACTS.md's rule (ds41_dense_quantize, or DS-D's ds41_quantize_acts<G>(..., ActOrder::kNatural): the same bits); per 32-block b the integer
+//    by CONTRACTS.md's rule (DS-D's ds41_quantize_acts<G>(..., ActOrder::kNatural)); per 32-block b the integer
 //    dot sum_j wq*xq is EXACT (dp4a) and the FP32 accumulation is   acc = fma(d_w * d_x, float(isum), acc)   (the rule of DS-D's expert kernels).  Order:
 //    a row has S = ceil(k / 256) "super-blocks" of 8 blocks; P = min(32, next power of two >= S) lanes share a row, lane l takes super-blocks l, l + P, ...
 //    and adds their blocks in increasing order into one accumulator, then the P lanes are summed by the xor butterfly (offsets P/2 .. 1).
@@ -50,6 +50,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "strata/ds41/cuda/ds41_cuda.hpp"   // ActOrder, ds41_quantize_acts<G>, Dev
 #include "strata/ds41/cuda/ds41_dev.hpp"
 #include "strata/ds41/geom.hpp"
 
@@ -61,15 +62,14 @@ inline constexpr int kQ8BlockBytes = 34;     // fp16 d + 32 int8
 constexpr size_t q8_row_bytes(int k) { return (size_t) (k / kQ8Block) * kQ8BlockBytes; }
 inline constexpr int kDenseMaxT = 8;         // the tested window; any T >= 1 works (more token tiles)
 
-// ---- the activation quantiser, natural byte order -------------------------------------------------------------------------------------------
-/// x fp32 [T][width] -> xq int8 [T][width/32][32] (byte j of block b = element 32 b + j), xs fp32 [T][width/32]; CONTRACTS.md's rule bit for bit (ties to
-/// even, d = NaN for a non-finite block, 0 for amax < 2^-100).  Bit-identical to ds41_quantize_acts<G>(..., ActOrder::kNatural) (DS-D / DS1-G): this is the
-/// local adapter the shared expert and the tests use; the integrator may call either.  width a multiple of 32; x 16-byte aligned (4 if width % 4 == 0 fails).
-template <class G>
-void ds41_dense_quantize(Dev& dev, const float* x, int T, int width, int8_t* xq, float* xs, Stream stream = nullptr);
+// ---- the activation quantiser: DS-D / DS1-G's -------------------------------------------------------------------------------------------------
+// The int8 GEMVs take x ALREADY QUANTISED in the natural per-32 layout: ds41_quantize_acts<G>(dev, x, T, width, xq, xs, stream, ActOrder::kNatural) of
+// ds41_cuda.hpp (xq int8 [T][width/32][32], byte j of block b = element 32 b + j; xs fp32 [T][width/32]; CONTRACTS.md's rule bit for bit).  One call per input,
+// shared by every GEMV that reads the same input.  This package has no quantiser of its own: the shared expert and its tests call that one (link
+// strata_ds41_cuda, or compile src/ds41/cuda/ds41_emu_impl.cpp into an emulated program).
 
 // ---- Q8_0 GEMV --------------------------------------------------------------------------------------------------------------------------------
-/// Y[T][n] = X[T][k] . W^T, W = n rows of k values in GGUF Q8_0 blocks, X given as the natural-order quantised activations (xq / xs as above).
+/// Y[T][n] = X[T][k] . W^T, W = n rows of k values in GGUF Q8_0 blocks, X given as the natural-order quantised activations (xq / xs of ds41_quantize_acts).
 /// k, n >= 1, k a multiple of 32.  y[t * n + row].
 template <class G>
 void ds41_gemv_q8_int8(Dev& dev, const void* w, int n, int k, const int8_t* xq, const float* xs, int T, float* y, Stream stream = nullptr);
@@ -182,22 +182,22 @@ struct SharedExpertScratch {
     float* hs = nullptr;    // [T][kFF / 32]
 };
 namespace detail {
-constexpr size_t up256(size_t v) { return (v + 255) & ~(size_t) 255; }
+constexpr size_t dense_up256(size_t v) { return (v + 255) & ~(size_t) 255; }
 }
 template <class G>
 constexpr size_t shared_expert_scratch_bytes(int T) {
-    return detail::up256((size_t) T * G::kHidden) + detail::up256((size_t) T * (G::kHidden / 32) * 4) + 2 * detail::up256((size_t) T * G::kFF * 4) +
-           detail::up256((size_t) T * G::kFF) + detail::up256((size_t) T * (G::kFF / 32) * 4);
+    return detail::dense_up256((size_t) T * G::kHidden) + detail::dense_up256((size_t) T * (G::kHidden / 32) * 4) + 2 * detail::dense_up256((size_t) T * G::kFF * 4) +
+           detail::dense_up256((size_t) T * G::kFF) + detail::dense_up256((size_t) T * (G::kFF / 32) * 4);
 }
 template <class G>
 inline SharedExpertScratch shared_expert_scratch_carve(void* base, int T) {
     auto* p = static_cast<unsigned char*>(base);
     SharedExpertScratch s;
-    s.xq = reinterpret_cast<int8_t*>(p), p += detail::up256((size_t) T * G::kHidden);
-    s.xs = reinterpret_cast<float*>(p), p += detail::up256((size_t) T * (G::kHidden / 32) * 4);
-    s.g = reinterpret_cast<float*>(p), p += detail::up256((size_t) T * G::kFF * 4);
-    s.u = reinterpret_cast<float*>(p), p += detail::up256((size_t) T * G::kFF * 4);
-    s.hq = reinterpret_cast<int8_t*>(p), p += detail::up256((size_t) T * G::kFF);
+    s.xq = reinterpret_cast<int8_t*>(p), p += detail::dense_up256((size_t) T * G::kHidden);
+    s.xs = reinterpret_cast<float*>(p), p += detail::dense_up256((size_t) T * (G::kHidden / 32) * 4);
+    s.g = reinterpret_cast<float*>(p), p += detail::dense_up256((size_t) T * G::kFF * 4);
+    s.u = reinterpret_cast<float*>(p), p += detail::dense_up256((size_t) T * G::kFF * 4);
+    s.hq = reinterpret_cast<int8_t*>(p), p += detail::dense_up256((size_t) T * G::kFF);
     s.hs = reinterpret_cast<float*>(p);
     return s;
 }
@@ -209,7 +209,7 @@ inline SharedExpertScratch shared_expert_scratch_carve(void* base, int T) {
 template <class G>
 void ds41_shared_expert(Dev& dev, const SharedExpertWeights& w, const float* x, int T, float* y, const SharedExpertScratch& scratch, bool int8_act = true,
                         float swiglu_limit = 10.0f, Stream stream = nullptr);
-/// The int8 mode starting from x already quantised in the NATURAL order (xq / xs of ds41_dense_quantize / ds41_quantize_acts<G>(..., kNatural), width kHidden);
+/// The int8 mode starting from x already quantised in the NATURAL order (xq / xs of ds41_quantize_acts<G>(..., ActOrder::kNatural), width kHidden);
 /// scratch.xq / xs are not used.
 template <class G>
 void ds41_shared_expert_q(Dev& dev, const SharedExpertWeights& w, const int8_t* xq, const float* xs, int T, float* y, const SharedExpertScratch& scratch,
