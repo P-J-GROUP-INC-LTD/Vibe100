@@ -1,5 +1,10 @@
-# DS-D (GPU hot experts + router): the sm_70 (V100) kernels for DeepSeek-V4.1-Flash and their parity programs.
+# DS-D / DS1-G (GPU hot experts + router): the sm_70 (V100) kernels for DeepSeek-V4.1-Flash and their parity programs.
 # Included by the top-level CMakeLists.txt (cmake/ds41_*.cmake).
+#
+# Every kernel and host entry point is a template over the geometry policy G (include/strata/ds41/geom.hpp).  The nvcc library instantiates RealGeom
+# (the engine's geometry); the emulator build below instantiates RealGeom and MiniGeom (the tiny model of tools/ds41/make_mini_gguf.py), and the
+# ds41_cuda_emu_mini_* tests run every suite at MiniGeom's shapes in seconds.  Shared helper headers other packages include without kernels:
+# include/strata/ds41/cuda/ds41_dev.hpp (Dev, HostDev), ds41_cuda_runtime.hpp (CudaDev), ds41_cuda.hpp (the quantiser, the router / split / expert API).
 #
 #   strata_ds41_cuda            static library: router (logits GEMV / token-looping prefill kernel / top-6), hit-miss split, MXFP4 hit experts
 #                               (activation quantiser, gate/up, down).  Needs STRATA_ENABLE_CUDA; built for CMAKE_CUDA_ARCHITECTURES
@@ -51,11 +56,20 @@ if(NOT WIN32)
     add_test(NAME ds41_cuda_emu_selftest COMMAND ds41_cuda_emu_test --emu)
     add_test(NAME ds41_cuda_emu_selftest_reverse COMMAND ds41_cuda_emu_test --emu --order reverse)
     add_test(NAME ds41_cuda_emu_selftest_shuffle COMMAND ds41_cuda_emu_test --emu --order shuffle:4)
+    # the same suites at MiniGeom's shapes (--geom mini: hidden 256, 16 experts, top-2; the full test sets, seconds each), in all three orders
+    set(_ds41_emu_mini_tests "")
+    foreach(_suite IN ITEMS router split experts quant)
+      add_test(NAME ds41_cuda_emu_mini_${_suite} COMMAND ds41_cuda_emu_test --geom mini --${_suite})
+      add_test(NAME ds41_cuda_emu_mini_${_suite}_reverse COMMAND ds41_cuda_emu_test --geom mini --${_suite} --order reverse)
+      add_test(NAME ds41_cuda_emu_mini_${_suite}_shuffle COMMAND ds41_cuda_emu_test --geom mini --${_suite} --order shuffle:5)
+      list(APPEND _ds41_emu_mini_tests ds41_cuda_emu_mini_${_suite} ds41_cuda_emu_mini_${_suite}_reverse ds41_cuda_emu_mini_${_suite}_shuffle)
+    endforeach()
     set(_ds41_emu_tests ds41_cuda_emu_router ds41_cuda_emu_split ds41_cuda_emu_experts ds41_cuda_emu_quant ds41_cuda_emu_router_reverse
         ds41_cuda_emu_split_reverse ds41_cuda_emu_experts_reverse ds41_cuda_emu_quant_reverse ds41_cuda_emu_router_shuffle
         ds41_cuda_emu_split_shuffle ds41_cuda_emu_quant_shuffle ds41_cuda_emu_selftest ds41_cuda_emu_selftest_reverse
         ds41_cuda_emu_selftest_shuffle)
-    set_tests_properties(${_ds41_emu_tests} PROPERTIES PASS_REGULAR_EXPRESSION "ALL PASS" FAIL_REGULAR_EXPRESSION "FAIL ")
+    set_tests_properties(${_ds41_emu_tests} ${_ds41_emu_mini_tests} PROPERTIES PASS_REGULAR_EXPRESSION "ALL PASS" FAIL_REGULAR_EXPRESSION "FAIL ")
+    set_tests_properties(${_ds41_emu_mini_tests} PROPERTIES TIMEOUT 300)
     set_tests_properties(ds41_cuda_emu_experts ds41_cuda_emu_experts_reverse PROPERTIES TIMEOUT 1800)
   endif()
 endif()
