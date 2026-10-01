@@ -16,8 +16,9 @@ Read first: `docs/deepseek/RESEARCH.md` (§1-4, §10), `docs/deepseek/CONTRACTS.
 - **Kernels are written once, compiled twice** (DS-D's pattern, `src/ds41/cuda/ds41_dev.cuh`): by nvcc for sm_70, and by the host
   compiler with `-DDS41_EMU` against the emulator (`ds41_emu.hpp`), which runs every GPU thread on the CPU (shared memory poisoned per
   block, block/fiber order forward / reverse / shuffled, alignment asserts). Kernel bodies use only `ds41_dev.cuh` names for intrinsics.
-  Device memory and launches go through DS-D's `Dev` interface (`ds41_parity_lib.hpp`: `CudaDev` / the emulator's), so host code runs
-  unchanged in both builds.
+  Device memory and launches go through the shared `Dev` interface (`include/strata/ds41/cuda/ds41_dev.hpp`: `Dev`, `DevBuf`,
+  `MappedBuf`, `HostDev` = the emulator's device, the `dev::launch` pattern; `ds41_cuda_runtime.hpp`: `CudaDev`), so host code runs
+  unchanged in both builds. The activation quantiser for every int8 GEMV: `ds41_quantize_acts<G>` in `ds41_cuda.hpp` (DS1-G).
 - **The end-to-end test**: `tools/ds41/make_mini_gguf.py` writes a tiny GGUF with the real tensor names, ggml types and metadata keys at
   `MiniGeom`'s shape (8 layers covering every layer role, 2 Engram layers, MXFP4 experts). The oracle loads it
   (`ref/ds41/model.py: model_from_gguf`); the engine (MiniGeom, emulated) loads the same file; per-layer traces are compared (§6).
