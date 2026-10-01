@@ -1020,3 +1020,12 @@ if(STRATA_BUILD_TESTS)
     add_subdirectory(tests)
   endif()
 endif()
+
+# ---- DeepSeek-V4.1 port (docs/deepseek/PLAN.md, docs/deepseek/CONTRACTS.md) --------------------------------------
+# One CMake file per work package (cmake/ds41_*.cmake), so the packages are developed side by side without editing
+# this file; each one guards itself on the backend it needs (CPU-only builds included).
+file(GLOB _strata_ds41_cmake CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ds41_*.cmake)
+list(SORT _strata_ds41_cmake)
+foreach(_strata_ds41_file IN LISTS _strata_ds41_cmake)
+  include(${_strata_ds41_file})
+endforeach()
