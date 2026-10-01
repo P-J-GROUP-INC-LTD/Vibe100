@@ -1,8 +1,10 @@
 // src/ds41/attn/attn_emu_test.cpp - DS1-C: runs the attention kernels and the per-layer driver the V100 runs (src/ds41/cuda/attn_impl.cuh,
 // src/ds41/attn/attn_host_impl.hpp, compiled for the host with -DDS41_EMU: every GPU thread is a fiber, see src/ds41/cuda/ds41_emu.hpp) on the CPU.
 //
-//   ds41_attn_emu_test [--kernels] [--oracle DIR [--scenario NAME]... [--dense ref|real] [--no-extras]] [--order forward|reverse|shuffle[:SEED]] [--seed N]
+//   ds41_attn_emu_test [--kernels] [--oracle DIR [--scenario NAME]... [--dense ref|real] [--no-extras]] [--real-smoke N] [--order forward|reverse|shuffle[:SEED]] [--seed N]
 //
+//   --real-smoke N   the driver at RealGeom shapes with random weights over N positions (plumbing: guard zones, finite outputs, valid top-k rows, T = 1..8 windows
+//               in the reverse scheduling order bit-identical to T = 1); slow (minutes), no oracle
 //   --no-extras skip the bit-identity checks (windows, reset, scheduling orders) that follow the first scenario: a quicker run (the mutation checks use it)
 //   --dense     which AttnDenseOps the replay runs on: `ref` (default) = the plain-C++ FP64-accumulation stand-ins below (independent of every other package);
 //               `real` = Ds41AttnDense<MiniGeom> (attn_dense.hpp): DS1-B's emulated GEMV kernels + DS1-G's activation quantiser (the integration check).
@@ -1266,6 +1268,176 @@ void run_oracle(Dev& dev, const std::string& dir, const std::vector<std::string>
     CHECK(ran > 0, "no golden scenario was run");
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// RealGeom plumbing smoke test: the driver at the real shapes (buffer sizes, strides, 512-wide heads, 64 heads, 32 x 128 indexer) with random weights shared
+// by all layers; no oracle (the kernels are checked at the real shapes above, the stage numerics at MiniGeom).  Checks what a wrong constant would break:
+// no store outside any buffer (the guard zones are verified when the buffers are released), finite outputs, valid top-k rows (ascending, < the compressed
+// length, -1 padded), windows of T = 1..8 and a second scheduling order bit-identical to T = 1.
+// ---------------------------------------------------------------------------------------------------------------------------------
+uint16_t float_to_half(float f) {                                    // round to nearest even, normal range only (the test's scales)
+    const uint32_t b = bits_of(f), s = (b >> 16) & 0x8000u;
+    int e = (int) ((b >> 23) & 0xFF) - 127 + 15;
+    uint32_t m = b & 0x7FFFFFu;
+    if (e <= 0 || e >= 31) return (uint16_t) s;
+    uint32_t h = ((uint32_t) e << 10) | (m >> 13);
+    const uint32_t rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
+    return (uint16_t) (s | h);
+}
+
+void run_real_smoke(Dev& dev, int n_pos) {
+    using G = RealGeom;
+    constexpr int HID = G::kHidden, D = G::kHeadDim, TK = G::kIdxTopK;
+    Ds41LayerRoles roles;
+    roles.compress_ratio = {0, 0, 2, 2, 1, 1, 1, 1};
+    roles.kv_source_layers = {2, 4};
+    roles.index_source_layers = {2, 4, 6};
+    roles.candidate_source_layer = 4;
+    const int nl = (int) roles.compress_ratio.size(), max_ctx = n_pos + 8;
+    Rng rng(77);
+    std::vector<void*> allocs;
+    auto up = [&](const void* data, size_t bytes) {
+        void* p = dev.alloc(bytes + 16);
+        dev.h2d(p, data, bytes);
+        allocs.push_back(p);
+        return p;
+    };
+    auto q8w = [&](int rows, int k) {
+        std::vector<unsigned char> b((size_t) rows * (size_t) (k / 32) * 34);
+        const uint16_t d = float_to_half(1.0f / (73.0f * std::sqrt((float) k)));
+        for (size_t blk = 0; blk < b.size() / 34; ++blk) {
+            std::memcpy(&b[blk * 34], &d, 2);
+            for (int j = 0; j < 32; ++j) b[blk * 34 + 2 + (size_t) j] = (unsigned char) (int8_t) (rng.below(255) - 127);
+        }
+        return static_cast<const void*>(up(b.data(), b.size()));
+    };
+    auto bf16w = [&](int rows, int k) {
+        std::vector<uint16_t> b((size_t) rows * (size_t) k);
+        const float sc = 1.0f / std::sqrt((float) k);
+        for (auto& v : b) v = (uint16_t) (bits_of(rng.normal() * sc) >> 16);
+        return static_cast<const uint16_t*>(up(b.data(), b.size() * 2));
+    };
+    auto f32w = [&](int n, float base, float spread) {
+        std::vector<float> b((size_t) n);
+        for (auto& v : b) v = base + spread * rng.normal();
+        return static_cast<const float*>(up(b.data(), b.size() * 4));
+    };
+    AttnLayerWeights w;
+    w.wq_a = q8w(G::kQLora, HID);
+    w.q_norm = f32w(G::kQLora, 1.0f, 0.1f);
+    w.wq_b = q8w(G::kHeads * D, G::kQLora);
+    w.wkv = q8w(D, HID);
+    w.kv_norm = f32w(D, 1.0f, 0.1f);
+    w.sink = f32w(G::kHeads, 0.0f, 0.5f);
+    w.wo_a = q8w(G::kOGroups * G::kOLora, G::kHeads * D / G::kOGroups);
+    w.wo_b = q8w(HID, G::kOGroups * G::kOLora);
+    {
+        std::vector<float> c((size_t) max_ctx * (G::kRopeDim / 2)), sn(c.size());
+        for (int pos = 0; pos < max_ctx; ++pos)
+            for (int i = 0; i < G::kRopeDim / 2; ++i) {
+                const double a = (double) pos * 0.37 / (1.0 + i * i);
+                c[(size_t) pos * (G::kRopeDim / 2) + i] = (float) std::cos(a);
+                sn[(size_t) pos * (G::kRopeDim / 2) + i] = (float) std::sin(a);
+            }
+        w.rope.cos = static_cast<const float*>(up(c.data(), c.size() * 4));
+        w.rope.sin = static_cast<const float*>(up(sn.data(), sn.size() * 4));
+    }
+    w.comp_wkv = bf16w(D, HID);
+    w.comp_wgate = bf16w(D, HID);
+    w.comp_norm = f32w(D, 1.0f, 0.1f);
+    w.idx_wk = bf16w(G::kIdxDim, D);
+    w.idx_k_norm = f32w(G::kIdxDim, 1.0f, 0.1f);
+    w.idx_wq_b = q8w(G::kIdxHeads * G::kIdxDim, G::kQLora);
+    w.idx_weights_proj = bf16w(G::kIdxHeads, HID);
+    std::vector<std::vector<float>> xs((size_t) n_pos * nl, std::vector<float>(HID));
+    for (auto& x : xs)
+        for (auto& v : x) v = rng.normal();
+
+    TestDense dense;
+    auto make = [&](Ds41Attention<G>& a) {
+        a.init(roles, max_ctx, AttnQuantFlags{}, 1e-20f);
+        for (int l = 0; l < nl; ++l) a.set_weights(l, w);
+    };
+    std::vector<std::vector<float>> ref_out;                  // [pos * nl + l]
+    std::vector<std::vector<int32_t>> ref_tk;
+    {
+        Ds41Attention<G> att(dev, dense);
+        make(att);
+        std::printf("INFO RealGeom attention: %.1f MB of device memory for max_context %d\n", (double) att.device_bytes() / 1e6, max_ctx);
+        DevBuf<float> dx(dev, HID), dout(dev, HID);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int p = 0; p < n_pos; ++p)
+            for (int l = 0; l < nl; ++l) {
+                dev.h2d(dx.p, xs[(size_t) p * nl + l].data(), HID * 4);
+                att.forward(l, dx.p, 1, p, dout.p, nullptr);
+                ref_out.push_back(dout.down());
+                std::vector<int32_t> tk((size_t) TK, -1);
+                const int ratio = roles.compress_ratio[(size_t) l];
+                if (ratio > 0) dev.d2h(tk.data(), att.trace_topk(0), (size_t) TK * 4);
+                ref_tk.push_back(tk);
+                bool finite = true, nonzero = false;
+                for (float v : ref_out.back()) {
+                    finite = finite && std::isfinite(v);
+                    nonzero = nonzero || v != 0.0f;
+                }
+                CHECK(finite && nonzero, "[real] L%d p%d: the output is not finite / is all zero", l, p);
+                if (ratio > 0) {
+                    const int clen = (p + 1) / ratio;
+                    bool ok = true;
+                    int prev = -1, cnt = 0;
+                    for (int i = 0; i < TK; ++i) {
+                        const int v = tk[(size_t) i];
+                        if (v < 0) {
+                            for (int j = i; j < TK; ++j) ok = ok && tk[(size_t) j] < 0;
+                            break;
+                        }
+                        ok = ok && v > prev && v < clen;
+                        prev = v;
+                        ++cnt;
+                    }
+                    ok = ok && cnt == std::min(TK, clen);                // fewer than TK compressed entries exist (n_pos is small): every one is selected, the pool covers them all
+                    CHECK(ok, "[real] L%d p%d: the top-k row is not ascending / < %d / -1 padded (%d entries)", l, p, clen, cnt);
+                }
+            }
+        std::printf("INFO RealGeom: %d layer-steps at T = 1 in %.1f s\n", n_pos * nl, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    // windows of T = 1..8 on a fresh instance, in the reverse scheduling order: bit-identical rows
+    {
+        const auto order0 = ds41_emu::g_order;
+        const auto seed0 = ds41_emu::g_order_seed;
+        ds41_emu::set_order(ds41_emu::Order::kReverse);
+        Ds41Attention<G> att(dev, dense);
+        make(att);
+        DevBuf<float> dx(dev, 8 * HID), dout(dev, 8 * HID);
+        const int pattern[] = {3, 5, 2, 8, 1, 4};
+        int p = 0, wi = 0;
+        long bad = 0, badk = 0;
+        while (p < n_pos) {
+            const int T = std::min(pattern[wi++ % 6], n_pos - p);
+            for (int l = 0; l < nl; ++l) {
+                std::vector<float> xin;
+                for (int t = 0; t < T; ++t) xin.insert(xin.end(), xs[(size_t) (p + t) * nl + l].begin(), xs[(size_t) (p + t) * nl + l].end());
+                dev.h2d(dx.p, xin.data(), xin.size() * 4);
+                att.forward(l, dx.p, T, p, dout.p, nullptr);
+                const auto o = dout.down((size_t) T * HID);
+                for (int t = 0; t < T; ++t) {
+                    bad += std::memcmp(o.data() + (size_t) t * HID, ref_out[(size_t) (p + t) * nl + l].data(), HID * 4) != 0;
+                    if (roles.compress_ratio[(size_t) l] > 0) {
+                        std::vector<int32_t> tk((size_t) TK);
+                        dev.d2h(tk.data(), att.trace_topk(t), (size_t) TK * 4);
+                        badk += tk != ref_tk[(size_t) (p + t) * nl + l];
+                    }
+                }
+            }
+            p += T;
+        }
+        ds41_emu::set_order(order0, seed0);
+        CHECK(bad == 0 && badk == 0, "[real] windows of T = 1..8 in the reverse scheduling order differ from T = 1 (%ld output rows, %ld top-k rows)", bad, badk);
+    }
+    for (void* p : allocs) dev.release(p);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1274,12 +1446,14 @@ int main(int argc, char** argv) {
     std::vector<std::string> only;
     uint64_t seed = 1;
     bool real_dense = false, extras = true;
+    int real_smoke = 0;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--kernels")) kernels = true;
         else if (!std::strcmp(argv[i], "--oracle") && i + 1 < argc) oracle_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--scenario") && i + 1 < argc) only.push_back(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--no-extras")) extras = false;
+        else if (!std::strcmp(argv[i], "--real-smoke") && i + 1 < argc) real_smoke = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--dense") && i + 1 < argc) {
             const std::string v = argv[++i];
             if (v != "ref" && v != "real") {
@@ -1294,11 +1468,11 @@ int main(int argc, char** argv) {
                 return 2;
             }
         } else {
-            std::printf("usage: ds41_attn_emu_test [--kernels] [--oracle DIR [--scenario NAME]... [--dense ref|real] [--no-extras]] [--order forward|reverse|shuffle[:SEED]] [--seed N]\n");
+            std::printf("usage: ds41_attn_emu_test [--kernels] [--oracle DIR [--scenario NAME]... [--dense ref|real] [--no-extras]] [--real-smoke N] [--order forward|reverse|shuffle[:SEED]] [--seed N]\n");
             return 2;
         }
     }
-    if (!kernels && oracle_dir.empty()) kernels = true;
+    if (!kernels && oracle_dir.empty() && !real_smoke) kernels = true;
 #if defined(__GLIBC__)
     // every emulated launch allocates one 256 KB stack per GPU thread: keep them in the heap instead of an mmap / munmap (page-fault) round trip each
     mallopt(M_MMAP_THRESHOLD, 1 << 30);
@@ -1316,6 +1490,7 @@ int main(int argc, char** argv) {
             std::printf("INFO RealGeom kernels done (%d checks, %d failed)\n", g_pass + g_fail, g_fail);
         }
         if (!oracle_dir.empty()) run_oracle(dev, oracle_dir, only, extras, real_dense);
+        if (real_smoke > 0) run_real_smoke(dev, real_smoke);
     }
     std::printf("INFO emulation wall time %.1f s, %d checks passed, %d failed\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), g_pass, g_fail);
     if (g_fail) {
