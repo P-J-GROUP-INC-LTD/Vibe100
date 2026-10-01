@@ -16,8 +16,10 @@ that noise against a reference run on THE SAME CARD:
                          error, which says whether a 0.5 % PPL difference is signal)
   NaN / inf scan         over every logit of both runs
 
-PASS needs top-1 >= 0.99, |dPPL| / PPL <= 0.02 and no NaN/inf (all overridable).  The plan's Gate 2 is "top-1 >= 99 %
-over 500 tokens, PPL within 1-2 %, no NaN/inf": this is that, with the 500 tokens being `--tail`.
+PASS needs top-1 >= 0.99, |dPPL| / PPL <= 0.02 and no NaN/inf (all overridable).  Gate Q of docs/volta/PLAN.md is "top-1 >= 99 %
+over 500 tokens, PPL within 1-2 %, no NaN/inf": this is that, with the 500 tokens being `--tail`.  The report's last line says
+whether the run establishes Gate Q ("GATE Q: PASS") or only passed a smaller check ("GATE Q: not established - ...": greedy mode,
+fewer than 500 scored rows, a prompt too short to exercise the sparse selection).
 
 THE REFERENCE is, by default, a second run of the same engine binary with
     STRATA_VOLTA_ATTN=0 STRATA_PREFILL_F16_GEMM=0
@@ -25,7 +27,7 @@ i.e. the FP32 CUDA-core prompt attention (the decode kernel, what upstream falls
 (upstream's own, on the CUDA cores of a V100).  Other references: `--ref-env "STRATA_PROMPT_ATTN_OLD=1 ..."` (upstream's
 own switch for the same FP32 attention), `--ref-args "..."` (extra engine flags for the reference run only), or
 `--ref-logits FILE` - logits produced elsewhere (another GPU running upstream, llama.cpp) in the format below.
-NOT references for the Volta prefill kernels: `--no-fast-attn` / `--no-fast-select` (generate.cpp:1803-1806, layer.cpp:931-941) only
+NOT references for the Volta prefill kernels: `--no-fast-attn` / `--no-fast-select` (generate.cpp:1831-1834, layer.cpp:931-941) only
 switch the token loop's decode attention / selection to the old kernels; the batched prefill and the verify windows never read
 them.  (`STRATA_SELECT_OLD=1`, the FP32 warp block scorer, is already the only scorer on a V100: cc < 8.)
 
@@ -64,8 +66,12 @@ TWO MODES
              last occurrence of `--turn-token` (generate.cpp, "the prompt is read in two parts"): everything before it goes
              through the BATCHED path (the Volta kernels), the tail (<= `--short-read` tokens) through the windows with the
              log-probs written.  The harness picks a token that occurs once in the prompt, at the position `--tail` from the end,
-             and passes it as --turn-token.  Any pack.  Metrics: top-1 agreement, perplexity of the target tokens, the paired
-             NLL delta, max |dlogp|, NaN / inf in the log-probs; NOT KL or max |dlogit| (the logits themselves are not written).
+             and passes it as --turn-token.  Any pack - but `strata --serve` refuses to start without `--spec T` (T >= 2), `--mtp DIR`
+             and `--prefill CHUNK` (generate.cpp:3681-3685: it always reads a prompt through the verify windows, which need the
+             draft layer), so this source KEEPS the config's speculative-decoding flags for every pack (setup.py's config has
+             them) and stops with a message when the engine arguments have none.  Metrics: top-1 agreement, perplexity of the
+             target tokens, the paired NLL delta, max |dlogp|, NaN / inf in the log-probs; NOT KL or max |dlogit| (the logits
+             themselves are not written).
     auto     dump for a non-native pack, logpos for a native one.
 
   Either way the scored rows depend on the batched prefill of the tokens before them - which is the point.
@@ -75,8 +81,9 @@ from `--ref-env` / `--ref-args`.  Unless `--no-fixed-experts` / `--no-pin-expert
 `--pcie-frac 0 --adapt-swaps 0` (no PCIe share of the misses, no adaptive swaps: the GPU's expert set stays what the profile
 chose, bench/results/2026-09-27-esp/esp_kl.py does the same) and pins the candidate's `--expert-cache auto` to the slot
 count the reference reported - the GPU and the CPU round an expert differently, upstream measured 2-5 % of top-1 flips just
-from the expert cache being on or off, which would drown the Volta kernels' own noise.  Speculative decoding is dropped for a
-non-native pack (plain decode is what writes logits) and kept for a native one (it cannot run without).
+from the expert cache being on or off, which would drown the Volta kernels' own noise.  Speculative decoding is dropped for the
+dump source on a non-native pack (plain decode is what writes logits) and kept for a native pack and for the logpos source (neither
+can run without it).
 
 WHICH PROMPT.  Everything that matters on a long prompt is invisible on a short one:
   * the QSA layers (12 of the 48) select at most idx_top_k + idx_block - 1 = 2,051 cells per query
@@ -98,22 +105,28 @@ still counts all of them, so the reader goes by the file size, not the header.  
 `rows` positions of the sequence unless `--ref-first-position` says otherwise (a llama.cpp run over the whole text:
 first position 0).  Producing one from numpy: `np.array([V, R], np.int32).tofile(f); logits.astype('<f4').tofile(f)`.
 
-EXAMPLES
-    # Gate 2 on a V100, the engine configured by setup.py:
-    python3 tools/volta/golden_compare.py --engine-config strata-q2_0.json --prompt-name long --tail 512
-    # the same, standalone:
-    python3 tools/volta/golden_compare.py --exe build-sm70/strata --pack pack/full --ple-gguf ... \\
-        --engine-args "--native /data/model-00001-of-00002.gguf --expert-cache 2000" --prompt-file big.txt
-    # a native (IQ3) pack: log-probabilities of the last 512 tokens of a 33,000-token prompt, via the resident engine
-    python3 tools/volta/golden_compare.py --engine-config strata-iq3_xxs.json --prompt-name long --tail 512
+EXAMPLES  (run from the repository root, or give absolute paths; every path the harness hands to the engine - the tokens file,
+the logits dumps, STRATA_LOGPOS, the engine itself - is made absolute against where YOU run it, because the engine runs in the
+config's `cwd`.  Paths INSIDE --engine-args or the config are the engine's own and are relative to its cwd.)
+    # Gate Q on a V100.  The config is setup.py's strata-<model>.json in the repository root: strata-q2_0.json (the canonical pack:
+    # the logits dump works), strata-iq3_xxs.json / strata-iq2_xs.json / strata-iq3_s.json (native packs: log-probabilities)
+    .venv/bin/python tools/volta/golden_compare.py --engine-config strata-iq3_xxs.json --prompt-name long --tail 512
+    # the same, standalone (--ple-gguf and the rest are ENGINE arguments, so they go in --engine-args; --pack is forwarded to it):
+    .venv/bin/python tools/volta/golden_compare.py --exe build-sm70/strata --pack pack/full \\
+        --engine-args "--native /data/model-00001-of-00002.gguf --ple-gguf /data/model-00002-of-00002.gguf --expert-profile data/expert-profile.bin --expert-cache auto" \\
+        --prompt-name long --tail 512                    # (the logpos source also needs --spec 4 --mtp <dir> in --engine-args)
+    # a native (IQ) pack: log-probabilities of the last 512 tokens of a 33,000-token prompt, via the resident engine
+    .venv/bin/python tools/volta/golden_compare.py --engine-config strata-iq3_xxs.json --prompt-name long --tail 512
     # the same pack, greedy: do 256 generated tokens agree?
-    python3 tools/volta/golden_compare.py --engine-config strata-iq3_xxs.json --prompt-name long --mode greedy --max-new 256
+    .venv/bin/python tools/volta/golden_compare.py --engine-config strata-iq3_xxs.json --prompt-name long --mode greedy --max-new 256
     # compare two logits files made elsewhere:
-    python3 tools/volta/golden_compare.py --prompt-file text.txt --cand-logits v100.bin --ref-logits llamacpp.npy
+    .venv/bin/python tools/volta/golden_compare.py --prompt-file text.txt --cand-logits v100.bin --ref-logits llamacpp.npy
+
+PYTHON.  Needs numpy, and `regex` to tokenize text (tools/strata_tokenizer.py): `./setup.sh` installs both into the repository's
+.venv, so run this with `.venv/bin/python`; with another interpreter `pip install numpy regex`.
 
 Exit status: 0 PASS, 1 FAIL (a threshold, a NaN, or the candidate engine failed), 2 the harness could not run (the
-reference failed, a file is missing or malformed).  Needs only numpy (and tools/strata_tokenizer.py + `regex` to tokenize
-text).
+reference failed, a file is missing or malformed).
 """
 from __future__ import annotations
 
@@ -131,7 +144,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    sys.exit("golden_compare: this tool needs numpy (and `regex` to tokenize text), and the Python running it (%s) has none.\n"
+             "  Use the repository's environment: .venv/bin/python %s ... (./setup.sh creates it),\n"
+             "  or install them: %s -m pip install numpy regex" % (sys.executable, sys.argv[0] if sys.argv and sys.argv[0] else "tools/volta/golden_compare.py",
+                                                                    sys.executable))
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -141,6 +160,7 @@ DEFAULT_REF_ENV = "STRATA_VOLTA_ATTN=0 STRATA_PREFILL_F16_GEMM=0"
 CHAT_WRAP = "<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"   # tools/calibrate.py:chat_ids
 SPARSE_FROM = 2051     # qsa_selection_width: idx_top_k 2048 + idx_block 4 - 1.  Up to it the selection is the identity.
 LONG_TOKENS = 33000    # the `long` prompt: past 2,051 and past four 8,192-token prefill chunks
+GATE_Q_ROWS = 500      # Gate Q of docs/volta/PLAN.md: top-1 >= 99 % over 500 tokens
 
 
 class HarnessError(Exception):
@@ -524,7 +544,8 @@ def load_tokenizer(tok_dir: str):
     try:
         import strata_tokenizer as ST   # needs `regex`
     except ImportError as e:
-        raise HarnessError(f"cannot import tools/strata_tokenizer.py ({e}); pip install regex, or pass --ids-file") from e
+        raise HarnessError(f"cannot import tools/strata_tokenizer.py ({e}); it needs the `regex` package: run this with the repository's "
+                           f".venv/bin/python (./setup.sh installs it), or `{sys.executable} -m pip install regex`, or pass --ids-file") from e
     d = Path(tok_dir)
     if not (d / "vocab.json").exists():
         raise HarnessError(f"{d}: no vocab.json - pass --tokenizer PACK/tokenizer (the directory setup.py extracts)")
@@ -606,8 +627,13 @@ def choose_split(tokens: list[int], k0: int, search: int = 6000) -> tuple[int, i
                        "and --prefill-until, or use a prompt with more variety")
 
 
-def build_serve_args(base: list[str], plan: Plan, *, fixed_experts: bool, keep_spec: bool, extra: list[str] | None = None) -> list[str]:
-    """`strata --serve ...` for the logpos source: the configured arguments, the split token and the window length."""
+def build_serve_args(base: list[str], plan: Plan, *, fixed_experts: bool, keep_spec: bool = True, extra: list[str] | None = None) -> list[str]:
+    """`strata --serve ...` for the logpos source: the configured arguments, the split token and the window length.
+
+    `strata --serve` refuses to start without `--spec T` (T >= 2), `--mtp DIR` and `--prefill CHUNK` > 0 (generate.cpp:3681-3685: a
+    prompt is read through the verify windows, which need the draft layer), so the speculative-decoding flags are kept for EVERY
+    pack - `keep_spec` is accepted for symmetry with `build_engine_args` and ignored here - and HarnessError says what is missing
+    when the arguments have none."""
     args = list(base)
     for f in ("--serve", "--greedy", "--stats", "--spec-split"):
         args = drop_flag(args, f, takes_value=False)
@@ -615,9 +641,13 @@ def build_serve_args(base: list[str], plan: Plan, *, fixed_experts: bool, keep_s
         args = drop_flag(args, f)
     cfg_ctx = flag_value(base, "--max-context")
     plan.max_context = (max(int(cfg_ctx) if cfg_ctx and cfg_ctx.isdigit() else 0, plan.n_tokens + plan.max_new + 8) + 1023) // 1024 * 1024
-    if not plan.native and not keep_spec:
-        for f in SPEC_FLAGS:
-            args = drop_flag(args, f)
+    spec, mtp = flag_value(args, "--spec"), flag_value(args, "--mtp")
+    if not (spec and spec.isdigit() and int(spec) >= 2) or not mtp:
+        raise HarnessError("the logpos source starts `strata --serve`, which refuses to run without --spec T (T >= 2) and --mtp DIR "
+                           "(and --prefill CHUNK; generate.cpp:3681-3685), and the engine arguments have "
+                           + ("no --spec" if not spec else f"--spec {spec}") + (" and no --mtp" if not mtp else "")
+                           + ": use setup.py's config (it passes --spec 4 --mtp <dir>), or add them in --engine-args"
+                           + (", or use --teacher-source dump (the logits dump; non-native packs only)" if not plan.native else ""))
     if flag_value(args, "--prefill") in (None, "0"):
         args = set_flag(args, "--prefill", "auto")
     if fixed_experts:
@@ -784,6 +814,31 @@ def pct(x: float) -> str:
     return f"{100 * x:.2f}%"
 
 
+def gate_q_status(rep: dict) -> tuple[str, list[str]]:
+    """Does this run establish Gate Q of docs/volta/PLAN.md (top-1 >= 99 % over 500 tokens, PPL within 1-2 %, no NaN / inf, on a prompt
+    long enough to exercise the batched path and the sparse selection)?  -> ("PASS" | "FAIL" | "not established", what is missing)."""
+    if not rep["pass"]:
+        return "FAIL", []
+    c, m = rep["config"], rep.get("metrics") or {}
+    gaps: list[str] = []
+    if c["mode"] != "teacher":
+        gaps.append("greedy mode shows what a user would see, it is not the gate (the default teacher mode is)")
+    if m.get("tokens_only"):
+        gaps.append("token ids only: no perplexity, no NaN scan")
+    rows = m.get("rows_scored", 0)
+    if rows < GATE_Q_ROWS:
+        gaps.append(f"{rows} rows scored, the gate asks for {GATE_Q_ROWS} (--tail {GATE_Q_ROWS})")
+    runs = rep.get("runs", {})
+    if any(r.get("kind") == "file" for r in runs.values()):
+        gaps.append("a side is a logits file made elsewhere: this harness cannot tell that it exercised the batched Volta paths")
+    elif c["mode"] == "teacher":
+        batched = c.get("split_at") if c.get("source") == "logpos" else c.get("prefill_until")
+        if not batched or batched <= SPARSE_FROM:
+            gaps.append(f"only {batched or 0} prompt tokens went through the batched path (the Volta kernels): the gate needs more than "
+                        f"{SPARSE_FROM} (the QSA selection is the identity up to there); use --prompt-name long")
+    return ("PASS" if not gaps else "not established"), gaps
+
+
 def format_report(rep: dict) -> str:
     c, m, g, th = rep["config"], rep.get("metrics"), rep.get("greedy"), rep["thresholds"]
     L = ["=" * 100, f"golden_compare: mode {c['mode']}, {c['n_tokens']} prompt tokens; reference: {c.get('reference', '?')}"]
@@ -835,6 +890,9 @@ def format_report(rep: dict) -> str:
             L.append(f"  first difference         token #{g['first_diff']}: candidate {g['cand_at_diff']} vs reference {g['ref_at_diff']}")
     L += ["=" * 100, "RESULT: " + ("PASS" if rep["pass"] else "FAIL")]
     L += [f"  - {r}" for r in rep["reasons"]]
+    status, gaps = gate_q_status(rep)
+    rep["gate_q"] = {"status": status, "missing": gaps}
+    L.append(f"GATE Q (docs/volta/PLAN.md): {status}" + (" - " + "; ".join(gaps) if gaps else ""))
     return "\n".join(L)
 
 
@@ -862,10 +920,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_argument_group("engine")
     g.add_argument("--engine-config", help="the strata-*.json that setup.py writes ({exe, args, cwd, lib_dirs, env, tokenizer})")
-    g.add_argument("--exe", help="the engine binary (instead of / overriding the config's)")
+    g.add_argument("--exe", help="the engine binary (instead of / overriding the config's); relative paths are taken from where you run this")
     g.add_argument("--engine-args", default="", help="engine arguments, one shell-quoted string (added to the config's)")
-    g.add_argument("--pack", help="the pack directory, if the engine arguments do not say (used to detect a native pack)")
-    g.add_argument("--cwd", help="working directory of the engine (default: the config's, else the current one)")
+    g.add_argument("--pack", help="the pack directory (relative to where you run this): forwarded to the engine as --pack (replacing the config's), "
+                                         "and used to detect a native pack")
+    g.add_argument("--cwd", help="working directory of the engine (default: the config's - the repository root -, else the current one)")
     g.add_argument("--gpu", help="CUDA_VISIBLE_DEVICES for both runs (numbered as nvidia-smi does)")
     g.add_argument("--native-pack", choices=["auto", "yes", "no"], default="auto",
                    help="is the pack native (IQ)?  auto: <pack>/native_experts.txt exists.  Native packs have no logits dump")
@@ -905,7 +964,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="logpos source: the token id whose LAST occurrence splits the prompt into the batched part and the scored "
                         "tail (default: a token that occurs once, near --tail from the end)")
     r.add_argument("--max-new", type=int, default=0, help="greedy: tokens to generate (default 256); teacher mode generates one")
-    r.add_argument("--workdir", help="where the logits and logs go (default ./golden_out/<time>)")
+    r.add_argument("--workdir", help="where the logits and logs go (default ./golden_out/<time> under the directory you run this from; always "
+                                             "made absolute, because the engine runs in its own cwd)")
     r.add_argument("--reuse", action="store_true", help="reuse the runs already in --workdir instead of running again")
     r.add_argument("--delete-logits", action="store_true", help="delete the (large) logits files afterwards")
     c = ap.add_argument_group("candidate and reference")
@@ -1053,21 +1113,36 @@ def place_external_logits(path: str, plan: Plan, first: int | None) -> Logits:
     return lg.place(np.arange(first, first + lg.n_rows) if plan.stride == 1 else selected_positions(plan.total, plan.stride, first))
 
 
+def absolute(path: str | Path | None, base: str | Path | None = None) -> str | None:
+    """`path` as an absolute path: relative paths are taken from `base` (default: the directory this harness was started in).  No
+    symlink resolution, and the file need not exist."""
+    if path is None or str(path) == "":
+        return None
+    p = Path(path).expanduser()
+    return str(p) if p.is_absolute() else os.path.normpath(str(Path(base or Path.cwd()) / p))
+
+
 def run(a) -> int:
     cfg = load_engine_config(a.engine_config) if a.engine_config else {}
     base_args = list(cfg.get("args", [])) + shlex.split(a.engine_args)
-    exe_s = a.exe or cfg.get("exe")
+    # The engine runs in `cwd` (the config's, normally the repository root), but every path WE hand to it - the tokens file, the logits
+    # dumps, STRATA_LOGPOS, the engine binary, --pack - must name the same file wherever the harness was started: made absolute here.
+    cwd = absolute(a.cwd) or cfg.get("cwd") or None
+    exe_s = absolute(a.exe) if a.exe else (absolute(cfg["exe"], cwd) if cfg.get("exe") else None)
     offline = bool(a.cand_logits and a.ref_logits)
     if not exe_s and not offline:
         raise HarnessError("which engine?  --engine-config strata-*.json, or --exe PATH [--engine-args ...]")
     exe = ([sys.executable, exe_s] if exe_s.endswith(".py") else [exe_s]) if exe_s else []
-    cwd = a.cwd or cfg.get("cwd") or None
-    workdir = Path(a.workdir) if a.workdir else Path("golden_out") / time.strftime("%Y%m%d-%H%M%S")
+    workdir = Path(absolute(a.workdir) if a.workdir else Path.cwd() / "golden_out" / time.strftime("%Y%m%d-%H%M%S"))
     workdir.mkdir(parents=True, exist_ok=True)
 
-    pack = a.pack or flag_value(base_args, "--pack") or "pack/full"
-    pack_dir = Path(cwd or ".") / pack
-    tok_dir = a.tokenizer or cfg.get("tokenizer") or (str(pack_dir / "tokenizer") if (pack_dir / "tokenizer" / "vocab.json").exists() else None)
+    if a.pack:      # an explicit --pack is the engine's too (it was only used to detect a native pack before)
+        base_args = set_flag(base_args, "--pack", absolute(a.pack))
+    pack = flag_value(base_args, "--pack") or "pack/full"
+    pack_dir = Path(absolute(pack, cwd))
+    tok_dir = absolute(a.tokenizer) or cfg.get("tokenizer") or (str(pack_dir / "tokenizer") if (pack_dir / "tokenizer" / "vocab.json").exists() else None)
+    if tok_dir:
+        tok_dir = absolute(tok_dir, cwd)
     tokens = get_tokens(a, tok_dir, workdir)
     n = len(tokens)
     if n < 2:

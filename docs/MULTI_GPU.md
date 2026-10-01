@@ -48,6 +48,10 @@ now on; the answer is kept.
 - Intel GPUs, and a mix of NVIDIA and AMD cards. (AMD cards share a model among themselves: `./setup.sh --backend
   hip --gpus 1,0`, see [AMD_HIP.md](AMD_HIP.md).)
 
+**A V100 together with RTX 20 / 30 / 40 cards** is allowed (one engine, built with CUDA 12.8 for every architecture in the box:
+[docs/volta/VOLTA.md](volta/VOLTA.md)); nobody has run it. Each card takes its own code path: the V100 gets the Volta kernels, an RTX
+card keeps upstream's.
+
 Or edit an existing config (`strata-*.json`), then restart:
 
 ```json
@@ -107,8 +111,9 @@ into the card that owns the layer.
   limit, so there the whole arena is pinned (since 0.1.31; the cap cost a 4090 + 3060 split two thirds of its
   prompt speed, #253). `STRATA_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena, on any OS.
 - Every card needs compute capability 7.0 (V100 / Titan V) or 7.5 (RTX 20 or newer). The pre-sm_80 QSA scorer path
-  is fp32 FMAs, so a Turing or Volta card runs the same kernels; Volta's prompt attention is its own WMMA kernel
-  (docs/volta/PLAN.md).
+  is fp32 FMAs, so a Turing or Volta card runs the same kernels; Volta's prompt attention is its own WMMA kernel, and its
+  dense prompt GEMMs run as FP16 tensor-core GEMMs (`STRATA_PREFILL_F16_GEMM`, default `auto` = Volta only: Turing keeps
+  the bf16 cuBLAS call unless it is set to `1`) (docs/volta/PLAN.md).
 
 ## Measured
 

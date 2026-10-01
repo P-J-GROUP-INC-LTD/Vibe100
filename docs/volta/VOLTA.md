@@ -5,6 +5,10 @@ a normal target: one command installs it, and the three places where Strata used
 got Volta versions. Everything else is upstream Strata 0.1.31 (see [UPSTREAM.md](../../UPSTREAM.md)); what was found
 in its source and what was changed is in [PLAN.md](PLAN.md).
 
+**Setting up a real box (a dual-Xeon workstation with one V100)? Follow [RUNBOOK.md](RUNBOOK.md):** one ordered day-one
+checklist - BIOS, OS settings, the driver, `./setup.sh`, the parity programs, the golden comparison, the profile, the A/B
+switches, then DeepSeek - with the exact commands and what to send back after each step. This page is the reference behind it.
+
 > **Read this first: nothing here has run on a V100 yet.** The port was written and compiled for sm_70 on a machine
 > without a GPU. The machine code was inspected and the CPU-side checks run, but the first start on your card is
 > the first real test - which is why this page has a section on [checking it](#checking-it-on-your-v100) and one
@@ -28,9 +32,9 @@ in its source and what was changed is in [PLAN.md](PLAN.md).
 | | |
 | --- | --- |
 | **The card** | Tesla V100 16 GB or 32 GB (PCIe or SXM2), Quadro GV100, Titan V (12 GB). `nvidia-smi --query-gpu=name,compute_cap --format=csv` must say **7.0**. 32 GB is the one worth having: the GPU's VRAM holds a copy of the most-used experts, so more VRAM means more answers served from the card. |
-| **The driver** | **570 or newer** (CUDA 12.8 needs it) and **no newer than the 580 series**: R580 is the last NVIDIA driver branch that supports Volta. |
+| **The driver** | The **proprietary R580** branch: **570 or newer** (CUDA 12.8 needs it; CUDA 13 needs 580 or newer) and **no newer than the 580 series**, because R580 is the last NVIDIA driver branch that supports Volta. On Ubuntu that is `nvidia-driver-580` - **not** `nvidia-driver-580-open`: NVIDIA's open kernel modules support Turing and newer only, so they do not drive a V100. Once it works, hold it (`apt-mark hold`, see [RUNBOOK.md](RUNBOOK.md) step 2): the next `apt upgrade` or "Additional Drivers" click must not move a V100 box to a branch that no longer lists the card. |
 | **CUDA toolkit** | **12.8** (any 12.x from 12.0 to 12.9 is accepted; 12.8 is the one this port was checked with). **Not 13.** The installer finds an existing 12.x or installs 12.8 next to whatever CUDA you have; it passes nvcc to CMake itself, so your default CUDA is not touched. |
-| **RAM and disk** | The same as for any card - [the table in the README](../../README.md#which-model-should-i-pick). A V100 server usually has plenty; with 64 GB of RAM every size fits. |
+| **RAM and disk** | The same as for any card - [the table in the user guide](../STRATA_README.md#which-model-should-i-pick). A V100 server usually has plenty; with 64 GB of RAM every size fits. |
 | **A compiler** | Linux: `g++` (installed with `build-essential`). Windows: Visual Studio 2022 Build Tools (C++). The installer offers to install them. |
 | **The OS** | Linux (Ubuntu 22.04 / 24.04 gets the CUDA 12.8 install automatically; other distributions: install CUDA 12.8 yourself, the installer finds it in `/usr/local/cuda-12.*` or `/opt/cuda*`). Windows is possible for a Titan V / Quadro GV100 through the same installer; that path is untested. |
 
@@ -69,10 +73,15 @@ other card. (A mixed V100 + RTX 40 box is allowed but nobody has run it.)
 
 ```
 export PATH=/usr/local/cuda-12.8/bin:$PATH
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
+.venv/bin/cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON \
       -DCMAKE_CUDA_ARCHITECTURES=70 -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
-cmake --build build --target strata -j4
+.venv/bin/cmake --build build --target strata -j4
 ```
+
+CMake **3.24 or newer** is required (`CMakeLists.txt` says so), and Ubuntu 22.04's apt package is 3.22: `./setup.sh` pip-installs a
+current `cmake` and `ninja` into `.venv`, which is why the commands above use `.venv/bin/cmake` (without `.venv`:
+`python3 -m pip install cmake ninja`). `tools/volta/run_parity.sh` prefers `.venv/bin/cmake` too and stops with this message when
+the cmake it finds is older.
 
 - No `-DSTRATA_EXPERIMENTAL_SM60=ON` is needed any more: sm_70 is a supported architecture. That flag is only for
   Pascal (sm_60 / 61 / 62), which this port does not cover.
@@ -80,7 +89,9 @@ cmake --build build --target strata -j4
 - With a CUDA 13 compiler, CMake stops at once and says that CUDA 13 dropped Volta and which nvcc to give it.
 - The GPU test programs: `-DSTRATA_BUILD_TESTS=ON`, or just the ones for this port with
   `-DSTRATA_PARITY_PROMPT_ATTN=ON -DSTRATA_PARITY_PREFILL_GEMM=ON` (targets `qsa_prompt_attn_parity` and
-  `gemm_volta_parity`). `strata-device` (`cmake --build build --target strata-device`) is the quickest check of the card.
+  `gemm_volta_parity`). `strata-device` is the quickest check of the card: `./setup.sh` builds only the `strata` target, so build
+  it first (`.venv/bin/cmake --build build --target strata-device`), then run `build/strata-device --selftest`. (`tools/volta/run_parity.sh`
+  builds it as well, into its own directory: `build-sm70/strata-device --selftest`.)
 - To run the model you still need the prepared model files; the one-command install makes them (`./setup.sh --no-start`
   compiles the engine with the same options and prepares everything).
 
@@ -98,17 +109,32 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data
 The host needs the NVIDIA Container Toolkit and a driver 570 or newer (and not past the 580 series). The default
 base (CUDA 13) is unchanged for RTX cards; with it `CUDA_ARCHITECTURES=70` stops the build with the reason. The
 other options (`-e MODEL=...`, `-e LOW_RAM=on`, ...) are the same as in the
-[README](../../README.md#install). (The Docker build has not been run on a V100 host either.)
+[user guide](../STRATA_README.md#install). (The Docker build has not been run on a V100 host either.)
 
-## The two run-time switches
+**Docker and the NUMA mirror.** On a two-socket host the engine places its expert copies with `mbind`, checks them with
+`move_pages`, and reads the process's own memory policy with `get_mempolicy` (to warn about an interleave policy). Docker's
+default seccomp profile blocks `move_pages`, and allows `mbind` / `get_mempolicy` / `set_mempolicy` only to a container that has
+`CAP_SYS_NICE`. Without them the engine finds its placement call refused, says so in the startup log and keeps ONE copy: the mirror
+is off, and the A/B in the NUMA section would show no gain. For the mirror add `--cap-add SYS_NICE` and a seccomp profile that also
+allows `move_pages` (Docker's default profile plus that one syscall), or - on a box you trust - `--security-opt seccomp=unconfined`:
+
+```
+docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 --cap-add SYS_NICE --security-opt seccomp=unconfined \
+       -v strata-data:/data vibe100
+```
+
+The huge-page pools below are the host's, not the container's: reserve them on the host.
+
+## The two run-time switches (and the ones to A/B)
 
 Both are environment variables, read once when the engine starts. Leave them alone for normal use; they exist so the
-Volta paths can be switched off to compare against, and for testing.
+Volta paths can be switched off to compare against, and for testing. (The other switches worth an A/B on a real box are listed
+in [RUNBOOK.md](RUNBOOK.md), step 8: `STRATA_PREFILL_MMQ`, `--numa` / `STRATA_NUMA_MIRROR`, `STRATA_IQ512`.)
 
 | Variable | Values | What it does |
 | --- | --- | --- |
-| `STRATA_VOLTA_ATTN` | unset or `1` (default) / `0` | **Prompt attention on a V100.** `1`: the new Volta tensor-core kernel. `0`: the older per-query FP32 kernel (what upstream falls back to when the tensor-core kernel cannot be used) - the reference the new kernel is checked against. Only matters while a prompt is read with a 16-bit, 8-bit or K8V4 KV cache; has no effect on other cards. |
-| `STRATA_PREFILL_F16_GEMM` | `auto` or unset (default) / `0` / `1` | **The dense GEMMs that read a prompt.** `auto`: on a card with FP16 but no BF16 tensor cores (compute capability 7.0 to 7.5: the V100, and also an RTX 20; small GEMMs and Pascal cards keep the upstream call) they run as FP16 tensor-core GEMMs with FP32 sums - the BF16 values are converted exactly, with a power-of-two scale per piece so nothing can overflow FP16. `0`: always upstream's BF16 cuBLAS call (on a V100 that runs on the ordinary cores, about 8x slower than the tensor cores). `1`: use the FP16 route on every card, to test it on a newer one. |
+| `STRATA_VOLTA_ATTN` | unset, `1`, `on`, `true`, `yes` (default) / `0`, `off`, `false`, `no` / `2`, `force` | **Prompt attention on a V100.** On: the new Volta tensor-core kernel. Off: the older per-query FP32 kernel (what upstream falls back to when the tensor-core kernel cannot be used) - the reference the new kernel is checked against. `2` / `force`: run the Volta (WMMA) kernel on ANY card of compute capability 7.0 or newer - a test aid for a development box without a V100; nothing else changes without it. Any other value prints a warning once and means the default. Only matters while a prompt is read with a 16-bit, 8-bit or K8V4 KV cache; on a card that is not a Volta the default does nothing. |
+| `STRATA_PREFILL_F16_GEMM` | `auto` or unset (default) / `0` / `1` | **The dense GEMMs that read a prompt.** `auto`: **on a Volta only** (compute capability 7.0 up to, not including, 7.5: the V100, Titan V, Quadro GV100) they run as FP16 tensor-core GEMMs with FP32 sums - the BF16 values are converted exactly, with a power-of-two scale per piece (signed: a piece of huge values is scaled down so nothing can overflow FP16, a piece of small values is scaled up so every value within 2^28 of the piece's largest converts without loss). Turing (RTX 20) and newer keep upstream's BF16 cuBLAS call and its numerics, as do small GEMMs and Pascal. `0`: always upstream's BF16 cuBLAS call (on a V100 that runs on the ordinary cores, about 8x slower than the tensor cores). `1`: use the FP16 route on every card - to test it on a newer one, or to opt a Turing card in. |
 
 Set them for one run on the command line:
 
@@ -125,21 +151,23 @@ or for good in the model's config file `strata-<model>.json` (the server passes 
 ## Checking it on your V100
 
 These tools are in `tools/volta/`; each one explains itself with `--help` (or its header). The order matters: each step
-answers a question the next one depends on.
+answers a question the next one depends on, and it is the plan's phase order ([PLAN.md](PLAN.md), section 3): the build comes
+before the profile, which runs the engine. Run the Python ones with `.venv/bin/python` (`./setup.sh` installs the `numpy` and
+`regex` they need; with another interpreter `pip install numpy regex`).
 
-| Step | Tool | What it tells you |
-| --- | --- | --- |
-| 0 | `nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv` | The card really is 7.0 and the driver is in range. A P4000 (6.1) or an RTX card tells you nothing about a V100. |
-| 1 | `build/strata-device --selftest` | The engine starts on the card: it knows the card is allowed (7.0) and that **this build has code for it**. If it does not, it says so in a sentence and names the `-DCMAKE_CUDA_ARCHITECTURES` to rebuild with. |
-| 2 | `tools/volta/run_parity.sh` | Runs every GPU parity program (prompt attention and the prefill GEMM against FP64 / FP32 references, on synthetic data, no model needed) and prints one pass / fail table. All must pass before anything else means anything. |
-| 3 | `tools/volta/golden_compare.py` | Correctness of the whole model, not one kernel: top-1 agreement, largest logit difference, KL and perplexity, and a NaN / inf scan - the Volta fast paths against the FP32 reference paths on the same card (that is what the two switches above are for), or against a reference-logits file made on another GPU. |
-| 4 | `tools/volta/profile_decode.sh` (with `summarize_profile.py`) | Where one decode step spends its time: GPU kernels, PCIe copies or the CPU's expert work. Run this before trying to tune anything. |
-| - | `tools/volta/sass_audit.py` | For people building the engine: reads the sm_70 machine code and fails when a kernel that must not trap does, or when a tensor-core kernel compiled to plain math. `tools/volta/compile_one.py` compiles one file for sm_70 and reports it. |
+| Step | Tool | What it tells you | Gate |
+| --- | --- | --- | --- |
+| 0 | `nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv` | The card really is 7.0 and the driver is in range. A P4000 (6.1) or an RTX card tells you nothing about a V100. | Gate 0 |
+| 1 | `.venv/bin/cmake --build build --target strata-device`, then `build/strata-device --selftest` | The engine starts on the card: it knows the card is allowed (7.0) and that **this build has code for it**. If it does not, it says so in a sentence and names the `-DCMAKE_CUDA_ARCHITECTURES` to rebuild with. (`./setup.sh` builds only the `strata` target, so `strata-device` has to be built first; `run_parity.sh` builds it too: `build-sm70/strata-device --selftest`.) | |
+| 2 | `tools/volta/run_parity.sh` | Builds for sm_70 and runs every GPU parity program - prompt attention, the prefill GEMM, the hybrid KV cache, and the DeepSeek router / split / expert kernels, against FP64 / FP32 references on synthetic data, no model needed - plus the SASS audit, and prints one pass / fail table ending in `GATE P`. All must pass before anything else means anything. | Gate P |
+| 3 | `tools/volta/golden_compare.py` | Correctness of the whole model, not one kernel: top-1 agreement, largest logit difference, KL and perplexity, and a NaN / inf scan - the Volta fast paths against the FP32 reference paths on the same card (that is what the two switches above are for), or against a reference-logits file made on another GPU. Its last line says whether the run establishes `GATE Q`. | Gate Q |
+| 4 | `tools/volta/profile_decode.sh` (with `summarize_profile.py`) | Where one decode step spends its time: GPU kernels, PCIe copies or the CPU's expert work. The per-token and "decode window" figures cover the decode only; the nsys trace also holds the start-up, and the figures over it are labelled "whole run". Run this before trying to tune anything. | |
+| - | `tools/volta/sass_audit.py` | For people building the engine: reads the sm_70 machine code and fails when a kernel that must not trap does, or when a tensor-core kernel compiled to plain math. `tools/volta/compile_one.py` compiles one file for sm_70 and reports it. Both take the `cuobjdump` of the CUDA 12.x toolkit that built the code, not whatever is first on `PATH`. | |
 
-The pass marks the plan sets are in [PLAN.md](PLAN.md) (section 3):
-top-1 agreement of at least 99% over 500 tokens, perplexity within 1-2%, no NaN or inf; and, as a goal rather than a
-prediction, 40 tokens/s or more on the IQ3 size on one V100. If those fail, the plan says to stop and rethink before
-building anything on top.
+The pass marks the plan sets, by gate, are in [PLAN.md](PLAN.md) (section 3): **Gate P** - every parity program and the SASS audit
+pass; **Gate Q** - top-1 agreement of at least 99% over 500 tokens, perplexity within 1-2%, no NaN or inf; **Gate 1** - as a goal
+rather than a prediction, 40 tokens/s or more on the IQ3 size on one V100, with P and Q passed. If those fail, the plan says to
+stop and rethink before building anything on top.
 
 ## Getting the speed
 
@@ -190,6 +218,29 @@ at setup or later with `./setup.sh --numa off` (saved for the model), and the en
 which overrides the option for one run - the A/B switch. If the log says the GPU's node was ASSUMED (the BIOS reports
 `numa_node -1`), tell it with `STRATA_NUMA_GPU_NODE=N` (what `nvidia-smi topo -m` shows: the card's CPU affinity).
 
+**Huge pages: the pools are per node.** The arena copies are big (23-50 GB each) and read at random, so 2 MiB pages cut the page-table
+and TLB cost. Two ways to get them, neither required (4 KiB pages work, a little slower):
+
+- **A reserved hugetlb pool** (`vm.nr_hugepages`). Linux splits `vm.nr_hugepages` EVENLY over the nodes, so one number does not size
+  a mirror: each node needs its OWN pool big enough to hold one whole copy, set through that node's sysfs entry. With 2 MiB pages
+  a copy of G GiB needs G x 512 pages (a 32 GiB copy: 16,384, plus a few percent):
+
+  ```
+  echo 17000 | sudo tee /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+  echo 17000 | sudo tee /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+  grep -H . /sys/devices/system/node/node*/hugepages/hugepages-2048kB/{nr,free}_hugepages      # reserved and still free, per node
+  ```
+
+  (Reserve them early after boot, or at boot with `hugepagesz=2M hugepages=...` plus the per-node form above: a pool grows only as far
+  as free, unfragmented memory allows.) The copies bound to a node draw from THAT node's pool; the engine uses a node's pool only
+  when it holds the whole copy and says in the log which page size each copy got.
+- **Transparent huge pages**, with no pool: the engine requests THP for the arena copies (`madvise`, on 2 MiB-aligned ranges, before
+  the first page is touched). That needs `cat /sys/kernel/mm/transparent_hugepage/enabled` to say `always` or `madvise`, not `never`
+  (Ubuntu's default is `madvise`). The startup log's placement lines say whether a copy came out in hugetlb pages, THP or 4 KiB
+  pages; `STRATA_NO_THP=1` switches the request off for an A/B.
+
+A hugetlb pool is memory the rest of the machine cannot use (it is not in `MemFree`): size it for the copies and nothing more.
+
 **Do not combine it with `numactl --interleave=all`** (or BIOS node interleaving): interleaving spreads every page of every
 allocation over both nodes, which is the opposite of placing a copy on each. The mirror binds its copies explicitly, and a
 per-mapping policy outranks the process's, so they should still land where they belong - but then the interleave only
@@ -215,7 +266,8 @@ socket — the mirror and the DeepSeek port's per-socket split both need the two
 (2 nodes, not 4); *System Profile: Performance* (or the highest-performance profile offered). The 7920's PCIe slots are
 divided between the two CPUs, so the slot decides which socket owns the card: `nvidia-smi topo -m` shows it, and a
 second GPU is best placed on the other CPU's slots. On Linux, `kernel.numa_balancing=0` (`sysctl`) keeps the kernel from
-migrating pages behind the engine's back, and the `performance` CPU governor avoids clock ramp-up delays.
+migrating pages behind the engine's back, and the `performance` CPU governor avoids clock ramp-up delays. The exact commands
+(including the per-node huge-page pools and the locked-memory limit) are in [RUNBOOK.md](RUNBOOK.md), steps 0 and 1.
 
 **PCIe Gen3.** A V100 talks to the host at PCIe 3.0 x16 (about 12 GB/s in practice), slower than the Gen4 / Gen5 of
 newer cards. Strata copies the experts the card is missing over PCIe, or computes them on the CPU; how much goes each way
@@ -261,7 +313,17 @@ longer context takes VRAM from the experts' cache (more in [DETAILS.md](../DETAI
   for other cards (the ready-made engine, or a build without 70). Run `./setup.sh`, or rebuild with
   `-DCMAKE_CUDA_ARCHITECTURES=70` and a CUDA 12 toolkit.
 - *"the NVIDIA driver is too old (...; 570 or newer is needed)"* - update it, but stay on the 580 series or older: newer
-  branches no longer list Volta cards, so `nvidia-smi` would not show the V100 at all.
+  branches no longer list Volta cards, so `nvidia-smi` would not show the V100 at all. Install the proprietary `nvidia-driver-580`,
+  not the `-open` package (the open kernel modules support Turing and newer only), and hold the packages afterwards
+  ([RUNBOOK.md](RUNBOOK.md), step 2).
+- *An engine built only for sm_70 (`-DCMAKE_CUDA_ARCHITECTURES=70`) started on a card of compute capability 7.5 or newer* - the
+  sm_70 machine code also runs on a 7.5 card, and on an 8.x card the driver compiles the sm_70 PTX itself; in both, upstream's
+  Turing / Ampere prompt-attention kernels are `__trap()` stubs, and a build like that used to die with "unspecified launch failure"
+  on the first long prompt. Fixed in the audit round, twice over: the engine refuses to start when the code the driver would run is
+  older than the card (`device.cu`; the message names the architectures it was built for), and the attention dispatcher asks the
+  runtime which code each kernel got (`ptxVersion`) and never launches a kernel whose body is a trap stub. The remedy is a build for
+  the card: `-DCMAKE_CUDA_ARCHITECTURES="70;75"` for a V100 plus an RTX 20.
 - *"one engine cannot be built for sm_70, sm_120"* - a V100 and an RTX 50 in one engine; choose with `--gpu` / `--gpus`.
 - *A crash or `unspecified launch failure` on a V100* - run `tools/volta/run_parity.sh` and attach its output with
-  `strata-<model>.log` and the output of `build/strata-device` when you report it.
+  `strata-<model>.log` and the output of `strata-device` (`build/strata-device`, after `.venv/bin/cmake --build build --target
+  strata-device`; or `build-sm70/strata-device` from the parity run) when you report it.

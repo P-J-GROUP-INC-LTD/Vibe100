@@ -1,6 +1,6 @@
 """tools/volta/test_summarize_profile.py - tests of summarize_profile.py on synthetic text built from the EXACT printf formats of
 src/program/generate.cpp (the test also checks that each format is still present in that file, so a reworded engine line
-fails here rather than silently emptying the Phase-0 table).
+fails here rather than silently emptying the profile table).
 
     python3 -m unittest tools.volta.test_summarize_profile        (from the repository root)
 """
@@ -10,6 +10,8 @@ import contextlib
 import io
 import json
 import re
+import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -240,6 +242,149 @@ class ServeLogTests(unittest.TestCase):
         self.assertAlmostEqual(reqs[1]["hit_rate"], 0.613)
 
 
+def make_trace(path: Path, *, with_names: bool = True) -> None:
+    """A synthetic nsys SQLite export of a profiled run: 10 s of start-up (the dense-weight upload and the expert-cache fill: four 1,000 MB
+    host-to-device copies and some setup kernels), a 1 s prefill of a short prompt, then a decode of 200 tokens in 2 s: per token 100
+    kernels of 10 us ("decode_kernel", 4 us of "tensorop_gemm") and one 100 KB host-to-device and one 10 KB device-to-host copy."""
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start INTEGER NOT NULL, end INTEGER NOT NULL, deviceId INTEGER, streamId INTEGER,
+            correlationId INTEGER, demangledName INTEGER, shortName INTEGER, mangledName INTEGER);
+        CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (start INTEGER NOT NULL, end INTEGER NOT NULL, deviceId INTEGER, streamId INTEGER,
+            correlationId INTEGER, bytes INTEGER, copyKind INTEGER, srcKind INTEGER, dstKind INTEGER);
+    """)
+    names = {1: "setup_convert_kernel", 2: "decode_kernel", 3: "tensorop_gemm", 4: "prefill_gemm_kernel"}
+    if with_names:
+        con.executemany("INSERT INTO StringIds VALUES (?, ?)", list(names.items()))
+    SEC = 1_000_000_000
+    k, m = [], []
+    for i in range(4):                                   # start-up: 4 x 1,000 MB, 2 s apart, from t = 1 s
+        t = (1 + 2 * i) * SEC
+        m.append((t, t + SEC // 2, 0, 7, i, 1_000_000_000, 1, 1, 3))
+        k.append((t, t + 1_000_000, 0, 7, i, 1, 1, 1))
+    for i in range(50):                                  # the prefill: t = 10.5 .. 11.0 s, 5 ms apart
+        t = 10 * SEC + SEC // 2 + i * 10_000_000
+        k.append((t, t + 5_000_000, 0, 7, i, 4, 4, 4))
+        m.append((t, t + 1_000, 0, 7, i, 40_000, 1, 1, 3))
+    for tok in range(200):                               # the decode: t = 12.0 .. 14.0 s, 10 ms per token
+        t0 = 12 * SEC + tok * (SEC // 100)
+        for j in range(100):
+            k.append((t0 + j * 50_000, t0 + j * 50_000 + (4_000 if j % 25 == 0 else 10_000), 0, 7, tok * 100 + j, 3 if j % 25 == 0 else 2, 2, 2))
+        m.append((t0, t0 + 2_000, 0, 7, 0, 100_000, 1, 1, 3))
+        m.append((t0 + 5_000_000, t0 + 5_001_000, 0, 7, 0, 10_000, 2, 3, 1))
+    con.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_KERNEL VALUES (?,?,?,?,?,?,?,?)", k)
+    con.executemany("INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES (?,?,?,?,?,?,?,?,?)", m)
+    con.commit()
+    con.close()
+
+
+class DecodeWindowTests(unittest.TestCase):
+    """The per-token figures cover the decode window only (the last `decode ... ms` of the profiled run), never the start-up."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = Path(tempfile.mkdtemp())
+        make_trace(cls.d / "decode.sqlite")
+        # the engine's own line for the nsys run: 200 tokens decoded in 2,005 ms (a little longer than the 2.0 s span of the decode
+        # activity, so the window starts a few ms before the first decode kernel and well after the prefill's last one at 11.0 s)
+        (cls.d / "run.txt").write_text("decode                   200 tokens in 2005.0 ms  ->  99.75 tok/s\n"
+                                       "prefill                  63 tokens in 500.0 ms  ->  126.00 tok/s  (time to first token 500.0 ms)\n")
+        (cls.d / "stats.txt").write_text(stats_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.d)
+
+    def test_window_and_whole_run_are_separate(self):
+        w = S.read_nsys_sqlite(str(self.d / "decode.sqlite"), 2005.0)
+        # the whole trace: 4,000 MB + 50 x 40 KB + 200 x 100 KB of H2D
+        h2d_all = S._sum_ops(w["mem_all"]["size_mb"], "host-to-device")
+        self.assertAlmostEqual(h2d_all, 4000.0 + 2.0 + 20.0, places=3)
+        # the decode window: only the 200 per-token copies (and nothing of the start-up or the prefill)
+        h2d_win = S._sum_ops(w["mem_win"]["size_mb"], "host-to-device")
+        d2h_win = S._sum_ops(w["mem_win"]["size_mb"], "device-to-host")
+        self.assertAlmostEqual(h2d_win, 20.0, places=6)
+        self.assertAlmostEqual(d2h_win, 2.0, places=6)
+        self.assertEqual(w["kern_win"]["n_kernels"], 2)               # decode_kernel and tensorop_gemm
+        self.assertEqual(sum(i["instances"] for i in w["kern_win"]["top"]), 200 * 100)
+        self.assertEqual(w["kern_all"]["n_kernels"], 4)
+        self.assertGreater(w["kern_all"]["total_ns"], w["kern_win"]["total_ns"])
+        self.assertAlmostEqual(w["span_ms"], 12995.0, delta=0.01)                       # t = 1.0 s .. 13.995 s
+        self.assertAlmostEqual(w["window_ms"], 2005.0, delta=0.01)
+        self.assertGreater(w["before_window_ms"], 10_000)
+
+    def test_cli_per_token_figures_use_the_window(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = S.main(["--stats", str(self.d / "stats.txt"), "--nsys-sqlite", str(self.d / "decode.sqlite"),
+                         "--nsys-run", str(self.d / "run.txt"), "--json", str(self.d / "o.json")])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        # (20 MB H2D + 2 MB D2H) over 200 tokens = 0.11 MB per token - not (4,022 + 2) MB over 200 = 20 MB
+        self.assertIn("PCIe traffic per token (decode window)", text)
+        self.assertIn("0.11 MB", text)
+        self.assertNotIn("20.1 MB", text)
+        self.assertIn("PCIe traffic (whole run, incl. start-up)", text)
+        self.assertIn("H2D 4022 MB", text)
+        self.assertIn("NOT a per-token figure", text)
+        self.assertIn("GPU kernel time (decode window)", text)
+        self.assertIn("GPU kernel time (whole run, incl. start-up and prompt)", text)
+        self.assertIn("tensor-core kernel time (by name, decode window)", text)
+        self.assertIn("GPU kernel time by kernel (decode window;", text)
+        self.assertIn("decode_kernel", text)
+        self.assertNotIn("setup_convert_kernel", text.split("GPU kernel time by kernel")[1])      # the start-up's kernels are not in the table
+        js = json.loads((self.d / "o.json").read_text())
+        self.assertEqual(js["kernels_scope"], "decode window")
+        self.assertEqual(js["decode_window"]["tokens"], 200)
+        self.assertEqual(js["whole_run"]["kernels"]["n_kernels"], 4)
+
+    def test_kernel_busy_per_token(self):
+        w = S.read_nsys_sqlite(str(self.d / "decode.sqlite"), 2005.0)
+        row = [r for r in S.build_summary({}, {}, None, None, S.parse_stats((self.d / "run.txt").read_text()), None, w)["rows"]
+               if r["name"] == "GPU kernel time (decode window)"][0]
+        # per token: 96 x 10 us + 4 x 4 us = 976 us ... = 0.98 ms; 200 tokens = 195 ms
+        self.assertEqual(row["value"], "195 ms")
+        self.assertIn("0.98 ms per generated token", row["note"])
+
+    def test_no_decode_line_means_no_window_and_a_note(self):
+        out = io.StringIO()
+        (self.d / "empty.txt").write_text("strata generate: loading\n")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = S.main(["--stats", str(self.d / "stats.txt"), "--nsys-sqlite", str(self.d / "decode.sqlite"),
+                         "--nsys-run", str(self.d / "empty.txt")])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertNotIn("PCIe traffic per token", text)
+        self.assertIn("no decode window", text)
+        self.assertIn("WHOLE run", text)
+
+    def test_unusable_sqlite_says_why(self):
+        (self.d / "bad.sqlite").write_text("not a database")
+        with self.assertRaises(S.NsysSqliteError):
+            S.read_nsys_sqlite(str(self.d / "bad.sqlite"), 100.0)
+        with self.assertRaises(S.NsysSqliteError):
+            S.read_nsys_sqlite(str(self.d / "missing.sqlite"), 100.0)
+        con = sqlite3.connect(self.d / "other.sqlite")
+        con.execute("CREATE TABLE x (a)")
+        con.commit()
+        con.close()
+        with self.assertRaises(S.NsysSqliteError) as cm:
+            S.read_nsys_sqlite(str(self.d / "other.sqlite"), 100.0)
+        self.assertIn("--trace=cuda", str(cm.exception))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = S.main(["--stats", str(self.d / "stats.txt"), "--nsys-sqlite", str(self.d / "missing.sqlite"),
+                         "--nsys-run", str(self.d / "run.txt"), "--nsys-memsize", "/nonexistent"])
+        self.assertEqual(rc, 0)         # the table still prints, without the nsys rows
+
+    def test_names_fall_back_to_the_raw_id_without_stringids(self):
+        make_trace(self.d / "nonames.sqlite", with_names=False)
+        w = S.read_nsys_sqlite(str(self.d / "nonames.sqlite"), 2005.0)
+        self.assertEqual(w["kern_win"]["n_kernels"], 2)
+        self.assertEqual(w["kern_win"]["top"][0]["name"], "2")
+
+
 class EndToEndTests(unittest.TestCase):
     def test_cli_builds_the_table(self):
         d = Path(tempfile.mkdtemp())
@@ -257,14 +402,22 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         text = out.getvalue()
         for needle in ("decode tok/s", "21.98", "MTP acceptance", "2.86", "expert cache hit rate", "54.3%", "CPU expert compute",
-                       "12.40 ms/round", "GPU idle share", "PCIe traffic per token", "Tesla V100", "void foo<(ggml_type)21, 72, false>"):
+                       "12.40 ms/round", "GPU idle share", "Tesla V100", "void foo<(ggml_type)21, 72, false>"):
             self.assertIn(needle, text)
         # idle share: wall = 9100 ms / 200 tokens = 45.5 ms per token; floor 11.87 ms -> 1 - 11.87/45.5 = 74%
         self.assertIn("74%", text)
-        # PCIe per token: (4000.5 + 12) MB over the profiled run's 200 generated tokens = 20.1 MB
-        self.assertIn("20.1 MB", text)
+        # the CSV summaries cover the WHOLE trace (the start-up's weight upload and cache fill included): the table says so and
+        # does NOT turn them into a per-token figure (4,012 MB over 200 tokens would be "20.1 MB per token" of mostly start-up)
+        self.assertNotIn("PCIe traffic per token", text)
+        self.assertNotIn("20.1 MB", text)
+        self.assertIn("PCIe traffic (nsys, WHOLE run, incl. start-up)", text)
+        self.assertIn("H2D 4000 MB, D2H 12 MB", text)
+        self.assertIn("NOT a per-token figure", text)
+        self.assertIn("GPU kernel time (nsys, WHOLE run, incl. start-up)", text)
+        self.assertIn("(WHOLE run, incl. start-up; total", text)
         js = json.loads((d / "o.json").read_text())
         self.assertEqual(js["kernels"]["n_kernels"], 3)
+        self.assertEqual(js["kernels_scope"], "WHOLE run, incl. start-up")
         self.assertEqual(js["gpu_floor"]["ms_per_token"], 11.87)
 
     def test_nothing_to_do(self):

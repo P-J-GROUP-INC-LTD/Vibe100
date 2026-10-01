@@ -1,7 +1,7 @@
 # Strata - the details
 
 The technical side of Strata: every measured number, the API, images, all settings and how the engine works.
-New here? Start with the [README](../README.md) - it has everything you need to install and use it.
+New here? Start with the [user guide](STRATA_README.md) (upstream Strata's README, moved here) - it has everything you need to install and use it.
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
 > [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
@@ -776,7 +776,13 @@ lacks the room (`STRATA_NUMA_HEADROOM_GIB`, default 6, is kept free on top of th
 low-RAM modes (`--mmap-experts`, `--resident-experts`, `--resident-budget-gib`) or with `--shared-expert-arena`. `--numa off` keeps
 one copy; the environment `STRATA_NUMA_MIRROR=0|1` overrides the option for an A/B run. Do not combine it with `numactl
 --interleave=all` (the log warns). The startup log states the nodes, the GPU's node, the copy sizes and where a sample of each
-copy's pages was found. Details, the A/B and how to check it with `numastat`: [docs/volta/VOLTA.md](volta/VOLTA.md).
+copy's pages was found. The engine requests transparent huge pages for the copies (`madvise`); hugetlb pools are used when each node has
+its own pool big enough for a whole copy (Linux splits `vm.nr_hugepages` evenly over the nodes, so reserve them per node through
+`/sys/devices/system/node/node*/hugepages/hugepages-2048kB/nr_hugepages`). In **Docker** the mirror needs `--cap-add SYS_NICE` and a
+seccomp profile that allows `move_pages` (Docker's default blocks it, and allows `mbind` only with `CAP_SYS_NICE`), or
+`--security-opt seccomp=unconfined` on a box you trust; without them the engine keeps one copy and says why. BIOS "Node Interleaving"
+must be Disabled: enabled, Linux sees one node and the mirror is off. Details, the A/B and how to check it with `numastat`:
+[docs/volta/VOLTA.md](volta/VOLTA.md); the whole sequence for a dual-Xeon V100 box: [docs/volta/RUNBOOK.md](volta/RUNBOOK.md).
 
 The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
 

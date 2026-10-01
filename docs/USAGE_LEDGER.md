@@ -3,6 +3,9 @@
 Design note (2026-10-01). Applies to both ports: Qwen3.8-Flash-Next on the V100 (`docs/volta/PLAN.md`, Phase 3)
 and DeepSeek-V4.1 (`docs/deepseek/PLAN.md`, DS-2).
 
+**Status: a design only. Nothing in this note is implemented** - there is no ledger file, no long-term counter and no ledger-driven
+placement in the engine. What exists today is only what the next section lists as "exists upstream".
+
 ## What exists upstream
 
 - **A starting profile** (`--expert-profile`, `STRP` format, `tools/make_profile.py`): every (layer, expert) pair
@@ -26,12 +29,17 @@ and DeepSeek-V4.1 (`docs/deepseek/PLAN.md`, DS-2).
      Set at start; refreshed slowly in the background (a few experts per minute, never a stall).
    - **GPU, "flex" share (~25 %):** the existing short-term adaptive swaps, for what the current task needs.
      The split is a setting, chosen by the measured hit rate the ledger records.
-   - **CPU (everything else): split evenly across the NUMA nodes by construction.** Every non-GPU expert's rows
-     are divided between the two sockets and each socket computes its half from local memory, so the commonly
-     used experts *are* divided equally across the nodes — at every token, not just on average. Placing whole
-     experts by frequency instead would balance only over time: on a given token the 3-5 missed experts of a
-     layer often land on one socket, and that socket sets the latency. So nothing moves between nodes at run time
-     (migrating pages of a 289 GB arena would cost more than it saves).
+   - **CPU (everything else): the NUMA layout does not depend on the ledger, and differs by port.**
+     - *DeepSeek* (`docs/deepseek/PLAN.md`, section 2) **row-splits** every non-GPU expert: each socket holds half of
+       its rows and computes its half from local memory, so the commonly used experts are divided equally across the
+       nodes by construction - at every token, not just on average. Placing whole experts by frequency instead would
+       balance only over time: on a given token the 3-5 missed experts of a layer often land on one socket, and that
+       socket sets the latency. The 269 GiB arena cannot be mirrored, and migrating its pages at run time would cost
+       more than it saves, so nothing moves between nodes.
+     - *Qwen* **mirrors** the expert arena (WP-F, `--numa auto`): each socket holds a FULL copy (the arena is 23-50 GB,
+       so two copies fit in 384 GiB) and each CPU worker reads its own node's copy, so any expert can be computed on
+       either socket from local memory. There is no placement of experts across nodes to decide.
+     In both ports the ledger decides only what the GPU holds (and, in the low-RAM modes, what stays in RAM).
    - **RAM vs SSD** (only when the experts do not all fit in RAM — the low-RAM modes): the ledger's ranking
      decides which experts stay resident (`--resident-budget-gib` already ranks by a profile).
 4. **Per-workload ledgers.** Coding and general chat use different hot sets (published V4.1 traces: overlap
@@ -41,9 +49,10 @@ and DeepSeek-V4.1 (`docs/deepseek/PLAN.md`, DS-2).
 ### Co-activation (which experts fire together)
 
 The ledger also keeps, per layer, how often pairs of experts are routed to the same token (a 384×384 or
-512×512 count per layer, a few MB in all). With every CPU expert split in half across the sockets, co-activation
-cannot unbalance them — two experts that always fire together are each computed by both sockets — so the counts
-are not needed for the NUMA layout. They are kept because they predict: when expert A is routed, the experts that
+512×512 count per layer, a few MB in all). With every CPU expert split in half across the sockets (DeepSeek) or
+held in full by both (Qwen's mirror), co-activation cannot unbalance them — two experts that always fire together are
+each computed by both sockets, or by whichever socket's workers take them — so the counts are not needed for the NUMA
+layout. They are kept because they predict: when expert A is routed, the experts that
 usually accompany A (in this layer, and in the next) are the ones to prefetch from the SSD or promote into VRAM
 first. If measurement ever shows whole experts per socket beating the split (e.g. the halves make the CPU
 kernels less efficient), the same counts give the placement for that variant: a balanced max-cut per layer that
@@ -57,6 +66,8 @@ few experts per minute, so neither ever blocks a token.
 
 ## Measuring that it works
 
-The ledger records, per session, the GPU hit rate of the core and flex shares and the CPU's bytes per token.
-`profile_decode.sh` / `--stats` print them; the acceptance test is a higher hit rate after a week of use than with
-the shipped profile, on the user's own prompts.
+The ledger would record, per session, the GPU hit rate of the core and flex shares and the CPU's bytes per token. Those
+counters do not exist yet; what exists today is the engine's single overall figure: `--stats` prints `R4 expert-cache hits`
+(hits of lookups, how full the cache is), and `tools/volta/profile_decode.sh`'s table shows it as "expert cache hit rate".
+The acceptance test, once the ledger is implemented, is a higher hit rate after a week of use than with the shipped
+profile, on the user's own prompts - read from that same figure, split by share.

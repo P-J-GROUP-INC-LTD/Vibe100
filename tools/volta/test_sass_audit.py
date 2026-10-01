@@ -189,6 +189,62 @@ class GateTests(unittest.TestCase):
         self.assertFalse(hit("strata::kernels::(anonymous namespace)::prompt_attn_volta_i8_kernel(float const*)"))
 
 
+class ToolDiscoveryTests(unittest.TestCase):
+    """cuobjdump must come from the toolkit that built the binaries, not from whatever is first on PATH (on a box with a newer card
+    that is often CUDA 13's, which does not read sm_70)."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        for sub in ("cuda128", "cuda13", "other12"):
+            (self.d / sub / "bin").mkdir(parents=True)
+            for tool in ("cuobjdump", "nvcc"):
+                (self.d / sub / "bin" / tool).write_text("#!/bin/sh\n")
+                (self.d / sub / "bin" / tool).chmod(0o755)
+        self.saved = (A.CUDA12_BINS, os.environ.get("PATH"), os.environ.get("CUDACXX"))
+        A.CUDA12_BINS = (str(self.d / "cuda128" / "bin"),)
+        os.environ["PATH"] = str(self.d / "cuda13" / "bin")           # the CUDA 13 one first (and only) on PATH
+        os.environ.pop("CUDACXX", None)
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        A.CUDA12_BINS = self.saved[0]
+        for k, v in zip(("PATH", "CUDACXX"), self.saved[1:]):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_a_12x_toolkit_beats_path(self):
+        self.assertEqual(A.find_tool("cuobjdump"), str(self.d / "cuda128" / "bin" / "cuobjdump"))
+
+    def test_path_is_the_last_resort(self):
+        A.CUDA12_BINS = (str(self.d / "nonexistent" / "bin"),)
+        self.assertEqual(A.find_tool("cuobjdump"), str(self.d / "cuda13" / "bin" / "cuobjdump"))
+
+    def test_the_toolkit_a_build_was_configured_with_comes_first(self):
+        build = self.d / "build"
+        build.mkdir()
+        (build / "CMakeCache.txt").write_text("CMAKE_BUILD_TYPE:STRING=Release\n"
+                                              f"CMAKE_CUDA_COMPILER:FILEPATH={self.d}/other12/bin/nvcc\n")
+        near = A.compiler_bins([build])
+        self.assertEqual(near, [str(self.d / "other12" / "bin")])
+        self.assertEqual(A.find_tool("cuobjdump", None, near), str(self.d / "other12" / "bin" / "cuobjdump"))
+        self.assertEqual(A.compiler_bins([self.d / "no_such_build"]), [])
+        os.environ["CUDACXX"] = str(self.d / "cuda128" / "bin" / "nvcc")
+        self.assertEqual(A.compiler_bins([]), [str(self.d / "cuda128" / "bin")])
+
+    def test_explicit_wins_and_a_missing_explicit_is_not_replaced(self):
+        e = self.d / "cuda13" / "bin" / "cuobjdump"
+        self.assertEqual(A.find_tool("cuobjdump", str(e), [str(self.d / "other12" / "bin")]), str(e))
+        self.assertIsNone(A.find_tool("cuobjdump", str(self.d / "nope")))
+
+    def test_compile_one_takes_the_cuobjdump_next_to_the_nvcc_it_compiled_with(self):
+        import compile_one as C
+        near = str(self.d / "other12" / "bin" / "nvcc")
+        self.assertEqual(C.find_nvcc_tool("cuobjdump", near=near), str(self.d / "other12" / "bin" / "cuobjdump"))
+
+
 @unittest.skipUnless(A.find_tool("cuobjdump") and shutil.which("nvcc") or Path("/usr/local/cuda-12.8/bin/nvcc").exists(),
                      "needs a CUDA 12.x toolkit")
 class EndToEnd(unittest.TestCase):

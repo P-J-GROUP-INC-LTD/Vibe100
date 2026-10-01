@@ -471,9 +471,31 @@ class LogposTests(unittest.TestCase):
         self.assertEqual(G.flag_value(a, "--prefill"), "auto")
         self.assertEqual(G.flag_value(a, "--adapt-swaps"), "0")
         self.assertEqual(int(G.flag_value(a, "--max-context")), 33792)
+        # a NON-native pack: `strata --serve` refuses to start without --spec T (T >= 2), --mtp DIR and --prefill CHUNK
+        # (generate.cpp:3681-3685), so the flags stay whatever the pack (they used to be dropped: exit status 2)
         plan.native = False
         a = G.build_serve_args(base, plan, fixed_experts=False, keep_spec=False)
-        self.assertNotIn("--spec", a)
+        self.assertEqual(G.flag_value(a, "--spec"), "4")
+        self.assertEqual(G.flag_value(a, "--mtp"), "/m/rt")
+        self.assertEqual(G.flag_value(a, "--prefill"), "auto")
+
+    def test_serve_args_without_spec_or_mtp_are_refused_with_the_reason(self):
+        plan = G.Plan("teacher", 33000, 1, 1, 32488, False)
+        plan.source, plan.turn_token, plan.split_at = "logpos", 123456, 32488
+        no_spec = [x for x in ArgsTests.CFG if x not in ("--spec", "4")]
+        with self.assertRaises(G.HarnessError) as cm:
+            G.build_serve_args(no_spec, plan, fixed_experts=True, keep_spec=False)
+        self.assertIn("--spec", str(cm.exception))
+        self.assertIn("3681", str(cm.exception))
+        self.assertIn("--teacher-source dump", str(cm.exception))          # a non-native pack has the other source
+        i = ArgsTests.CFG.index("--mtp")
+        no_mtp = ArgsTests.CFG[:i] + ArgsTests.CFG[i + 2:]
+        with self.assertRaises(G.HarnessError) as cm:
+            G.build_serve_args(no_mtp, plan, fixed_experts=True)
+        self.assertIn("no --mtp", str(cm.exception))
+        one = ArgsTests.CFG[:ArgsTests.CFG.index("--spec") + 1] + ["1"] + ArgsTests.CFG[ArgsTests.CFG.index("--spec") + 2:]
+        with self.assertRaises(G.HarnessError):                              # --spec 1 is below the engine's minimum of 2
+            G.build_serve_args(one, plan, fixed_experts=True)
 
 
 class OutputParseTests(unittest.TestCase):
@@ -601,6 +623,8 @@ class FlowTests(unittest.TestCase):
         (cls.d / "cfg.json").write_text(json.dumps(cls.cfg))
         native = dict(cls.cfg, args=["--pack", "pack_native/full", "--prefill", "auto", "--spec", "4", "--mtp", "x"])
         (cls.d / "cfg_native.json").write_text(json.dumps(native))
+        nospec = dict(cls.cfg, args=["--pack", "pack/full", "--prefill", "auto", "--max-context", "4096"])
+        (cls.d / "cfg_nospec.json").write_text(json.dumps(nospec))
 
     @classmethod
     def tearDownClass(cls):
@@ -771,10 +795,71 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(rep["config"]["source"], "logpos")
         log = (self.d / "wlp" / "cand.log").read_text().splitlines()[0]
-        self.assertNotIn("--spec", log)                                  # plain decode for a non-native pack unless --keep-spec
+        self.assertIn("--spec 4", log)                                   # `--serve` cannot start without them, whatever the pack
+        self.assertIn("--mtp x", log)
         rc, rep, out = self.go_lp("--tail", "300", env={"FAKE_CRASH": "1"})
         self.assertEqual(rc, 1, out)
         self.assertIn("CANDIDATE", rep["reasons"][0])
+
+    def test_logpos_without_spec_flags_stops_with_the_reason(self):
+        # no --spec / --mtp in the engine arguments: `strata --serve` could not start (exit 2 from the engine); the harness says why
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = G.main(["--engine-config", str(self.d / "cfg_nospec.json"), "--ids-file", str(self.d / "ids_lp.txt"),
+                         "--workdir", str(self.d / "wnospec"), "--tail", "300", "--teacher-source", "logpos"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--spec", err.getvalue())
+        self.assertIn("--mtp", err.getvalue())
+
+    def test_every_path_handed_to_the_engine_is_absolute(self):
+        # The engine runs in the config's cwd (here self.d), the harness is started from somewhere else with RELATIVE --workdir, --exe and
+        # --pack: the tokens file, the dumps, STRATA_LOGPOS, the engine and --pack must still name the files the harness reads back.
+        caller = self.d / "caller"
+        caller.mkdir(exist_ok=True)
+        shutil.copy(self.d / "fake_strata.py", caller / "engine_here.py")     # exists in the caller's directory only
+        shutil.rmtree(caller / "rel_out", ignore_errors=True)
+        shutil.rmtree(caller / "rel_lp", ignore_errors=True)
+        old = os.getcwd()
+        os.chdir(caller)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                rc = G.main(["--exe", "engine_here.py", "--cwd", str(self.d), "--pack", "../pack/full", "--engine-args", "--prefill auto",
+                             "--ids-file", str(self.d / "ids.txt"), "--workdir", "rel_out", "--tail", "300"])
+            self.assertEqual(rc, 0, out.getvalue())
+            w = caller / "rel_out"
+            head = (w / "cand.log").read_text().splitlines()[0].split()
+            self.assertEqual(Path(head[2]).name, "engine_here.py")
+            self.assertTrue(Path(head[2]).is_absolute())
+            joined = " ".join(head)
+            self.assertIn(f"--tokens-file {w}/tokens.ids", joined)
+            self.assertIn(f"--dump-logits {w}/cand.bin", joined)
+            self.assertIn(f"--pack {self.d}/pack/full", joined)
+            # the logpos source: STRATA_LOGPOS names a file under the caller's workdir, where the harness looks for it
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                rc = G.main(["--engine-config", str(self.d / "cfg_native.json"), "--ids-file", str(self.d / "ids_lp.txt"),
+                             "--workdir", "rel_lp", "--tail", "300"])
+            self.assertEqual(rc, 0, out.getvalue())
+            self.assertTrue((caller / "rel_lp" / "cand.logpos").exists())
+            self.assertFalse((self.d / "rel_lp").exists())                       # nothing was written under the engine's cwd
+        finally:
+            os.chdir(old)
+
+    def test_gate_q_line(self):
+        rc, rep, out = self.go("--tail", "500", name="gq")             # 500 scored rows after 2,500 batched tokens: the gate's own size
+        self.assertEqual(rc, 0, out)
+        self.assertIn("GATE Q (docs/volta/PLAN.md): PASS", out)
+        self.assertEqual(rep["gate_q"]["status"], "PASS")
+        rc, rep, out = self.go("--tail", "300", name="gq2")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("GATE Q (docs/volta/PLAN.md): not established", out)
+        self.assertIn("300 rows scored", out)
+        rc, rep, out = self.go("--tail", "500", env={"FAKE_NOISE": "4.0"}, name="gq3")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("GATE Q (docs/volta/PLAN.md): FAIL", out)
+        rc, rep, out = self.go("--mode", "greedy", "--max-new", "40", name="gq4")
+        self.assertIn("greedy mode", out.split("GATE Q")[1])
 
     def test_dry_run_prints_the_commands_and_runs_nothing(self):
         w = self.d / "wdry"

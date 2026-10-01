@@ -20,8 +20,12 @@ So on a V100 the format (NVFP4) is not the lever — **speculation is**, and it 
 
 All ninfer forks are Apache-2.0 (no NOTICE files except tp4's). Apache code cannot be relicensed to MIT: copying
 it would mean shipping the Apache text, a NOTICE crediting "Neroued/ninfer contributors" and change notices. Prefer
-the MIT sources (llama.cpp's fragment maps and FA kernels, v100-skinny's kernels) or reimplement — the useful
+the MIT sources (llama.cpp's fragment maps and FA kernels, v100-skinny's `kernels/`) or reimplement — the useful
 tricks are a few lines each.
+
+**v100-skinny is dual-licensed**, not simply MIT: its LICENSE gives MIT for `kernels/` and the other directories and
+Apache-2.0 for `fork_patches/`, which is taken from 1Cat-vLLM. This study uses only the MIT part (`kernels/`, where the QPN
+GEMV below lives); nothing from `fork_patches/` is used or recommended.
 
 ## Worth taking (ranked)
 
@@ -32,15 +36,16 @@ tricks are a few lines each.
    variant). Port llama.cpp's Volta FA kernel only if the WMMA kernel underperforms.
 2. **ReplaySSM** (record GDN inputs, replay only the accepted prefix on verify) — a smaller verify cost for the
    GDN layers under speculation. Compare with how Strata's verify handles GDN state before porting.
-3. **QPN** M=2..8 GEMV (v100-skinny, MIT): only the spec-verify widths gain; at M=1 plain SIMT is already near the
+3. **QPN** M=2..8 GEMV (v100-skinny `kernels/`, MIT): only the spec-verify widths gain; at M=1 plain SIMT is already near the
    bandwidth ceiling (752 of ~794 GB/s measured for W8).
 
 **For the DeepSeek MXFP4 GPU expert kernels (DS-D)**
 
-1. **1Cat-vLLM `csrc/sm70_turbomind/ops/mxfp4_qpn_m1_sm70.cu`** (Apache-2.0; layout from MIT v100-skinny): an M=1
+1. **1Cat-vLLM `csrc/sm70_turbomind/ops/mxfp4_qpn_m1_sm70.cu`** (Apache-2.0; layout from v100-skinny's MIT `kernels/`): an M=1
    MXFP4 tensor-core expert GEMV for DeepSeek V4 on V100 — all routed experts in one launch (`grid.y` = route),
    device-side expert ids, split-K 8/16. Hardcoded for hidden 4096 / 256 experts (ours: 5120 / 384). The design
-   alternative to the planned dp4a + LUT kernel; benchmark both on the V100.
+   alternative to the dp4a + LUT kernel. **Status: DS-D built only the dp4a kernel** (`7f8158b`); this tensor-core candidate was not
+   built, so there is nothing to benchmark it against yet (`docs/deepseek/PLAN.md`, DS-D row).
 2. Its **compact grouped launch** of only the active experts (1Cat design notes claim 54.6 → 1.96 ms per token on
    8x V100) — maps onto launching only the GPU cache hits.
 3. Two decode tricks: E8M0 → fp16 by rebasing the exponent (`<<10`, one ×16384 multiply), and repack-on-fill so a

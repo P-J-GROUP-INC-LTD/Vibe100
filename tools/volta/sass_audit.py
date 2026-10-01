@@ -34,7 +34,9 @@ libstrata_kernels.a), and applies two rules:
     python3 tools/volta/sass_audit.py --build build-sm70 --json audit.json --top 25
 
 Files may be executables, static libraries (.a), objects (.o) or cubins.  A directory argument is treated as a build
-directory.  Exit status: 0 = pass, 1 = a rule failed, 2 = could not run (no cuobjdump, nothing to scan).
+directory.  The cuobjdump used is the one next to the nvcc the build directory was configured with (CMakeCache.txt), else a CUDA 12.x
+toolkit's, else the one on PATH - never a CUDA 13 one when a 12.x is installed - or `--cuobjdump PATH`.  Exit status: 0 = pass,
+1 = a rule failed, 2 = could not run (no cuobjdump, nothing to scan).
 
 THE ALLOWLIST (`trap_allowlist.txt`) is one entry per line, `regex<TAB>justification`; `#` starts a comment.  The
 regex is searched in the DEMANGLED name (with its parameter list, e.g. `void mul_mat_q<(ggml_type)21, 72, false>(...)`).
@@ -68,17 +70,50 @@ DEFAULT_REQUIRED = HERE / "hmma_required.txt"
 # ---------------------------------------------------------------------------------------------- tool discovery
 
 
-def find_tool(name: str, explicit: str | None = None) -> str | None:
+CUDA12_BINS = ("/usr/local/cuda-12.8/bin", "/usr/local/cuda-12.9/bin", "/usr/local/cuda-12.6/bin", "/usr/local/cuda-12.4/bin")
+
+
+def compiler_bins(build_dirs) -> list[str]:
+    """The bin/ directories of the CUDA compilers the given CMake build directories were configured with (CMAKE_CUDA_COMPILER in
+    CMakeCache.txt) - the toolkit that made the binaries, whose cuobjdump reads them best - and of $CUDACXX."""
+    out: list[str] = []
+    for d in build_dirs:
+        try:
+            for line in (Path(d) / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("CMAKE_CUDA_COMPILER:"):
+                    out.append(str(Path(line.split("=", 1)[1].strip()).parent))
+                    break
+        except OSError:
+            continue
+    cxx = os.environ.get("CUDACXX")
+    if cxx:
+        out.append(str(Path(shutil.which(cxx) or cxx).parent))
+    return out
+
+
+def find_tool(name: str, explicit: str | None = None, near: list[str] | None = None) -> str | None:
+    """A CUDA tool: the explicit path; else the copy in a `near` directory (the bin/ of the nvcc the binaries were built with); else the
+    CUDA 12.x toolkits' (CUDA 13's cuobjdump does not read sm_70 - and it is what PATH often holds on a box that also has a newer
+    card); PATH, then the unversioned /usr/local/cuda, last."""
     if explicit:
         return explicit if Path(explicit).exists() else None
-    cands = [shutil.which(name)]
-    for root in ("/usr/local/cuda-12.8/bin", "/usr/local/cuda-12.9/bin", "/usr/local/cuda-12.6/bin",
-                 "/usr/local/cuda-12.4/bin", "/usr/local/cuda/bin", "/opt/cuda/bin"):
-        cands.append(f"{root}/{name}")
+    cands = [f"{d}/{name}" for d in (near or [])]
+    cands += [f"{d}/{name}" for d in CUDA12_BINS]
+    cands += [shutil.which(name), f"/usr/local/cuda/bin/{name}", f"/opt/cuda/bin/{name}"]
     for c in cands:
         if c and Path(c).exists():
             return c
     return None
+
+
+def tool_release(path: str) -> str | None:
+    """`12.8` from `<tool> --version`, or None (best effort: only used to warn about a CUDA 13 cuobjdump)."""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"release (\d+\.\d+)", out)
+    return m.group(1) if m else None
 
 
 # ------------------------------------------------------------------------------------------------- the parsers
@@ -515,16 +550,21 @@ def main(argv=None) -> int:
     ap.add_argument("--list-traps", action="store_true", help="print every allowlisted trap kernel, not only the counts")
     ap.add_argument("-v", "--verbose", action="store_true", help="also list the allowlist entries that matched nothing")
     ap.add_argument("--jobs", type=int, default=2, help="files scanned in parallel (default 2: cuobjdump is CPU-bound)")
-    ap.add_argument("--cuobjdump", help="path to cuobjdump (default: PATH, then /usr/local/cuda-12.*/bin)")
+    ap.add_argument("--cuobjdump", help="path to cuobjdump (default: the one next to the nvcc a --build directory was configured with "
+                                        "($CUDACXX too), then /usr/local/cuda-12.*/bin, then PATH)")
     ap.add_argument("--max-stack", type=int, default=0,
                     help="also FAIL when a kernel that is not allowlisted has a stack frame above this many bytes "
                          "(default 0 = off)")
     a = ap.parse_args(argv)
 
-    tool = find_tool("cuobjdump", a.cuobjdump)
+    tool = find_tool("cuobjdump", a.cuobjdump, compiler_bins(a.build + [x for x in a.paths if Path(x).is_dir()]))
     if not tool:
         print("sass_audit: cuobjdump not found (install a CUDA 12.x toolkit, or pass --cuobjdump)", file=sys.stderr)
         return 2
+    release = tool_release(tool)
+    if release and release.split(".")[0] != "12":
+        print(f"sass_audit: WARNING: {tool} is from CUDA {release}; only a CUDA 12.x cuobjdump reads sm_70 code reliably (CUDA 13 dropped "
+              "Volta): pass --cuobjdump /usr/local/cuda-12.8/bin/cuobjdump", file=sys.stderr)
 
     files: list[Path] = []
     for b in a.build:

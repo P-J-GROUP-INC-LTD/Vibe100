@@ -1,27 +1,41 @@
 #!/usr/bin/env python3
-"""tools/volta/summarize_profile.py - the Phase-0 table of docs/volta/PLAN.md from what profile_decode.sh collected.
+"""tools/volta/summarize_profile.py - the Phase-3 profile table of docs/volta/PLAN.md from what profile_decode.sh collected.
 
-Phase 0 asks one question before any kernel is touched: where does a decode step on THIS V100 box actually go?  The plan
+The profile asks one question before any kernel is touched: where does a decode step on THIS V100 box actually go?  The plan
 expects the answer to be the expert cache hit rate, the CPU's expert throughput and PCIe - not the GPU kernels - and the
 Gate-1 target (IQ3 decode >= 40 tok/s) depends on which of those is the limit.  This script turns the engine's `--stats`
-printout and Nsight Systems' CSV summaries into the table that decides that:
+printout and Nsight Systems' output into the table that decides that:
 
-    GPU kernel time by kernel      top 15, % of all kernel time               (nsys cuda_gpu_kern_sum)
+    GPU kernel time by kernel      top 15, % of kernel time IN THE DECODE WINDOW  (nsys sqlite; whole run from the CSV)
     CPU expert compute time        the pool's ms per round / per token         (--stats: "pool multi", "the CPU expert pool")
     GPU idle share                 1 - (pure GPU floor) / (wall time per token)   (--gpu-only-full vs --stats "decode")
-                                   and kernel-busy share of the profiled run   (nsys)
+                                   and kernel-busy share of the decode window  (nsys)
     expert cache hit rate          GPU tier hits / lookups                     (--stats "R4 expert-cache hits")
     MTP acceptance                 tokens per verify round, drafts accepted    (--stats "speculation")
-    PCIe traffic per token         H2D + D2H MB / generated tokens             (nsys cuda_gpu_mem_size_sum)
+    PCIe traffic per token         (H2D + D2H cudaMemcpy MB in the decode window) / generated tokens   (nsys sqlite)
     tok/s                          decode and prefill                          (--stats "decode" / "prefill")
+
+WHAT EACH NUMBER COVERS.  nsys profiles the whole process, and a process that has just started is busy with things that are
+not decoding: it uploads the dense weights (GBs) and fills the GPU expert cache before the first token.  A figure summed over
+the whole trace and divided by the token count is therefore tens of GB per token of nothing the decode does.  So the table
+separates the two:
+  * every "per token" figure and every "(decode window)" figure covers ONLY the decode window: the last <decode ms> of the
+    profiled run, <decode ms> being the engine's own `decode N tokens in X ms` line of that run, ending where the GPU's last
+    activity ends (nothing is launched after the decode loop).  This needs the trace's SQLite export (`--nsys-sqlite
+    decode.sqlite`, which `nsys stats` / `nsys export` write next to the .nsys-rep) and the nsys run's own output (`--nsys-run`);
+  * every figure labelled "whole run" covers everything in the trace, start-up and prompt included, and is never divided by the
+    token count.  Given only the CSV summaries (`--nsys-kern` ... - they cannot be cut by time) the table has whole-run rows only
+    and says so; it has no per-token PCIe figure then.
+The engine writes no NVTX ranges and no cudaProfilerStart/Stop, so the window is found from its own timing, not marked by it.
 
 Every number is parsed from the exact strings src/program/generate.cpp prints at the end of main() (the printf formats are
 reproduced in test_summarize_profile.py, so a change of wording there breaks a test here instead of silently producing an
 empty table).  Missing inputs leave their rows out and say so; nothing is guessed.
 
     python3 tools/volta/summarize_profile.py --stats stats.txt [--gpu-floor floor.txt] \\
+        [--nsys-sqlite decode.sqlite] [--nsys-run run.txt] \\
         [--nsys-kern cuda_gpu_kern_sum.csv] [--nsys-memsize cuda_gpu_mem_size_sum.csv] [--nsys-memtime cuda_gpu_mem_time_sum.csv] \\
-        [--nsys-run run.txt] [--serve-log strata-q2_0.log] [--tokens N] [--json out.json] [--gpu "Tesla V100-PCIE-32GB, 7.0"]
+        [--serve-log strata-q2_0.log] [--tokens N] [--json out.json] [--gpu "Tesla V100-PCIE-32GB, 7.0"]
 
 `--serve-log` reads a deployed engine's log (`strata serve:` lines on stderr, `DONE` lines, the server's own `[strata] done:`
 lines) and tabulates the last requests: prompt speed, decode speed, draft acceptance, expert cache hit rate.
@@ -33,7 +47,9 @@ import csv
 import io
 import json
 import re
+import sqlite3
 import sys
+import urllib.parse
 from pathlib import Path
 
 # ---------------------------------------------------------------------------------------------- the engine's --stats
@@ -86,7 +102,7 @@ def _num(x: str):
 
 
 def parse_stats(text: str) -> dict:
-    """Everything `strata --stats` (and `--gpu-only-full`) printed that Phase 0 uses.  Keys absent from the text are absent."""
+    """Everything `strata --stats` (and `--gpu-only-full`) printed that the profile uses.  Keys absent from the text are absent."""
     out: dict = {}
     g = lambda k: _RX[k].search(text)
     m = g("decode")
@@ -282,10 +298,113 @@ def _sum_ops(d: dict, *needles: str) -> float:
     return sum(v for k, v in d.items() if any(n in k.lower() for n in needles))
 
 
+# ------------------------------------------------------------------------------------------ the nsys SQLite export
+# `nsys stats` / `nsys export --type sqlite` write <report>.sqlite: CUPTI_ACTIVITY_KIND_KERNEL (start, end in ns, the name as a
+# StringIds id), CUPTI_ACTIVITY_KIND_MEMCPY (start, end, bytes, copyKind) and StringIds (id, value).  The CSV summaries nsys
+# prints are totals over the whole trace and cannot be cut by time; this can.
+
+_COPY_KIND = {1: "[CUDA memcpy Host-to-Device]", 2: "[CUDA memcpy Device-to-Host]", 3: "[CUDA memcpy Host-to-Array]",
+              4: "[CUDA memcpy Array-to-Host]", 5: "[CUDA memcpy Array-to-Array]", 6: "[CUDA memcpy Array-to-Device]",
+              7: "[CUDA memcpy Device-to-Array]", 8: "[CUDA memcpy Device-to-Device]", 9: "[CUDA memcpy Host-to-Host]",
+              10: "[CUDA memcpy Peer-to-Peer]"}
+
+
+class NsysSqliteError(Exception):
+    pass
+
+
+def _columns(con: sqlite3.Connection, table: str) -> list[str]:
+    return [r[1] for r in con.execute(f"PRAGMA table_info({table})")]
+
+
+def _mem_dict(rows) -> dict:
+    out: dict = {"size_mb": {}, "count": {}, "time_ns": {}}
+    for kind, nbytes, n, ns in rows:
+        op = _COPY_KIND.get(int(kind), f"[CUDA memcpy kind {kind}]")
+        out["size_mb"][op] = out["size_mb"].get(op, 0.0) + (nbytes or 0) / 1e6
+        out["count"][op] = out["count"].get(op, 0) + int(n)
+        out["time_ns"][op] = out["time_ns"].get(op, 0.0) + (ns or 0)
+    return out
+
+
+def read_nsys_sqlite(path: str, window_ms: float | None, top: int = 15) -> dict:
+    """The kernel and memcpy activity of an nsys SQLite export, over the whole trace and over its DECODE WINDOW.
+
+    The window is the last `window_ms` of the trace - the engine's own decode time, taken from the nsys run's output - ending at
+    the last GPU activity (kernel or copy); an activity belongs to it when it STARTS inside.  `window_ms` None: no window, the
+    whole-run figures only.  Raises NsysSqliteError with the reason when the file cannot be used."""
+    p = Path(path)
+    if not p.exists():
+        raise NsysSqliteError(f"{path}: no such file (nsys stats / nsys export --type sqlite writes it next to the .nsys-rep)")
+    try:
+        con = sqlite3.connect("file:" + urllib.parse.quote(str(p.resolve())) + "?mode=ro", uri=True)
+    except sqlite3.Error as e:
+        raise NsysSqliteError(f"{path}: cannot open: {e}") from e
+    try:
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        kt, mt = "CUPTI_ACTIVITY_KIND_KERNEL", "CUPTI_ACTIVITY_KIND_MEMCPY"
+        if kt not in tables and mt not in tables:
+            raise NsysSqliteError(f"{path}: no CUDA kernel or memcpy table (was nsys run with --trace=cuda?)")
+        has_k, has_m = kt in tables, mt in tables
+        name_col = None
+        if has_k:
+            kc = _columns(con, kt)
+            name_col = next((c for c in ("demangledName", "shortName", "mangledName") if c in kc), None)
+            if "start" not in kc or "end" not in kc or name_col is None:
+                raise NsysSqliteError(f"{path}: {kt} has columns {kc}: expected start, end and a name column")
+        if has_m:
+            mc = _columns(con, mt)
+            if not {"start", "end", "bytes", "copyKind"} <= set(mc):
+                raise NsysSqliteError(f"{path}: {mt} has columns {mc}: expected start, end, bytes, copyKind")
+        t0 = t1 = None
+        for tbl, ok in ((kt, has_k), (mt, has_m)):
+            if not ok:
+                continue
+            lo, hi = con.execute(f"SELECT MIN(start), MAX(end) FROM {tbl}").fetchone()
+            if lo is None:
+                continue
+            t0 = lo if t0 is None else min(t0, lo)
+            t1 = hi if t1 is None else max(t1, hi)
+        if t0 is None:
+            raise NsysSqliteError(f"{path}: the trace has no kernels and no copies")
+        win0 = None if window_ms is None else max(t0, t1 - int(window_ms * 1e6))
+
+        def kernels(since: int | None) -> dict:
+            if not has_k:
+                return kernel_table([], top)
+            where, args = ("WHERE k.start >= ?", (since,)) if since is not None else ("", ())
+            q = (f"SELECT COALESCE(s.value, CAST(k.{name_col} AS TEXT)), SUM(k.end - k.start), COUNT(*) "
+                 f"FROM {kt} k LEFT JOIN StringIds s ON s.id = k.{name_col} {where} GROUP BY 1") if "StringIds" in tables else \
+                (f"SELECT CAST(k.{name_col} AS TEXT), SUM(k.end - k.start), COUNT(*) FROM {kt} k {where} GROUP BY 1")
+            rows = [{"name": n, "totaltimens": str(tot), "instances": str(cnt), "avgns": str(tot / cnt)}
+                    for n, tot, cnt in con.execute(q, args)]
+            return kernel_table(rows, top)
+
+        def copies(since: int | None) -> dict:
+            if not has_m:
+                return _mem_dict([])
+            where, args = ("WHERE start >= ?", (since,)) if since is not None else ("", ())
+            return _mem_dict(con.execute(f"SELECT copyKind, SUM(bytes), COUNT(*), SUM(end - start) FROM {mt} {where} GROUP BY copyKind", args))
+
+        out = {"span_ms": (t1 - t0) / 1e6, "kern_all": kernels(None), "mem_all": copies(None), "window_ms": None,
+               "kern_win": None, "mem_win": None, "before_window_ms": None}
+        if win0 is not None:
+            out.update(window_ms=(t1 - win0) / 1e6, kern_win=kernels(win0), mem_win=copies(win0), before_window_ms=(win0 - t0) / 1e6)
+        return out
+    except sqlite3.Error as e:
+        raise NsysSqliteError(f"{path}: {e}") from e
+    finally:
+        con.close()
+
+
 # -------------------------------------------------------------------------------------------------------- the table
 
 
-def build_summary(stats: dict, floor: dict, kern: dict | None, mem: dict | None, nsys_run: dict, tokens: int | None) -> dict:
+def build_summary(stats: dict, floor: dict, kern: dict | None, mem: dict | None, nsys_run: dict, tokens: int | None,
+                  window: dict | None = None, window_note: str = "") -> dict:
+    """The rows of the table.  `kern` / `mem`: whole-run kernel and memcpy summaries from nsys's CSV reports; `window`: the result of
+    `read_nsys_sqlite` with a window, which supersedes them and adds the decode-window figures (and the per-token ones).
+    `window_note`: why there is no window although a SQLite file or an nsys run was given (said in the table)."""
     s: dict = {"rows": []}
     dec = stats.get("decode")
     n_dec = tokens or (dec["tokens"] if dec else None)
@@ -332,41 +451,78 @@ def build_summary(stats: dict, floor: dict, kern: dict | None, mem: dict | None,
         if wall:
             idle = max(0.0, 1.0 - gf["ms_per_token"] / wall)
             row("GPU idle share", f"{100 * idle:.0f}%", f"1 - floor {gf['ms_per_token']:.1f} / wall {wall:.1f} ms per token: the time the GPU waits for the CPU pool, PCIe, drafting and the host")
-    if kern:
+    n_nsys = nsys_run.get("decode", {}).get("tokens") or n_dec
+    has_win = bool(window and window.get("kern_win") is not None)
+    if window:
+        # from the SQLite export: the decode window and the whole run, kept apart
+        kern, mem = window["kern_all"], window["mem_all"]
+    if has_win:
+        kw, mw, wms = window["kern_win"], window["mem_win"], window["window_ms"]
+        busy_w = kw["total_ns"] / 1e6
+        per_tok = f" = {busy_w / n_nsys:.2f} ms per generated token;" if n_nsys else ";"
+        row("GPU kernel time (decode window)", f"{busy_w:.0f} ms",
+            f"{kw['n_kernels']} kernels in the last {wms:.0f} ms of the profiled run (the engine's own decode time, ending at the last GPU "
+            f"activity){per_tok} {100 * busy_w / wms:.0f}% of the window (an upper bound: concurrent streams overlap)")
+        busy_a = kern["total_ns"] / 1e6
+        row("GPU kernel time (whole run, incl. start-up and prompt)", f"{busy_a:.0f} ms",
+            f"{kern['n_kernels']} kernels over the {window['span_ms']:.0f} ms trace, {window['before_window_ms']:.0f} ms of it before the decode window; "
+            "not a decode figure")
+        tcs_src = kw
+        tcs_scope = "decode window"
+    elif kern:
         run_ms = None
         if nsys_run.get("decode") or nsys_run.get("prefill"):
             run_ms = (nsys_run.get("decode", {}).get("ms", 0) or 0) + (nsys_run.get("prefill", {}).get("ms", 0) or 0)
         busy = kern["total_ns"] / 1e6
-        row("GPU kernel time (nsys, whole profiled run)", f"{busy:.0f} ms", f"{kern['n_kernels']} kernels; top 15 = {kern['top_pct']:.0f}%"
-            + (f"; {100 * busy / run_ms:.0f}% of the run's {run_ms:.0f} ms wall clock (an upper bound: concurrent streams overlap)" if run_ms else ""))
-    if kern:
-        tcs = kern.get("tensor_core_ns", 0)
-        row("tensor-core kernel time (by name)", f"{100 * tcs / kern['total_ns']:.1f}%" if kern["total_ns"] else "-",
-            "; ".join(kern.get("tensor_core_names", [])[:2])[:110] or "no kernel name looks like a tensor-core kernel (a decode-only profile has none; profile a long "
+        row("GPU kernel time (nsys, WHOLE run, incl. start-up)", f"{busy:.0f} ms", f"{kern['n_kernels']} kernels; top 15 = {kern['top_pct']:.0f}%"
+            + (f"; {100 * busy / run_ms:.0f}% of the engine's decode + prefill wall clock of {run_ms:.0f} ms (an upper bound: concurrent streams overlap; "
+               "the trace also holds the start-up)" if run_ms else "")
+            + (f"; {window_note}" if window_note else ""))
+        tcs_src = kern
+        tcs_scope = "WHOLE run"
+    else:
+        tcs_src = None
+    if tcs_src:
+        tcs = tcs_src.get("tensor_core_ns", 0)
+        row(f"tensor-core kernel time (by name, {tcs_scope})", f"{100 * tcs / tcs_src['total_ns']:.1f}%" if tcs_src["total_ns"] else "-",
+            "; ".join(tcs_src.get("tensor_core_names", [])[:2])[:110] or "no kernel name looks like a tensor-core kernel (a decode-only profile has none; profile a long "
             "prompt with --nsys-prompt-tokens 0 to see the prefill GEMMs and the Volta attention)")
-    if mem:
+    if has_win:
+        h2d = _sum_ops(mw["size_mb"], "host-to-device", "htod")
+        d2h = _sum_ops(mw["size_mb"], "device-to-host", "dtoh")
+        if n_nsys:
+            row("PCIe traffic per token (decode window)", f"{(h2d + d2h) / n_nsys:.2f} MB",
+                f"H2D {h2d:.1f} MB + D2H {d2h:.1f} MB over {n_nsys} generated tokens, cudaMemcpy only (a kernel reading mapped host memory is not counted)")
+        else:
+            row("PCIe traffic (decode window)", f"H2D {h2d:.1f} MB, D2H {d2h:.1f} MB", "no token count: pass --tokens or --nsys-run")
+        h2d_a = _sum_ops(mem["size_mb"], "host-to-device", "htod")
+        d2h_a = _sum_ops(mem["size_mb"], "device-to-host", "dtoh")
+        row("PCIe traffic (whole run, incl. start-up)", f"H2D {h2d_a:.0f} MB, D2H {d2h_a:.0f} MB",
+            "everything in the trace: the dense-weight upload and the expert-cache fill before the first token are in it; NOT a per-token figure")
+        t_cpy = _sum_ops(mw["time_ns"], "memcpy") / 1e6
+        if t_cpy:
+            row("copy engine busy time (decode window)", f"{t_cpy:.0f} ms", "sum of memcpy durations")
+    elif mem:
         h2d = _sum_ops(mem["size_mb"], "host-to-device", "htod")
         d2h = _sum_ops(mem["size_mb"], "device-to-host", "dtoh")
-        n_nsys = nsys_run.get("decode", {}).get("tokens") or n_dec
-        if n_nsys:
-            row("PCIe traffic per token", f"{(h2d + d2h) / n_nsys:.1f} MB", f"H2D {h2d:.0f} MB + D2H {d2h:.0f} MB over {n_nsys} generated tokens"
-                " (includes the prompt's prefill traffic: profile a short prompt for a pure decode figure)")
-        else:
-            row("PCIe traffic", f"H2D {h2d:.0f} MB, D2H {d2h:.0f} MB", "no token count: pass --tokens")
+        row("PCIe traffic (nsys, WHOLE run, incl. start-up)", f"H2D {h2d:.0f} MB, D2H {d2h:.0f} MB",
+            "everything in the trace: the dense-weight upload and the start-up expert-cache fill are in it, so this is NOT a per-token figure; "
+            "the per-token one needs --nsys-sqlite (the CSV summaries cannot be cut by time)" + (f" [{window_note}]" if window_note else ""))
         t_cpy = _sum_ops(mem["time_ns"], "memcpy") / 1e6
         if t_cpy:
-            row("copy engine busy time (nsys)", f"{t_cpy:.0f} ms", "sum of memcpy durations")
+            row("copy engine busy time (nsys, WHOLE run)", f"{t_cpy:.0f} ms", "sum of memcpy durations")
     t = stats.get("tiers")
     if t:
         row("expert tiers during decode", f"RAM {t['ram_blobs']} / file {t['file_blobs']} blobs", f"{t['file_mb']:.1f} MB read from the files")
     pe = stats.get("pcie_experts")
     if pe:
         row("experts read over PCIe by the GPU", f"{pe['distinct_per_layer']:.2f} per layer", f"share {pe['share_256']}/256 of the misses (--pcie-frac)")
+    s["kern_shown"] = (window["kern_win"], "decode window") if has_win else ((kern, "WHOLE run, incl. start-up") if kern else None)
     return s
 
 
 def format_table(summary: dict, kern: dict | None, gpu: str | None, serve: list[dict] | None) -> str:
-    L = ["Phase 0 - where a decode step goes" + (f"   [{gpu}]" if gpu else "")]
+    L = ["Profile - where a decode step goes" + (f"   [{gpu}]" if gpu else "")]
     if not summary["rows"]:
         L.append("  (no recognisable --stats output: did the run print its summary? is the file the engine's stdout?)")
     else:
@@ -376,15 +532,17 @@ def format_table(summary: dict, kern: dict | None, gpu: str | None, serve: list[
         L.append("  " + "-" * w + "  " + "-" * v + "  " + "-" * 40)
         for r in summary["rows"]:
             L.append(f"  {r['name'].ljust(w)}  {r['value'].ljust(v)}  {r['note']}")
+    shown = summary.get("kern_shown")
+    kern, scope = shown if shown else (kern, "WHOLE run, incl. start-up")
     if kern and kern["top"]:
-        L += ["", f"GPU kernel time by kernel (nsys cuda_gpu_kern_sum; total {kern['total_ns'] / 1e6:.1f} ms, {kern['n_kernels']} kernels)",
+        L += ["", f"GPU kernel time by kernel ({scope}; total {kern['total_ns'] / 1e6:.1f} ms, {kern['n_kernels']} kernels)",
               f"  {'%':>6}  {'total ms':>10}  {'calls':>8}  {'avg us':>9}  kernel"]
         for k in kern["top"]:
             name = k["name"]
             name = name if len(name) <= 96 else name[:93] + "..."
             avg = f"{k['avg_ns'] / 1000:.1f}" if k.get("avg_ns") else "-"
             L.append(f"  {k['pct']:>6.1f}  {k['total_ns'] / 1e6:>10.2f}  {k['instances']:>8}  {avg:>9}  {name}")
-        L.append(f"  top {len(kern['top'])} = {kern['top_pct']:.1f}% of all kernel time")
+        L.append(f"  top {len(kern['top'])} = {kern['top_pct']:.1f}% of the kernel time shown")
     if serve:
         L += ["", "Deployed engine, last requests (from the log)"]
         for r in serve:
@@ -413,10 +571,13 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stats", help="the engine's stdout/stderr of a `--stats` run")
     ap.add_argument("--gpu-floor", help="the engine's output of a `--gpu-only-full` run")
-    ap.add_argument("--nsys-kern", help="`nsys stats --report cuda_gpu_kern_sum --format csv` output")
-    ap.add_argument("--nsys-memsize", help="... cuda_gpu_mem_size_sum")
-    ap.add_argument("--nsys-memtime", help="... cuda_gpu_mem_time_sum")
-    ap.add_argument("--nsys-run", help="the engine's own output of the run nsys profiled (its decode / prefill wall clock)")
+    ap.add_argument("--nsys-sqlite", help="the nsys trace's SQLite export (decode.sqlite): gives the decode-window and per-token "
+                                          "figures; needs --nsys-run")
+    ap.add_argument("--nsys-kern", help="`nsys stats --report cuda_gpu_kern_sum --format csv` output (whole run only)")
+    ap.add_argument("--nsys-memsize", help="... cuda_gpu_mem_size_sum (whole run only)")
+    ap.add_argument("--nsys-memtime", help="... cuda_gpu_mem_time_sum (whole run only)")
+    ap.add_argument("--nsys-run", help="the engine's own output of the run nsys profiled (its decode / prefill wall clock: the "
+                                       "decode window's length)")
     ap.add_argument("--serve-log", help="a deployed engine's log (strata-*.log) or the server's console")
     ap.add_argument("--tokens", type=int, help="generated tokens of the profiled run (default: from the engine output)")
     ap.add_argument("--top", type=int, default=15, help="kernels in the table (default 15)")
@@ -432,19 +593,39 @@ def main(argv=None) -> int:
     if a.nsys_memsize or a.nsys_memtime:
         mem = mem_tables(parse_nsys_csv(read_text(a.nsys_memsize), "operation") if a.nsys_memsize else [],
                          parse_nsys_csv(read_text(a.nsys_memtime), "operation") if a.nsys_memtime else [])
+    window, window_note = None, ""
+    if a.nsys_sqlite:
+        window_ms = (nsys_run.get("decode") or {}).get("ms")
+        if not window_ms:
+            window_note = (f"no decode window: {a.nsys_run or 'the nsys run output (--nsys-run)'} has no `decode N tokens in X ms` line "
+                           "(did the profiled run finish?)")
+        try:
+            window = read_nsys_sqlite(a.nsys_sqlite, window_ms or None, a.top)
+        except NsysSqliteError as e:
+            window_note = f"no decode window: {e}"
+            print(f"summarize_profile: {e}", file=sys.stderr)
     serve = parse_serve_log(read_text(a.serve_log)) if a.serve_log else None
     if serve:
         hits = [r["hit_rate"] for r in serve if "hit_rate" in r]
         if hits and "cache" not in stats:
             stats["serve_hit"] = hits[-1]
-    if not stats and not floor and not kern and not serve:
+    if not stats and not floor and not kern and not serve and window is None:
         print("summarize_profile: nothing to summarize (give --stats, --nsys-kern, --serve-log ...)", file=sys.stderr)
         return 2
-    summary = build_summary(stats, floor, kern, mem, nsys_run, a.tokens)
+    summary = build_summary(stats, floor, kern, mem, nsys_run, a.tokens, window, window_note)
     print(format_table(summary, kern, a.gpu, serve))
     if a.json:
-        Path(a.json).write_text(json.dumps({"gpu": a.gpu, "stats": stats, "gpu_floor": floor.get("gpu_floor"), "summary": summary,
-                                            "kernels": kern, "memory": mem, "serve": serve}, indent=1), encoding="utf-8")
+        shown = summary.pop("kern_shown", None)
+        doc = {"gpu": a.gpu, "stats": stats, "gpu_floor": floor.get("gpu_floor"), "summary": summary,
+               "kernels": shown[0] if shown else kern, "kernels_scope": shown[1] if shown else "WHOLE run, incl. start-up",
+               "memory": mem, "serve": serve}
+        if window:
+            doc["whole_run"] = {"span_ms": window["span_ms"], "kernels": window["kern_all"], "memory": window["mem_all"]}
+            if window["kern_win"] is not None:
+                doc["decode_window"] = {"window_ms": window["window_ms"], "before_window_ms": window["before_window_ms"],
+                                        "tokens": nsys_run.get("decode", {}).get("tokens"), "kernels": window["kern_win"],
+                                        "memory": window["mem_win"]}
+        Path(a.json).write_text(json.dumps(doc, indent=1), encoding="utf-8")
         print(f"summarize_profile: wrote {a.json}", file=sys.stderr)
     return 0
 

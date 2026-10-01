@@ -86,7 +86,7 @@ Environment variables unless noted; defaults checked in the source.
 | `STRATA_NUMA_GPU_NODE` | unset (read from sysfs; if the BIOS gives none the first node is assumed, and the log says so) | `N` names the GPU's NUMA node |
 | `STRATA_NUMA_HEADROOM_GIB` | 6 | free memory each node must keep beyond its arena copy, or the engine keeps one copy |
 | `STRATA_FORCE_AVX512_NOVBMI` | unset | `1` runs the no-VBMI build on a CPU that has VBMI, to compare the two |
-| `STRATA_IQ512` | unset | when set (the code tests only that it is set), the AVX-512 i-quant rows are used for every format on any AVX-512 CPU |
+| `STRATA_IQ512` | unset | `1`: the AVX-512 i-quant rows for every format on any AVX-512 CPU (the A/B on Cascade Lake) |
 
 ## Quick start on a V100 box
 
@@ -103,18 +103,18 @@ CUDA 12.x (asks before installing 12.8), compiles the engine for sm_70 (10-20 mi
 downloads and prepares the model like for any card. `./setup.sh --check` only checks card, driver and RAM and says
 whether a CUDA 12 toolkit was found. CUDA 12.8 is the version the port was compiled with; not 13.
 
-**4. Verify, in this order** (the plan's phases, [docs/volta/PLAN.md](docs/volta/PLAN.md) section 3):
+**4. Verify, in this order** — the step-by-step version, with exact commands and what to send back after each step, is
+[docs/volta/RUNBOOK.md](docs/volta/RUNBOOK.md); the gates are defined once in [docs/volta/PLAN.md](docs/volta/PLAN.md) section 3:
 
 | Phase | Tool | Gate |
 |---|---|---|
-| 0 profile one decode step on this card | `tools/volta/profile_decode.sh --config strata-<model>.json` (+ `summarize_profile.py`; `--strict` stops unless cc is 7.0) | **Gate 0:** the numbers come from a V100 (a P4000 baseline says nothing) |
-| 1 build for sm_70 and run every GPU parity program | `tools/volta/run_parity.sh` (`--require-v100`, `--skip-build`) | all pass |
-| 2 correctness: Volta paths vs FP32 reference paths on the same card | `python3 tools/volta/golden_compare.py --engine-config strata-<model>.json --prompt-name long --tail 512` | top-1 >= 99%, perplexity within 1-2% (the tool's default threshold is 2%), no NaN/inf |
-| 3 tuning, data-driven from phase 0 | `./setup.sh --calibrate`, `--stats`, `--pcie-frac` | **Gate 1:** IQ3 decode >= 40 tok/s on one V100 and phase 2 passing; if not, stop and reassess Volta before any DeepSeek engine work |
+| 0 the box and the card: BIOS, OS settings, the R580 proprietary driver (not `-open`: NVIDIA's open modules do not drive Volta) | `nvidia-smi --query-gpu=name,compute_cap --format=csv`, `numactl -H` | **Gate 0:** the card says 7.0, Linux sees two NUMA nodes |
+| 1 build for sm_70 and run every GPU parity program and the SASS audit | `.venv/bin/cmake --build build --target strata-device && build/strata-device --selftest`, then `tools/volta/run_parity.sh --ggml-dir third_party/llama.cpp --require-v100` | **Gate P:** the script prints `GATE P (...): PASS` |
+| 2 correctness: Volta paths vs FP32 reference paths on the same card | `.venv/bin/python tools/volta/golden_compare.py --engine-config strata-<model>.json --prompt-name long --tail 512` | **Gate Q:** top-1 >= 99%, perplexity within 2%, no NaN/inf |
+| 3 profile one decode step, then tune (A/B switches, `./setup.sh --calibrate`) | `tools/volta/profile_decode.sh --config strata-<model>.json --strict` | **Gate 1:** IQ3 decode >= 40 tok/s with Gates P and Q passed; if not, stop and reassess Volta before any DeepSeek engine work |
 
-Each tool explains itself with `--help`. VOLTA.md lists the same tools as a checklist in a different order (card check,
-`build/strata-device --selftest`, parity, golden compare, profile). `tools/volta/sass_audit.py` gates a build's sm_70
-machine code; `tools/volta/compile_one.py` compiles one file for sm_70.
+Each tool explains itself with `--help`. `tools/volta/sass_audit.py` gates a build's sm_70 machine code;
+`tools/volta/compile_one.py` compiles one file for sm_70.
 
 **5. NUMA A/B.** The startup log's `NUMA:` lines say what the mirror did. Compare the default, `STRATA_NUMA_MIRROR=0`, and
 `STRATA_NUMA_MIRROR=0 numactl --interleave=all`; do not combine the mirror with `numactl --interleave`.

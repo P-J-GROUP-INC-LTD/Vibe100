@@ -32,8 +32,14 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BUILD = os.environ.get("VIBE_BUILD_DIR", "")
 
 
-def find_nvcc_tool(name: str) -> str:
-    for cand in (shutil.which(name), f"/usr/local/cuda-12.8/bin/{name}", f"/usr/local/cuda/bin/{name}"):
+def find_nvcc_tool(name: str, near: str | None = None) -> str:
+    """A CUDA tool.  `near`: the nvcc the file was just compiled with (compile_commands.json's argv[0]) - the tool next to it is the
+    toolkit's own (cuobjdump of CUDA 13 does not read sm_70); then the CUDA 12.x toolkits'; PATH and /usr/local/cuda last."""
+    cands = []
+    if near:
+        cands.append(str(Path(shutil.which(near) or near).parent / name))
+    cands += [f"/usr/local/cuda-12.8/bin/{name}", f"/usr/local/cuda-12.9/bin/{name}", shutil.which(name), f"/usr/local/cuda/bin/{name}"]
+    for cand in cands:
         if cand and Path(cand).exists():
             return cand
     sys.exit(f"compile_one: {name} not found (install a CUDA 12.x toolkit; CUDA 13 cannot target sm_70)")
@@ -126,7 +132,7 @@ def main() -> int:
             sm = re.search(r"(\d+) bytes smem", line)
             res[cur]["smem"] = int(sm.group(1)) if sm else 0
 
-    sass = subprocess.run([find_nvcc_tool("cuobjdump"), "-sass", "-arch", "sm_70", str(obj)],
+    sass = subprocess.run([find_nvcc_tool("cuobjdump", near=out_argv[0]), "-sass", "-arch", "sm_70", str(obj)],
                           capture_output=True, text=True).stdout
     funcs: dict[str, list[str]] = {}
     fn = None

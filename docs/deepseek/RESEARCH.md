@@ -90,9 +90,12 @@ layer keeps its own Q and its own 128-token SWA KV.
   positions; reindex layers mask outside it (no effect below 16,384 compressed positions). An entry is visible
   once its whole group is complete.
 - Global KV = 890 B/token at the trained precisions [DERIVED, matches the paper]; fp16 ≈ 3.2 KB/token.
-- **Reference bug (found by the port's oracle):** on decode steps where a ratio-2 owner's group is incomplete, the
-  official code scores against the last-published index-K cache (layer 20's) instead of its own; the port follows the
-  intent — see `docs/deepseek/CONTRACTS.md`.
+- **Reference bug (found by the port's oracle; decided):** on decode steps where a ratio-2 owner's group is incomplete (every other
+  token), the official code scores against the last-published index-K cache (layer 20's, from the previous token) instead of the
+  owner's own. The stale scoring happens in the three ratio-2 owners (L2, L8, L14), but their top-k indices are what the Reuse layers
+  3-7, 9-13 and 15-19 consume (`model.py:722-736`), so **all 18 ratio-2 layers** are affected, not three - once a layer has more than
+  512 compressed positions (context above ~1,024 tokens). The port follows the intent (each owner scores against its own cache); the
+  oracle implements both. See "Decided: the index-K cache..." in `docs/deepseek/CONTRACTS.md`.
 
 ## 3. Engram [PRIMARY: engram.py, model.py; PAPER 2.4.2]
 
@@ -176,7 +179,11 @@ All-miss worst case: 240 expert reads/token × 18.8 MB = 4.51 GB/token.
 - Volta datapoints exist only for V4-Flash (8× V100, layer split, f16 KV, ~12.5 tok/s). Quantised KV gives garbage
   for this family (issue #25382; rotation path) → use f16 KV. Sparse FlashAttention is gated behind Turing MMA;
   a V100 enablement PR (#28887: 4.8-14.6× faster attention) was closed unmerged.
-- Measured V4.1 offload rigs: RTX 5090 + 126 GiB RAM: 5.1 tok/s on new content; RTX 3090 + 128 GB DDR4: 6-8 tok/s.
+- V4.1 offload rigs, as REPORTED by others (not re-measured; different engines, prompts and settings): RTX 5090 + 126 GiB RAM,
+  5.1 tok/s on new content; RTX 3090 + 128 GB DDR4, 6-8 tok/s. They are the two rigs of §7 (JigSawPT's RTX 5090, ik_llama.cpp #2449's
+  RTX 3090), matched by hardware: check the report before quoting a figure.
+- **The target box's own baseline: 4-5 tok/s**, which its owner reports measuring today on this machine (another engine; their figure,
+  not measured by this port). That, not the figures above, is the number the port has to beat; `docs/deepseek/PLAN.md` §2 uses it.
 
 ## 9. Confidence
 
