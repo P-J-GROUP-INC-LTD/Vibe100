@@ -87,6 +87,9 @@ Environment variables unless noted; defaults checked in the source.
 | `STRATA_NUMA_HEADROOM_GIB` | 6 | free memory each node must keep beyond its arena copy, or the engine keeps one copy |
 | `STRATA_FORCE_AVX512_NOVBMI` | unset | `1` runs the no-VBMI build on a CPU that has VBMI, to compare the two |
 | `STRATA_IQ512` | unset | `1`: the AVX-512 i-quant rows for every format on any AVX-512 CPU (the A/B on Cascade Lake) |
+| `STRATA_Q2_PREFETCH` | 3072 | bytes of software prefetch ahead in the Q2_0 CPU expert rows (+31% per thread measured on a Cascade-Lake-class VM, output bit-identical); `0` = off |
+| `STRATA_NO_THP` | unset | `1`: do not request transparent huge pages for the arena copies (A/B) |
+| `STRATA_NUMA_PIN_REPLICA` | unset = on | `0`: mlock the NUMA replicas instead of registering them with CUDA |
 
 ## Quick start on a V100 box
 

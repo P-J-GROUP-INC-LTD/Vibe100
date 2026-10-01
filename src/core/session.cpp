@@ -518,9 +518,26 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
         return false;
     }
     parts_bytes = parts_bytes_in;
+    // **PIN THE HOST ONCE, NOT ONCE PER TOKEN - AND BEFORE THE FIRST BUFFER IS TOUCHED.**  `ExpertPool` builds its workers from
+    // `physical_cores(true)`, which drops the first physical core so the host loop can spin without taking a worker's cycles -
+    // and nothing in the pool can pin the host, so if this does not happen the spin is free to land on a worker's
+    // core or its SMT sibling.  The symptom is not an error: it is a CPU path at 26.9 GB/s where the same pool
+    // runs at 36.32.  It was being done and undone on EVERY token, which is a syscall pair on the critical path
+    // for a property that wants to hold for the whole session.
+    //
+    // WP-F: THE ORDER MATTERS ON TWO SOCKETS.  With a mirrored arena `physical_cores(false)[0]` is a core of the GPU's node, and
+    // the buffers below (`y_miss`, which the host reads and the card writes through its mapped pointer) are first-touched by
+    // whatever thread allocates them: under the default first-touch policy that is the node the main thread happens to be on -
+    // the other socket half the time, which puts the host's reads of the GPU's output across UPI.  So the pin comes first.
+    const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
+    if (!cores.empty()) {
+        pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
+        pinned = true;
+    }
     // MAPPED as well as pinned: the token graph's handoff kernel reads it through its device pointer.
     if (cudaHostAlloc((void**) &y_miss, parts_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
         err = "SessionLoopScratch: cudaHostAlloc for the pool's staging failed";
+        free();   // gives the caller its affinity back
         return false;
     }
     std::memset(y_miss, 0, parts_bytes);
@@ -528,17 +545,6 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
         err = "SessionLoopScratch: cudaEventCreate failed";
         free();
         return false;
-    }
-    // **PIN THE HOST ONCE, NOT ONCE PER TOKEN.**  `ExpertPool` builds its workers from `physical_cores(true)`,
-    // which drops the first physical core so the host loop can spin without taking a worker's cycles - and
-    // nothing in the pool can pin the host, so if this does not happen the spin is free to land on a worker's
-    // core or its SMT sibling.  The symptom is not an error: it is a CPU path at 26.9 GB/s where the same pool
-    // runs at 36.32.  It was being done and undone on EVERY token, which is a syscall pair on the critical path
-    // for a property that wants to hold for the whole session.
-    const std::vector<int> cores = strata::kernels::cpu::physical_cores(false);
-    if (!cores.empty()) {
-        pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
-        pinned = true;
     }
     return true;
 }

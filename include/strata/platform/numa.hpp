@@ -10,8 +10,18 @@
 // actually landed.  `strata::kernels::cpu::ExpertPool` (pool.hpp) does the other half - translating a worker's expert
 // pointer to its node's copy - and `ArenaExpertSource` (core/expert_source.hpp) wires the two.
 //
-// NO libnuma.  Everything below is sysfs reads and four raw syscalls (mbind, get_mempolicy, move_pages), so the engine
-// still has nothing to install and the prebuilt release needs no new shared library.  Linux only; elsewhere topology
+// PAGE BACKING IS PART OF THE DESIGN.  Each copy is 23-50 GB read at DRAM speed by every core, so 4 KiB pages (one TLB entry
+// per 4 KiB: 12 million for 50 GB) cost bandwidth.  A copy therefore takes, in this order: 2 MiB hugetlb pages when ITS
+// node's own pool (`.../node<N>/hugepages/hugepages-2048kB/free_hugepages`) holds the whole copy - Linux spreads
+// `vm.nr_hugepages` EVENLY over the nodes, so a pool sized for one arena is half a copy per node - else transparent
+// hugepages (`madvise(MADV_HUGEPAGE)` on a 2 MiB-aligned mapping, before the first touch; the default THP mode of Ubuntu is
+// `madvise`, which is OFF for memory that does not ask), else 4 KiB pages; and the line that reports a copy says which it
+// got.  A hugetlb mapping bound to a node whose pool was promised elsewhere is a SIGBUS at the first touch, so it is
+// prefaulted at once with `MADV_POPULATE_WRITE` (Linux >= 5.14), which returns an error instead, and a failure remaps the
+// copy as THP.
+//
+// NO libnuma.  Everything below is sysfs reads, three raw syscalls (mbind, get_mempolicy, move_pages) and libc's madvise /
+// mmap, so the engine still has nothing to install and the prebuilt release needs no new shared library.  Linux only; elsewhere topology
 // reports "not available" and the engine keeps its single copy.
 //
 // TESTABLE ON ONE NODE.  Every sysfs read goes through a root that `STRATA_SYSFS_ROOT` (or the `sysfs_root` argument)
@@ -21,7 +31,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::platform {
@@ -35,9 +47,20 @@ struct NumaNode {
     uint64_t mem_free = 0;            ///< MemFree
     uint64_t mem_file = 0;            ///< Active(file) + Inactive(file): clean page cache the kernel reclaims for a bound allocation
     bool has_meminfo = false;         ///< false: the node's meminfo could not be read (the planner then refuses it)
-    /// What a MPOL_BIND allocation on this node can count on: free pages plus the file cache it will reclaim (the
-    /// experts were just read through that cache, so MemFree alone would call a node full that is not).
+    /// The node's 2 MiB hugetlb pool (`hugepages/hugepages-2048kB/{free,nr}_hugepages`).  Pages reserved by
+    /// `vm.nr_hugepages` are NOT in MemFree, and a MAP_HUGETLB mapping bound to the node draws on THIS pool alone.
+    bool has_huge = false;            ///< the pool's files were readable
+    uint64_t huge_free = 0;           ///< bytes of FREE pages (may include pages another reservation has promised)
+    uint64_t huge_total = 0;          ///< bytes of the whole pool
+    /// The physical package (socket) of the node's CPUs, from `cpu<N>/topology/physical_package_id`: -1 unknown (no
+    /// such file), -2 the CPUs span several packages.  Sub-NUMA clustering (SNC / NPS) makes several nodes of one socket.
+    int package = -1;
+    /// What a MPOL_BIND allocation on this node can count on in NORMAL memory: free pages plus the file cache it will
+    /// reclaim (the experts were just read through that cache, so MemFree alone would call a node full that is not).
+    /// The hugetlb pool is not in it: a copy the pool holds whole takes pool pages instead (`pool_holds`).
     uint64_t usable_bytes() const { return mem_free + mem_file; }
+    /// Whether the node's free 2 MiB pool holds a whole copy of `copy` bytes: that copy then takes no normal memory.
+    bool pool_holds(uint64_t copy) const { return has_huge && copy > 0 && huge_free >= (copy + (2ull << 20) - 1) / (2ull << 20) * (2ull << 20); }
 };
 
 struct NumaTopology {
@@ -56,6 +79,8 @@ struct NumaTopology {
     /// Index into `nodes` of the node that owns logical CPU `cpu`, or -1.
     int index_of_cpu(int cpu) const;
     bool multi() const { return available && nodes.size() >= 2; }
+    /// The `transparent_hugepage/enabled` mode ("always" / "madvise" / "never"; empty = unreadable), from the same root.
+    std::string thp_mode;
 };
 
 /// "0-11,24-35" -> {0..11, 24..35}.  `ok` (when given) is false for anything that is not a cpulist; an empty string is a
@@ -64,8 +89,9 @@ std::vector<int> parse_cpulist(const std::string& text, bool* ok = nullptr);
 /// The reverse, for messages: {0..11, 24..35} -> "0-11,24-35".
 std::string format_cpulist(const std::vector<int>& cpus);
 
-/// Reads `<root>/devices/system/node/node*/{cpulist,meminfo}`.  `sysfs_root` empty -> `STRATA_SYSFS_ROOT`, else "/sys".
-/// Never throws; a failure is `available == false` with `why`.
+/// Reads `<root>/devices/system/node/node*/{cpulist,meminfo,hugepages/hugepages-2048kB/*}`, `cpu<N>/topology/
+/// physical_package_id` of every node's CPUs and `kernel/mm/transparent_hugepage/enabled`.  `sysfs_root` empty ->
+/// `STRATA_SYSFS_ROOT`, else "/sys".  Never throws; a failure is `available == false` with `why`.
 NumaTopology numa_discover(const std::string& sysfs_root = {});
 
 /// Finds the GPU's node: `pci_bus_id` is what `cudaDeviceGetPCIBusId` returns ("0000:3B:00.0"); the node is read from
@@ -114,8 +140,63 @@ bool numa_task_policy_interleaved(std::string& detail);
 /// takes SIGBUS at the first touch, it does not fall back).  `known` false when the file is unreadable.
 uint64_t numa_node_free_hugepage_bytes(int node, bool& known, const std::string& sysfs_root = {});
 
-/// An anonymous mapping bound to one node, released on destruction.  2 MiB pages when the node's hugepage pool holds
-/// enough (as the primary arena does), else 4 KiB pages.
+// ================================ PAGE BACKING ================================
+
+enum class PageKind { Small, Thp, Hugetlb };
+/// "4 KiB pages" / "THP (2 MiB pages, madvise)" / "2 MiB hugetlb pages"
+const char* page_kind_name(PageKind k);
+
+/// `transparent_hugepage/enabled` of `sysfs_root` (empty -> STRATA_SYSFS_ROOT, else /sys): "always", "madvise", "never",
+/// or empty when it cannot be read.  With "never" a MADV_HUGEPAGE request is accepted and ignored.
+std::string numa_thp_mode(const std::string& sysfs_root = {});
+
+/// `madvise(MADV_POPULATE_WRITE)` (Linux >= 5.14) over [p, p + bytes) from `threads` threads (pinned round-robin to `cpus`
+/// when given): every page is allocated NOW, with the mapping's policy, and a page that cannot be had - the case that is a
+/// SIGBUS at the first touch of a hugetlb mapping whose node pool was promised elsewhere - is an error here instead.
+/// Unsupported: the kernel lacks it (EINVAL), nothing was done.  Failed: `err` says why; some pages may be populated.
+enum class Populate { Ok, Unsupported, Failed };
+Populate numa_populate_write(void* p, uint64_t bytes, int threads, const std::vector<int>& cpus, std::string& err);
+
+struct ArenaMapOptions {
+    int node = -1;                    ///< bind to this node (id) before the first touch; -1 = no binding
+    bool hugetlb = true;              ///< try MAP_HUGETLB (bound: only when the node's own pool holds the whole mapping)
+    bool thp = true;                  ///< else (or when hugetlb is not asked) `madvise(MADV_HUGEPAGE)` on the aligned mapping
+    bool prefault_hugetlb = true;     ///< a hugetlb mapping is prefaulted (numa_populate_write) - bound or under a task policy; failure -> THP
+    std::vector<int> cpus;            ///< CPUs of the node, for the prefault threads (empty: unpinned)
+    int threads = 8;                  ///< prefault threads
+    std::string sysfs_root;           ///< "" = STRATA_SYSFS_ROOT / /sys (the pool and THP files)
+    bool fail_prefault_for_test = false;   ///< test hook: treat the hugetlb prefault as failed (a pool promised elsewhere)
+};
+struct ArenaMap {
+    void* base = nullptr;             ///< 2 MiB-aligned; the mapping is exactly [base, base + bytes) (munmap releases it)
+    uint64_t bytes = 0;               ///< `requested` rounded up to 2 MiB
+    PageKind kind = PageKind::Small;
+    bool bound = false;               ///< mbind(MPOL_BIND) to `node` succeeded (false also when none was asked)
+    std::string bind_note;            ///< "mbind(MPOL_BIND) to node 1" / "mbind to node 1 FAILED (...)"; empty when no bind was asked
+    std::string note;                 ///< why the page kind is what it is ("hugetlb: node 1 pool 26.0 GiB < 50.0 GiB; THP madvise ...")
+};
+/// ONE ANONYMOUS PRIVATE MAPPING for a big arena, in the order above (hugetlb, THP, 4 KiB), bound to `opt.node` before any
+/// page is touched.  False only when no mapping could be made (`out.note` says why).  Unmap with `numa_unmap_arena`.
+bool numa_map_arena(uint64_t requested, const ArenaMapOptions& opt, ArenaMap& out);
+void numa_unmap_arena(void* base, uint64_t bytes);
+
+/// What the kernel actually gave a mapping: from /proc/self/smaps (AnonHugePages / Private_Hugetlb / Rss of the VMAs that
+/// overlap [p, p + bytes), pro rata where a VMA is larger).  Call it AFTER the pages were touched.
+struct PageStats {
+    bool ok = false;
+    uint64_t rss = 0, thp = 0, hugetlb = 0;    ///< bytes resident / of them in THP / in hugetlb pages
+    /// "THP: 49.8 of 50.0 GiB in 2 MiB pages" / "2 MiB hugetlb pages: 50.0 of 50.0 GiB" / "4 KiB pages: 50.0 GiB resident"
+    std::string text() const;
+};
+PageStats numa_page_stats(const void* p, uint64_t bytes);
+
+/// Pins a finished range for the GPU runtime (cudaHostRegister, from the CUDA side: this library has no CUDA); `how` says
+/// what was done or why not.  `UnpinFn` undoes it and must run BEFORE the memory is unmapped.
+using PinFn = std::function<bool(void* p, uint64_t bytes, std::string& how)>;
+using UnpinFn = std::function<void(void* p, uint64_t bytes)>;
+
+/// An anonymous mapping bound to one node, released on destruction.  Backed by 2 MiB hugetlb pages when the node's own
+/// pool holds the whole buffer (as the primary arena does), else by THP, else 4 KiB pages (`numa_map_arena`).
 class NumaBuffer {
 public:
     NumaBuffer() = default;
@@ -127,18 +208,26 @@ public:
 
     /// Maps `bytes` and binds them to `node` BEFORE any page is touched.  Returns false only when the MAPPING failed;
     /// a failed bind is reported through `bound()` / `note()` and the buffer is still usable (first touch from a thread
-    /// pinned to the node - `numa_copy` - then places it).  `use_hugepages` is a request, `hugepages()` the outcome.
-    bool allocate(uint64_t bytes, int node, bool use_hugepages = true);
+    /// pinned to the node - `numa_copy` - then places it).  `use_hugepages` is a request (hugetlb, else THP), `page_kind()`
+    /// the outcome.  `cpus`: the node's CPUs, for the prefault threads of a hugetlb mapping.
+    bool allocate(uint64_t bytes, int node, bool use_hugepages = true, const std::vector<int>& cpus = {});
     uint8_t* data() const { return base_; }
     uint64_t bytes() const { return bytes_; }
     int node() const { return node_; }
     bool bound() const { return bound_; }
-    bool hugepages() const { return huge_; }
-    /// What allocate() did, for the startup line ("2 MiB pages; bound to node 0" / "4 KiB pages; mbind failed: ...").
+    PageKind page_kind() const { return kind_; }
+    bool hugepages() const { return kind_ == PageKind::Hugetlb; }
+    /// What allocate() did, for the startup line ("2 MiB hugetlb pages; mbind(MPOL_BIND) to node 0" / "THP ...; mbind FAILED").
     const std::string& note() const { return note_; }
-    /// mlock the whole buffer (call it AFTER the copy: it makes every page resident).  A replica is not
-    /// CUDA-registered, so nothing else keeps it resident; the caller applies the arena's lock policy
-    /// (`strata::platform::arena_lock_allowed`, memory.hpp) and a refusal (ulimit -l) is a note, not an error.
+    /// Pin the buffer for the GPU runtime (call it AFTER the copy: it finds every page resident).  Pinned pages are
+    /// unswappable like an mlock but are not charged to RLIMIT_MEMLOCK (8 MiB for a user by default), which is why a
+    /// replica is pinned the way the primary is and `lock()` is only the fallback.  The buffer unpins before it unmaps.
+    bool pin(const PinFn& pin, const UnpinFn& unpin);
+    bool pinned() const { return pinned_; }
+    const std::string& pin_note() const { return pin_note_; }
+    /// mlock the whole buffer (after the copy: it makes every page resident).  Subject to RLIMIT_MEMLOCK; the caller applies
+    /// the arena's lock policy (`strata::platform::arena_lock_allowed`, memory.hpp) and a refusal (ulimit -l) is a note,
+    /// not an error.
     bool lock();
     uint64_t locked_bytes() const { return locked_; }
     const std::string& lock_note() const { return lock_note_; }
@@ -148,8 +237,10 @@ private:
     uint8_t* base_ = nullptr;
     uint64_t bytes_ = 0, map_bytes_ = 0, locked_ = 0;
     int node_ = -1;
-    bool bound_ = false, huge_ = false;
-    std::string note_, lock_note_;
+    bool bound_ = false, pinned_ = false;
+    PageKind kind_ = PageKind::Small;
+    UnpinFn unpin_;
+    std::string note_, lock_note_, pin_note_;
 };
 
 /// `memcpy(dst, src, bytes)` on `threads` threads, each pinned to one of `cpus` (round-robin) for the duration, over
@@ -191,21 +282,29 @@ struct MirrorPlan {
     bool mirror = false;
     std::string why_not;              ///< when !mirror: ONE line, the reason (printed once at startup)
     int primary_node = -1;            ///< node id of the primary copy (the GPU's node): CUDA-registered, the only copy a GPU DMA sees
-    std::vector<int> replica_nodes;   ///< node ids that get a replica (every other node that has CPUs to read it)
+    /// Node ids that get a replica.  `Mirror`: every other node that has CPUs to read it.  `Auto`: ONE per physical
+    /// package (socket) other than the GPU's - with sub-NUMA clustering (SNC / NPS) a socket is several nodes, and a copy
+    /// per node would be 4 x 50 GB on a dual Xeon Gold; the node's package-mates read that copy.
+    std::vector<int> replica_nodes;
     std::vector<int> cpu_nodes;       ///< node ids with at least one allowed CPU
+    /// (node id, id of the node whose copy its workers read) for every node of `cpu_nodes`: itself when it holds a copy
+    /// (the primary or a replica), else the copy of its package.  What `NumaReplicas::build` turns into `ArenaMirror::copy`.
+    std::vector<std::pair<int, int>> reads;
+    std::string layout;               ///< when mirroring: which copy serves which nodes ("socket 0: nodes 0,1 read the primary on node 0; ...")
     bool gpu_node_assumed = false;    ///< the GPU's node was unknown and node `primary_node` is a guess
     uint64_t copy_bytes = 0;
 };
 /// The decision, as a pure function of its inputs: Off -> no; no topology / one node / one node with CPUs -> no; not the
-/// full-RAM mode -> no (one copy, and why); shared arena -> no; a node without `arena + headroom` of usable memory -> no
-/// (naming the node and both numbers).  Otherwise: primary on the GPU's node, one replica on every other node that has
-/// allowed CPUs.
+/// full-RAM mode -> no (one copy, and why); shared arena -> no; a node without room for its copy (`arena + headroom` of
+/// usable memory, or just the headroom when its own free hugepage pool holds the whole copy) -> no (naming the node and
+/// the numbers).  Otherwise: primary on the GPU's node, replicas as `MirrorPlan::replica_nodes` says.
 MirrorPlan plan_arena_mirror(const MirrorInputs& in);
 
 // ================================ THE MIRROR ================================
 
-/// What the pool needs: the primary arena and one copy per node, indexed by NODE INDEX in `NumaTopology::nodes`
-/// (`copy[primary_index] == primary`; null for a node that holds no copy).
+/// What the pool needs: the primary arena and, per node, the copy that node's workers read, indexed by NODE INDEX in
+/// `NumaTopology::nodes` (`copy[primary_index] == primary`; a node that HOLDS a replica has it; a node served by its
+/// socket's copy (sub-NUMA clustering) has the same pointer as its package-mate; null = no copy, read the primary).
 struct ArenaMirror {
     const uint8_t* primary = nullptr;
     uint64_t bytes = 0;               ///< length of the primary range every copy covers
@@ -221,13 +320,19 @@ struct MirrorOptions {
     bool faked = false;
     int threads = 8;                  ///< copy threads per replica
     int samples = 64;                 ///< pages sampled per placement check
-    bool lock = true;                 ///< apply the arena lock policy to the replicas
-    bool hugepages = true;
+    bool lock = true;                 ///< apply the arena lock policy (mlock) to a replica that could not be pinned
+    bool hugepages = true;            ///< hugetlb when the node's pool holds the copy, else THP (false: 4 KiB pages)
+    /// Pin each replica for the GPU runtime (cudaHostRegister: pinning only, the GPU never reads a replica) instead of
+    /// mlock-ing it: pinned memory is not charged to RLIMIT_MEMLOCK, so a replica is no longer pageable on a stock user
+    /// limit while the primary is pinned.  Set by the CUDA side (this library has no CUDA); a failure falls back to mlock.
+    PinFn pin;
+    UnpinFn unpin;
 };
 
-/// The replicas of one primary arena.  `build` allocates each replica bound to its node, copies the primary into it from
-/// threads pinned to the node, and verifies placement of a sample of pages of the primary AND the replica; `log` gets one
-/// line per fact.  After it, `mirror()` is what the pool takes.
+/// The replicas of one primary arena.  `build` allocates each replica bound to its node (hugetlb, else THP, else 4 KiB
+/// pages), copies the primary into it from threads pinned to the node, verifies placement of a sample of pages of the
+/// primary AND the replica, pins it (`MirrorOptions::pin`, else mlock); `log` gets one line per fact, the page size each
+/// copy got among them.  After it, `mirror()` is what the pool takes.
 class NumaReplicas {
 public:
     NumaReplicas() = default;

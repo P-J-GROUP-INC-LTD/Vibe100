@@ -57,9 +57,12 @@ static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes, int bind_node) {
+              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes, int bind_node, bool& bound,
+              std::string& bind_note) {
     mapping_base = nullptr;
     mapping_bytes = 0;
+    bound = false;
+    bind_note.clear();
 #ifdef _WIN32
     if (!shared_file.empty()) {
         note = "shared-file arena backing is not implemented on Windows";
@@ -200,35 +203,30 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         return (uint8_t*) map + kSharedArenaHeaderBytes;
     }
 
-    // WP-F: a mapping that is going to be bound to a node draws its hugepages from THAT node's pool, and a pool that runs
-    // dry is a SIGBUS at the first touch rather than a fallback.  So with `bind_node` the per-node pool is asked first
-    // (an unreadable one counts as empty), and the mapping is plain 4 KB pages unless it holds the whole arena.
-    bool try_huge = true;
-    std::string huge_skip;
-    if (bind_node >= 0) {
-        bool known = false;
-        const uint64_t room = strata::platform::numa_node_free_hugepage_bytes(bind_node, known);
-        if (!known || room < bytes) {
-            try_huge = false;
-            huge_skip = known ? "node " + std::to_string(bind_node) + " has " + std::to_string(room >> 20) +
-                                    " MiB of free 2 MB hugepages, the arena needs " + std::to_string(bytes >> 20) +
-                                    " MiB; using 4 KB pages"
-                              : "no 2 MB hugepage pool on node " + std::to_string(bind_node) + "; using 4 KB pages";
-        }
+    // WP-F: ONE mapping routine for the bound primary and for an unbound arena (platform/numa.hpp, `numa_map_arena`), in the
+    // order that matters for a 23-50 GB arena read at DRAM speed by every core (4 KiB pages are one TLB entry per 4 KiB):
+    //   1. 2 MiB hugetlb pages - bound: only when THAT node's own pool holds the whole arena (a bound mapping on a dry pool is
+    //      a SIGBUS at the first touch, and Linux spreads vm.nr_hugepages EVENLY over the nodes), and then prefaulted
+    //      (MADV_POPULATE_WRITE) so a pool that was promised elsewhere is an error here, not a SIGBUS in the loader;
+    //   2. transparent hugepages: a 2 MiB-ALIGNED mapping with madvise(MADV_HUGEPAGE) before anything touches it (Ubuntu's THP
+    //      mode is `madvise`: memory that does not ask gets 4 KiB pages), which is the same TLB reach without a pool;
+    //   3. 4 KiB pages.
+    // The bind (`bind_node` >= 0) is done inside, BEFORE the first touch, which is the CUDA registration below.
+    strata::platform::ArenaMapOptions mo;
+    mo.node = bind_node;
+    strata::platform::ArenaMap m;
+    if (!strata::platform::numa_map_arena(bytes, mo, m)) {
+        note = m.note;
+        return nullptr;
     }
-    void* p = MAP_FAILED;
-    if (try_huge)
-        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-    if (p != MAP_FAILED) {
-        got = PageBacking::LargePages;
-        note = "hugetlb 2 MB pages";
-        return p;
-    }
-    note = try_huge ? "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages" : huge_skip;
-    p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    got = PageBacking::NormalPages;
-    return p == MAP_FAILED ? nullptr : p;
+    got = m.kind == strata::platform::PageKind::Hugetlb ? PageBacking::LargePages
+        : m.kind == strata::platform::PageKind::Thp ? PageBacking::Thp : PageBacking::NormalPages;
+    note = m.note;
+    bound = m.bound;
+    bind_note = m.bind_note;
+    mapping_base = m.base;       // 2 MiB-aligned and a whole number of 2 MiB: what munmap needs (a hugetlb mapping insists)
+    mapping_bytes = m.bytes;
+    return m.base;
 #endif
 }
 
@@ -265,6 +263,22 @@ std::string gpu_pci_bus_id(int device) {
     if (cudaDeviceGetPCIBusId(id, (int) sizeof id, device) != cudaSuccess) { (void) cudaGetLastError(); return {}; }
 #endif
     return id;
+}
+
+bool pin_host_range(void* p, uint64_t bytes, std::string& how) {
+    const cudaError_t e = cudaHostRegister(p, (size_t) bytes, cudaHostRegisterPortable);
+    if (e == cudaSuccess) {
+        how = "cudaHostRegister PORTABLE";
+        return true;
+    }
+    (void) cudaGetLastError();   // consume it: see the note at the arena's own registration failure below
+    how = std::string("cudaHostRegister refused (") + cudaGetErrorString(e) + ")";
+    return false;
+}
+
+void unpin_host_range(void* p, uint64_t) {
+    cudaHostUnregister(p);
+    (void) cudaGetLastError();
 }
 
 int arena_pin_cap_gib() {
@@ -328,24 +342,19 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
     if (bytes == 0) return;
     // a bound arena is a private anonymous mapping: a shared file's placement is not this process's to choose
     base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes,
-                   shared_file.empty() ? bind_node : -1);
+                   shared_file.empty() ? bind_node : -1, bound, bind_note);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
     }
     // WP-F: THE BIND COMES BEFORE THE REGISTRATION, which is the first thing to touch a page (cudaHostRegister pins what is
-    // resident, and faults in what is not).  After it, a page is allocated on `bind_node` or not at all.
-    if (base != nullptr && bind_node >= 0 && shared_file.empty()) {
-        std::string err;
-        bound = strata::platform::numa_bind_memory(base, bytes, bind_node, err,
-                                                   backing == PageBacking::LargePages ? (2ull << 20) : 4096);
-        bind_note = bound ? "mbind(MPOL_BIND) to node " + std::to_string(bind_node)
-                          : "mbind to node " + std::to_string(bind_node) + " FAILED (" + err + ")";
-        note = bind_note + "; " + note;
-    }
+    // resident, and faults in what is not): `reserve` did it.  After it, a page is allocated on `bind_node` or not at all.
+    if (base != nullptr && bind_node >= 0 && shared_file.empty()) note = bind_note + "; " + note;
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
+    // (A bound hugetlb mapping is the one exception: `reserve` prefaulted it in 64 MiB chunks on several threads, so that a pool
+    // promised elsewhere is an error there and not a SIGBUS in the loader - the registration then pins resident hugepages.)
     if (base) {
         // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
         const int env_gib = arena_pin_cap_gib();

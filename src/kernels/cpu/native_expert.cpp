@@ -20,6 +20,13 @@ namespace {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
+// The same rule as the STRATA_FORCE_* switches (expert_layout.cpp): the switch is on when the variable starts with '1', so
+// "0" and "" are off.  (The older STRATA_NO_* / STRATA_IQ_GATHER switches here are on for any value, as they always were.)
+bool env_is_1(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] == '1';
+}
+
 void init_once() {
     static std::once_flag once;
     std::call_once(once, [] { ggml_cpu_init(); });
@@ -91,9 +98,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // for IQ2_S (2.0-2.3 vs 1.7-2.0).  The Skylake-derived cores pay for the 512-bit license and the 64-bit table-lookup
     // inserts where Zen 4 does not.  So the VNNI tier takes the AVX-512 rows for IQ2_S only, and everything else stays on
     // AVX-2; from VBMI up (Ice Lake / Zen 4, where upstream measured the AVX-512 rows faster) every format uses them.
-    // STRATA_IQ512=1 forces them on every format on any AVX-512 CPU, which is the A/B switch for a Cascade Lake box.
+    // STRATA_IQ512=1 forces them on every format on any AVX-512 CPU, which is the A/B switch for a Cascade Lake box (only "1"
+    // counts, as for STRATA_FORCE_AVX2 / STRATA_FORCE_AVX512_NOVBMI: STRATA_IQ512=0 used to switch it ON).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
-    static const bool avx512_all = cpu_expert_isa() == ExpertIsa::Avx512Vbmi || std::getenv("STRATA_IQ512") != nullptr;
+    static const bool avx512_all = cpu_expert_isa() == ExpertIsa::Avx512Vbmi || env_is_1("STRATA_IQ512");
     static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output

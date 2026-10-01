@@ -174,6 +174,43 @@ void pin_this_thread(int core) {
 
 }  // namespace
 
+namespace {
+// The calling thread runs on `core` for the life of the scope (core < 0: not at all), then gets its affinity back.  Used for the
+// pool's own first touches (below): with a mirror the node a page lands on is the node of the thread that first writes it.
+class ThreadPinScope {
+public:
+    explicit ThreadPinScope(int core) {
+        if (core < 0) return;
+#if defined(_WIN32)
+        prev_ = pin_current_thread(core);
+        active_ = prev_ > 0;
+#else
+        if (pthread_getaffinity_np(pthread_self(), sizeof prev_, &prev_) != 0) return;
+        pin_this_thread(core);
+        active_ = true;
+#endif
+    }
+    ~ThreadPinScope() {
+        if (!active_) return;
+#if defined(_WIN32)
+        restore_thread_affinity(prev_);
+#else
+        pthread_setaffinity_np(pthread_self(), sizeof prev_, &prev_);
+#endif
+    }
+    ThreadPinScope(const ThreadPinScope&) = delete;
+    ThreadPinScope& operator=(const ThreadPinScope&) = delete;
+
+private:
+    bool active_ = false;
+#if defined(_WIN32)
+    long long prev_ = -1;
+#else
+    cpu_set_t prev_;
+#endif
+};
+}  // namespace
+
 long long pin_current_thread(int core) {
     if (core < 0) return -1;
 #if defined(_WIN32)
@@ -246,6 +283,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
     if (n_ < 1) n_ = 1;
     // NUMA (WP-F): each worker's node, from the core it is pinned to.  Without a `PoolNuma` every entry is -1 and nothing
     // below ever reads it.
+    int host_core = -1;   // the core the session pins the host loop to (the GPU's node) - only with a mirror
     {
         const PoolNuma pn = numa_snapshot();
         wnode_.assign((size_t) n_, -1);
@@ -261,16 +299,24 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
             // which is `pn.host_node` unless that node had no core to give (then the legacy first core stays the host's)
             const std::vector<int> all = physical_cores(false);
             hnode_ = !all.empty() ? numa_node_of(pn, all.front()) : pn.host_node;
+            if (!all.empty()) host_core = all.front();
         }
     }
-    scratch_.resize((size_t) n_);
+    // The per-worker scratch and the split buffers (several MB, shared by all the threads of a split job) are first-touched by the
+    // value-initialisation in `resize`, i.e. by THIS thread, which is not pinned yet and may be running on the socket the GPU is
+    // NOT on.  Make them on the host's core, so with a mirror they land on the GPU's node like the session's other host buffers.
+    // (The scope ends before any worker is created: a std::thread inherits its creator's affinity mask.)
+    {
+        ThreadPinScope on_host(host_core);
+        scratch_.resize((size_t) n_);
+        split_.resize((size_t) kMaxSplit);
+        split_multi_.resize((size_t) kMaxSplitMulti);
+    }
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
     strata::core::diag_pool_fn().store(&diag_active_pool);
-    split_.resize((size_t) kMaxSplit);
-    split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
@@ -291,16 +337,24 @@ ExpertPool::~ExpertPool() {
 }
 
 void ExpertPool::set_mirror(const strata::platform::ArenaMirror& m) {
+    // The workers read `mir_*` / `weff_` with plain loads after the epoch's acquire: write them only while every worker is
+    // parked (the contract in pool.hpp).  `wait_parked` is the wait `run` starts with: the workers' own release (a worker
+    // re-parks with `parked_.fetch_add`) is what orders their last reads before these writes, and the next `begin_batch`'s
+    // release is what orders these writes before their next reads.
+    wait_parked("before set_mirror");
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     if (!m.active()) {
         mir_len_ = 0;
         mir_lo_ = 0;
         mir_nodes_ = 0;
+        mir_copy_.clear();   // the copies are about to be unmapped by their owner: nothing may keep their addresses
         return;
     }
-    mir_nodes_ = (std::min)((int) m.copy.size(), kMaxNodes);
+    mir_nodes_ = (int) m.copy.size();
     mir_primary_ = m.primary_index >= 0 && m.primary_index < mir_nodes_ ? m.primary_index : 0;
-    for (int i = 0; i < kMaxNodes; ++i)
-        mir_copy_[i] = i < mir_nodes_ && m.copy[(size_t) i] != nullptr ? m.copy[(size_t) i] : m.primary;
+    mir_copy_.assign((size_t) mir_nodes_, nullptr);
+    for (int i = 0; i < mir_nodes_; ++i) mir_copy_[(size_t) i] = m.copy[(size_t) i] != nullptr ? m.copy[(size_t) i] : m.primary;
     // A thread whose node holds no copy (or is unknown) reads the primary: the identity translation.
     auto eff = [&](int node) { return node >= 0 && node < mir_nodes_ ? node : mir_primary_; };
     for (int i = 0; i < n_; ++i) weff_[(size_t) i] = eff(wnode_[(size_t) i]);
@@ -443,11 +497,13 @@ void ExpertPool::wait_done(int n) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
-    // The copy this thread reads (WP-F): its node's, or the primary when no mirror is set.  Fixed for the whole batch.
-    const int node = id >= 0 ? weff_[(size_t) id] : heff_;
     for (;;) {
         const int ci = claim(epoch);
         if (ci < 0) break;
+        // The copy this thread reads (WP-F): its node's, or the primary when no mirror is set.  Read AFTER the claim: a claim
+        // that succeeds belongs to the current batch, which `set_mirror` (host, workers parked) ordered its writes before; a
+        // worker that woke late for an old epoch claims nothing and never looks at what a `set_mirror` may be writing.
+        const int node = id >= 0 ? weff_[(size_t) id] : heff_;
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }

@@ -11,6 +11,12 @@
 //   2. --numa mirror: the arena opens, `blob()` still names the PRIMARY (the only copy a GPU DMA may see), one replica holds the
 //      primary's bytes at every expert, the notes carry the decision and the placement lines, and the pool built from the
 //      source's layout and mirror computes bit-identically to a pool with no mirror.
+//   2b. (audit A4) the replica is PINNED like the primary (cudaHostRegister, falling back to mlock where the registration is
+//      refused - which is every machine without a GPU, so that is the path run here), unless STRATA_NUMA_PIN_REPLICA=0; the
+//      notes say which page size the arena got (hugetlb / THP / 4 KiB, from smaps); a node pool the files claim and the kernel
+//      refuses is a fallback, not a failure.
+//   2c. (audit A4) sub-NUMA clustering: four nodes on two sockets make ONE replica, the nodes of a socket share a copy, and the
+//      pool built from that layout computes bit-identically.
 //   3. The refusals ArenaExpertSource makes: a one-node box, --shared-expert-arena, and (numa_single_copy_notes) the mmap /
 //      low-RAM modes - each says why, and keeps one copy.
 //
@@ -127,36 +133,8 @@ int main() {
     write_node(one, 0, cores);
     const std::string two_s = two.string(), one_s = one.string();
 
-    // ---- 1. off
-    setenv("STRATA_SYSFS_ROOT", two_s.c_str(), 1);
-    {
-        ArenaExpertSource a;
-        a.set_numa(plat::NumaMode::Off);
-        check(a.open(pack.string(), kLayers, kExperts, 2, err), "off: the arena opens");
-        check(!a.mirror().active() && a.replicas().count() == 0, "off: one copy, no mirror");
-        check(has(a.numa_notes(), "--numa off"), "off: the notes say so");
-        for (const auto& n : a.numa_notes()) std::printf("    %s\n", n.c_str());
-    }
-
-    // ---- 2. mirror
-    {
-        ArenaExpertSource a;
-        a.set_numa(plat::NumaMode::Mirror);
-        check(a.open(pack.string(), kLayers, kExperts, 2, err), "mirror: the arena opens");
-        for (const auto& n : a.numa_notes()) std::printf("    %s\n", n.c_str());
-        check(a.mirror().active() && a.replicas().count() == 1, "mirror: one replica kept (a fake topology reports its failed bind and carries on)");
-        check(has(a.numa_notes(), "MIRRORED") && has(a.numa_notes(), "primary") && has(a.numa_notes(), "replica on node 1") &&
-                  has(a.numa_notes(), "only copy any GPU DMA reads"),
-              "mirror: the notes name the primary, the replica and who reads which");
-        check(has(a.numa_notes(), "sampled pages"), "mirror: ...and the placement that was checked");
-        const uint8_t* b00 = a.blob(0, 0);
-        check(b00 == a.mirror().primary && a.mirror().bytes >= total, "blob() names the PRIMARY; the mirror covers the whole arena");
-        const uint8_t* rep = a.mirror().copy.size() == 2 ? a.mirror().copy[1] : nullptr;
-        check(rep != nullptr && rep != b00 && std::memcmp(rep, b00, total) == 0, "the replica holds the primary's bytes (every expert)");
-        check(a.mirror().copy[0] == b00, "the primary's own slot of the mirror is the primary");
-        check(a.pool_numa().active() && a.pool_numa().host_node == 0, "pool layout: two nodes, the host on the GPU's node 0");
-
-        // the pool, with this source's layout and mirror, against a pool with none: every API, bit for bit
+    // the pool, with a source's layout and mirror, against a pool with none: every API, bit for bit
+    auto pool_matches = [&](ArenaExpertSource& a) {
         std::mt19937 rng(9);
         std::normal_distribution<float> gauss(0.f, 1.f);
         std::vector<float> x(cpu::H);
@@ -187,18 +165,128 @@ int main() {
         }
         cpu::set_pool_numa(a.pool_numa());
         std::vector<float> mirrored;
+        bool took = false;
         {
             cpu::ExpertPool pool;
             pool.set_mirror(a.mirror());
-            check(pool.mirrored(), "the pool took the source's mirror");
+            took = pool.mirrored();
             for (int r = 0; r < 5; ++r) {
                 mirrored = run_all(pool);
                 if (mirrored.size() != plain.size() || std::memcmp(mirrored.data(), plain.data(), plain.size() * 4) != 0) break;
             }
         }
         cpu::clear_pool_numa();
-        check(mirrored.size() == plain.size() && std::memcmp(mirrored.data(), plain.data(), plain.size() * 4) == 0,
-              "the mirrored pool is bit-identical to the pool without a mirror (run and run_split)");
+        check(took, "the pool took the source's mirror");
+        return mirrored.size() == plain.size() && std::memcmp(mirrored.data(), plain.data(), plain.size() * 4) == 0;
+    };
+
+    // ---- 1. off
+    setenv("STRATA_SYSFS_ROOT", two_s.c_str(), 1);
+    {
+        ArenaExpertSource a;
+        a.set_numa(plat::NumaMode::Off);
+        check(a.open(pack.string(), kLayers, kExperts, 2, err), "off: the arena opens");
+        check(!a.mirror().active() && a.replicas().count() == 0, "off: one copy, no mirror");
+        check(has(a.numa_notes(), "--numa off"), "off: the notes say so");
+        for (const auto& n : a.numa_notes()) std::printf("    %s\n", n.c_str());
+    }
+
+    // ---- 2. mirror
+    {
+        ArenaExpertSource a;
+        a.set_numa(plat::NumaMode::Mirror);
+        check(a.open(pack.string(), kLayers, kExperts, 2, err), "mirror: the arena opens");
+        for (const auto& n : a.numa_notes()) std::printf("    %s\n", n.c_str());
+        check(a.mirror().active() && a.replicas().count() == 1, "mirror: one replica kept (a fake topology reports its failed bind and carries on)");
+        check(has(a.numa_notes(), "MIRRORED") && has(a.numa_notes(), "primary") && has(a.numa_notes(), "replica on node 1") &&
+                  has(a.numa_notes(), "only copy any GPU DMA reads"),
+              "mirror: the notes name the primary, the replica and who reads which");
+        check(has(a.numa_notes(), "sampled pages"), "mirror: ...and the placement that was checked");
+        const uint8_t* b00 = a.blob(0, 0);
+        check(b00 == a.mirror().primary && a.mirror().bytes >= total, "blob() names the PRIMARY; the mirror covers the whole arena");
+        const uint8_t* rep = a.mirror().copy.size() == 2 ? a.mirror().copy[1] : nullptr;
+        check(rep != nullptr && rep != b00 && std::memcmp(rep, b00, total) == 0, "the replica holds the primary's bytes (every expert)");
+        check(a.mirror().copy[0] == b00, "the primary's own slot of the mirror is the primary");
+        check(a.pool_numa().active() && a.pool_numa().host_node == 0, "pool layout: two nodes, the host on the GPU's node 0");
+
+        check(pool_matches(a), "the mirrored pool is bit-identical to the pool without a mirror (run and run_split)");
+    }
+    // ---- 2b. the replica is pinned like the primary; the page size is reported
+    {
+        ArenaExpertSource a;
+        a.set_numa(plat::NumaMode::Mirror);
+        check(a.open(pack.string(), kLayers, kExperts, 2, err) && a.mirror().active(), "2b: the arena opens, mirrored");
+        check(has(a.numa_notes(), "pinned") || has(a.numa_notes(), "mlock"),
+              "the replica's line says it was pinned (cudaHostRegister) or, where that is refused, mlock-ed");
+        check(has(a.numa_notes(), "THP") || has(a.numa_notes(), "hugetlb") || has(a.numa_notes(), "4 KiB pages"), "the replica's line says which page size it got");
+        check(a.note().find("resident") != std::string::npos && (a.note().find("THP") != std::string::npos || a.note().find("hugetlb") != std::string::npos ||
+                                                                a.note().find("4 KiB") != std::string::npos),
+              "the primary's note says what the kernel gave it (smaps)");
+        std::printf("    primary: %s\n", a.note().c_str());
+        for (const auto& n : a.numa_notes()) if (n.find("replica on node") != std::string::npos) std::printf("    %s\n", n.c_str());
+        check(a.replicas().count() == 1 && a.replicas().buffer(0).pinned() == (a.replicas().buffer(0).pin_note().find("cudaHostRegister PORTABLE") != std::string::npos),
+              "the buffer's pinned flag agrees with its note");
+    }
+    {
+        setenv("STRATA_NUMA_PIN_REPLICA", "0", 1);
+        ArenaExpertSource a;
+        a.set_numa(plat::NumaMode::Mirror);
+        check(a.open(pack.string(), kLayers, kExperts, 2, err) && a.mirror().active() && !has(a.numa_notes(), "pinned:") && !has(a.numa_notes(), "not pinned") &&
+                  a.replicas().count() == 1 && !a.replicas().buffer(0).pinned(),
+              "STRATA_NUMA_PIN_REPLICA=0: no pin is attempted (mlock only, as before)");
+        unsetenv("STRATA_NUMA_PIN_REPLICA");
+    }
+    {   // the node's hugepage pool is in the (fake) files; the kernel's own pool decides whether the mapping works
+        const fs::path hp = tmp.root / "sys2hp";
+        write_node(hp, 0, n0);
+        write_node(hp, 1, n1);
+        put(hp / "devices/system/node/node0/hugepages/hugepages-2048kB/free_hugepages", "100000\n");
+        put(hp / "devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages", "100000\n");
+        setenv("STRATA_SYSFS_ROOT", hp.string().c_str(), 1);
+        ArenaExpertSource a;
+        a.set_numa(plat::NumaMode::Mirror);
+        check(a.open(pack.string(), kLayers, kExperts, 2, err) && a.mirror().active(), "a node pool the files claim: the arena opens, mirrored");
+        check(a.note().find("refused") != std::string::npos || a.note().find("hugetlb pages") != std::string::npos,
+              "...hugetlb if the kernel has the pages, else a fallback whose note carries the kernel's refusal");
+        std::printf("    primary: %s\n", a.note().c_str());
+        setenv("STRATA_SYSFS_ROOT", two_s.c_str(), 1);
+    }
+
+    // ---- 2c. sub-NUMA clustering: four nodes on two sockets
+    if (cores.size() >= 4) {
+        const fs::path snc = tmp.root / "sys4";
+        const size_t q = cores.size() / 4;
+        std::vector<std::vector<int>> g(4);
+        for (size_t n = 0; n < 4; ++n) {
+            g[n].assign(cores.begin() + (long) (n * q), n == 3 ? cores.end() : cores.begin() + (long) ((n + 1) * q));
+            std::sort(g[n].begin(), g[n].end());
+            write_node(snc, (int) n, g[n]);
+            for (int c : g[n]) put(snc / "devices/system/cpu" / ("cpu" + std::to_string(c)) / "topology/physical_package_id", (n < 2 ? "0\n" : "1\n"));
+        }
+        {
+            const std::string bdf = strata::core::gpu_pci_bus_id(0);
+            std::string low = bdf;
+            for (char& c : low) c = (char) std::tolower((unsigned char) c);
+            if (!low.empty()) put(snc / "bus/pci/devices" / low / "numa_node", "0\n");
+        }
+        setenv("STRATA_SYSFS_ROOT", snc.string().c_str(), 1);
+        ArenaExpertSource a;
+        a.set_numa(plat::NumaMode::Auto);
+        const bool opened = a.open(pack.string(), kLayers, kExperts, 2, err);
+        for (const auto& n : a.numa_notes()) std::printf("    %s\n", n.c_str());
+        check(opened && a.mirror().active() && a.replicas().count() == 1, "SNC, auto: ONE replica for four nodes (one copy per socket)");
+        const auto& m = a.mirror();
+        check(m.copy.size() == 4 && m.copy[0] == m.primary && m.copy[1] == m.primary && m.copy[2] != nullptr && m.copy[2] != m.primary && m.copy[3] == m.copy[2],
+              "nodes 0,1 read the primary, nodes 2,3 share the replica");
+        check(has(a.numa_notes(), "one copy per socket"), "the notes say so");
+        check(a.pool_numa().node_cpus.size() == 4, "the pool layout lists all four nodes");
+        check(pool_matches(a), "the pool built from it is bit-identical to a pool with no mirror");
+        ArenaExpertSource b;
+        b.set_numa(plat::NumaMode::Mirror);
+        check(b.open(pack.string(), kLayers, kExperts, 2, err) && b.replicas().count() == 3, "SNC, --numa mirror: one replica per node (3)");
+        setenv("STRATA_SYSFS_ROOT", two_s.c_str(), 1);
+    } else {
+        std::printf("  (fewer than four cores: the SNC case is SKIPPED)\n");
     }
 
     // ---- 3. the refusals

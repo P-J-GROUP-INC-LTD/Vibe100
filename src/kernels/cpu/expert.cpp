@@ -205,6 +205,46 @@ inline float hsum_ps(__m256 v) {
 // use this kernel, so speculative decode still reproduces plain decode exactly.
 static const bool kZmm = std::getenv("STRATA_CPU_YMM") == nullptr;
 
+// ---- SOFTWARE PREFETCH OF THE WEIGHT CODES (a hint: no data dependency, so every output is bitwise what it was without it).
+//
+// The rows are 160-640 B and every expert is read ONCE per token from DRAM, so a thread never sees its bytes twice: it runs at
+// whatever the memory system delivers for a stream, and the hardware L2 streamer stops at every 4 KiB boundary, then needs a
+// few misses to ramp up again (a 640 B row is 1/6 of a page, so a stream is a restart every ~6 rows - and 2 MiB pages do not
+// lift that limit, it is the streamer's, not the TLB's).  Two 64-byte prefetches per group of 8 blocks (the 128 B the group
+// itself reads), `q2_pf_bytes` AHEAD of it, keep the line fill buffers busy across those boundaries and across row ends: the rows
+// of a plane are contiguous, so what is prefetched past a row is the next row.
+//
+// MEASURED (WP-F audit A4), a 4-vCPU Cascade Lake VM (Xeon 2.8 GHz, no VBMI; the no-VBMI build; `s2_expert_vnni_q` over a 1.3 GB
+// arena = 960 experts, 4 KiB pages, per-thread CPU time so a busy neighbour does not count; mean of 6-10 interleaved rounds,
+// best of 3 passes each).  GB/s, 1 / 2 / 4 threads:
+//     off      5.9  /   -   / 23.6
+//     1 KiB    7.2  /   -   / 28.9
+//     2 KiB    7.7  / 15.3  / 30.1
+//     3 KiB    7.8  / 15.9  / 30.8     <- the default: the plateau starts here
+//     4 KiB    7.9  / 15.7  / 31.3
+//     5 KiB    7.9  / 15.5  /  -
+//     8 KiB    7.8  /  -    / 30.6
+// With the arena on THP (2 MiB pages, via madvise) the same kernel gains a further 5-6% at 3 KiB (1 thread 7.9 -> 8.4, 4 threads
+// 31.1 -> 32.8) and ~0% with the prefetch off - presumably because the prefetches cross 4 KiB pages, each a TLB lookup on small pages.
+// The hint was T0 (T1 and NTA measured the same or worse), and a second stream for the scale plane (1/8 of the bytes) gained nothing.
+//
+// CLAMPED: `lim` is one past the last code byte THIS CALL's rows read (the end of the plane, or of the row range a pool thread
+// was given), so nothing is prefetched past what the call reads - a hint cannot fault, but a line fetched for a neighbour's rows
+// is DRAM bandwidth spent for nothing.  `STRATA_Q2_PREFETCH=<bytes>` sets the distance, 0 = off (the A/B arm; same name
+// pattern as the i-quant rows' STRATA_IQ_PREFETCH, which already prefetches 2 KiB ahead).
+constexpr int kQ2PrefetchDefault = 3072;
+static int q2_pf_bytes = [] {   // written only here and by the test hook below, never while a kernel runs
+    const char* v = std::getenv("STRATA_Q2_PREFETCH");
+    const int d = v != nullptr ? std::atoi(v) : kQ2PrefetchDefault;
+    return d < 0 ? 0 : d;
+}();
+inline void pf_codes(const uint8_t* group, const uint8_t* lim) {
+    if (q2_pf_bytes == 0) return;
+    const uintptr_t at = (uintptr_t) group + (uintptr_t) q2_pf_bytes, end = (uintptr_t) lim;   // integers: `group + d` may be past the object
+    if (at < end) _mm_prefetch((const char*) at, _MM_HINT_T0);
+    if (at + 64 < end) _mm_prefetch((const char*) at + 64, _MM_HINT_T0);
+}
+
 #if !defined(STRATA_EXPERT_NO_VBMI)
 inline __m512i unpack64_q2_0(const uint8_t* codes) {
     const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes
@@ -260,11 +300,12 @@ inline void scales8(const uint8_t* wscales, const ActQ& a, int b0, int nb, __m51
     p = _mm512_mul_ps(dd, _mm512_maskz_loadu_ps(m16, a.scale + 2 * b0));
 }
 
-inline float row_dot_z(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
+inline float row_dot_z(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks, const uint8_t* lim) {
     __m512 acc = _mm512_setzero_ps(), corr = _mm512_setzero_ps();
     const __m512i base = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
     for (int b0 = 0; b0 < nblocks; b0 += 8) {
         const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
+        pf_codes(codes + b0 * 16, lim);
         __m512 p, dd;
         scales8(scales, a, b0, nb, p, dd);
         const __mmask16 m16 = nb >= 8 ? (__mmask16) 0xFFFF : (__mmask16) ((1u << (2 * nb)) - 1u);
@@ -282,12 +323,13 @@ inline float row_dot_z(const uint8_t* codes, const uint8_t* scales, const ActQ& 
 
 template<int NT>
 inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const ActQ* const* a, int nblocks,
-                            float* res) {
+                            float* res, const uint8_t* lim) {
     __m512 acc[NT], corr[NT];
     for (int t = 0; t < NT; ++t) { acc[t] = _mm512_setzero_ps(); corr[t] = _mm512_setzero_ps(); }
     const __m512i base = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
     for (int b0 = 0; b0 < nblocks; b0 += 8) {
         const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
+        pf_codes(codes + b0 * 16, lim);
         const __mmask16 m16 = nb >= 8 ? (__mmask16) 0xFFFF : (__mmask16) ((1u << (2 * nb)) - 1u);
         __m512 p[NT];
         for (int t = 0; t < NT; ++t) {
@@ -318,8 +360,8 @@ inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const A
 /// The accumulator stays a FLOAT VECTOR for the whole row and is reduced once at the end.  Reducing per
 /// 64-weight block (two 8-lane horizontal sums: a store plus 16 scalar adds) cost far more than the dot
 /// products themselves - it made the kernel compute-bound at 21 GB/s instead of DRAM-bound at 32.
-inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks) {
-    if (kZmm) return row_dot_z(codes, scales, a, nblocks);
+inline float row_dot(const uint8_t* codes, const uint8_t* scales, const ActQ& a, int nblocks, const uint8_t* lim) {
+    if (kZmm) return row_dot_z(codes, scales, a, nblocks, lim);
     __m256 acc = _mm256_setzero_ps();
     // The -sum(xhat) term is a SCALAR: broadcasting it into all 8 lanes and letting hsum_ps add them would
     // apply it eight times per block.
@@ -365,8 +407,8 @@ inline float row_dot_oracle(const uint8_t* codes, const uint8_t* scales, const A
 /// accumulator sees exactly the operations `row_dot` would apply to it, in the same order.
 template<int NT>
 inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const ActQ* const* a, int nblocks,
-                          float* res) {
-    if (kZmm) { row_dot_multi_z<NT>(codes, scales, a, nblocks, res); return; }
+                          float* res, const uint8_t* lim) {
+    if (kZmm) { row_dot_multi_z<NT>(codes, scales, a, nblocks, res, lim); return; }
     __m256 acc[NT];
     float corr[NT];
     for (int t = 0; t < NT; ++t) { acc[t] = _mm256_setzero_ps(); corr[t] = 0.f; }
@@ -391,11 +433,12 @@ inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const Act
 template<int NT>
 void expert_multi(const uint8_t* blob, const ActQ* const* a1, float* const* out, ExpertScratchMulti& ws) {
     float g[NT], u[NT];
+    const uint8_t* const lim_gu = blob + O_GU_SCALES;   // the gate/up code plane runs into the down one this call reads next (see pf_codes)
     for (int r = 0; r < FF; ++r) {
         row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g);
+                          blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g, lim_gu);
         row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, u);
+                          blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, u, lim_gu);
         for (int t = 0; t < NT; ++t) ws.ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
     const ActQ* a2[NT];
@@ -404,9 +447,10 @@ void expert_multi(const uint8_t* blob, const ActQ* const* a1, float* const* out,
         a2[t] = &ws.a2[t];
     }
     float o[NT];
+    const uint8_t* const lim_d = blob + O_GU_SCALES;   // the end of the down code plane
     for (int r = 0; r < H; ++r) {
         row_dot_multi<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
-                          SC_D, o);
+                          SC_D, o, lim_d);
         for (int t = 0; t < NT; ++t) out[t][r] = o[t];
     }
 }
@@ -503,54 +547,61 @@ void k_s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertS
         expert_oracle_q8_0(blob, a1, out, ws);
         return;
     }
+    // this call reads the gate/up code plane and then, contiguously, the down one: prefetch may run on into it (see pf_codes)
+    const uint8_t* const lim_gu = blob + O_GU_SCALES;
     for (int r = 0; r < FF; ++r) {
         const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
+                                blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, lim_gu);
         const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU);
+                                blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, lim_gu);
         // SiLU on the GATE, multiplied by up - the same reading `docs/semantics.md` records for the shared
         // expert, and the one that is wrong the other way round in a way that still produces a number.
         ws.ff[r] = (g / (1.f + std::exp(-g))) * u;
     }
     act_quant_q8_1(ws.ff, FF, ws.a2);
+    const uint8_t* const lim_d = blob + O_GU_SCALES;   // the end of the down code plane
     for (int r = 0; r < H; ++r)
         out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D,
-                         blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, SC_D);
+                         blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, SC_D, lim_d);
 }
 
 void k_s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
+    const uint8_t* const lim = blob + O_GU_CODES + (size_t) (2 * r1) * ROW_GU;   // the end of THIS range's rows (see pf_codes)
     for (int r = r0; r < r1; ++r) {
         const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
+                                blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, lim);
         const float u = row_dot(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                                blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU);
+                                blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, lim);
         ff[r] = (g / (1.f + std::exp(-g))) * u;
     }
 }
 
 void k_s2_expert_down_rows(const uint8_t* blob, const ActQ& a2, float* out, int r0, int r1) {
+    const uint8_t* const lim = blob + O_D_CODES + (size_t) r1 * ROW_D;
     for (int r = r0; r < r1; ++r)
-        out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2, SC_D);
+        out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2, SC_D, lim);
 }
 
 namespace {
 template<int NT>
 void gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, float* const* ff, int r0, int r1) {
     float g[NT], u[NT];
+    const uint8_t* const lim = blob + O_GU_CODES + (size_t) (2 * r1) * ROW_GU;
     for (int r = r0; r < r1; ++r) {
         row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g);
+                          blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU, g, lim);
         row_dot_multi<NT>(blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU,
-                          blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, u);
+                          blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2, a1, SC_GU, u, lim);
         for (int t = 0; t < NT; ++t) ff[t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
     }
 }
 template<int NT>
 void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* out, int r0, int r1) {
     float o[NT];
+    const uint8_t* const lim = blob + O_D_CODES + (size_t) r1 * ROW_D;
     for (int r = r0; r < r1; ++r) {
         row_dot_multi<NT>(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2,
-                          SC_D, o);
+                          SC_D, o, lim);
         for (int t = 0; t < NT; ++t) out[t][r] = o[t];
     }
 }
@@ -591,13 +642,16 @@ void k_s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int
 // the block stride of the GGUF layout: the same unpack, the same VNNI dot, the same correction.
 namespace {
 template<int NT>
-inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, float* res) {
+inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks, float* res, const uint8_t* lim) {
     __m512 acc[NT], corr[NT];
     for (int t = 0; t < NT; ++t) { acc[t] = _mm512_setzero_ps(); corr[t] = _mm512_setzero_ps(); }
     const __m512i base = _mm512_setr_epi32(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
     const __m512i dup = _mm512_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
     for (int b0 = 0; b0 < nblocks; b0 += 8) {
         const int nb = nblocks - b0 < 8 ? nblocks - b0 : 8;
+        // the group is 8 interleaved blocks of 18 B = 144 B (scale + codes together): two lines per group reach every line of
+        // the row stream, because the groups are contiguous and each line is the "+64" of one group or the start of the next
+        pf_codes(row + (size_t) b0 * 18, lim);
         const __mmask16 m16 = nb >= 8 ? (__mmask16) 0xFFFF : (__mmask16) ((1u << (2 * nb)) - 1u);
         alignas(16) uint16_t sc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (int i = 0; i < nb; ++i) std::memcpy(&sc[i], row + (size_t) (b0 + i) * 18, 2);
@@ -624,8 +678,9 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks,
 template<int NT>
 void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, float* const* out, int r0, int r1) {
     float res[NT];
+    const uint8_t* const lim = w + (size_t) r1 * row_bytes;   // the end of THIS range's rows (see pf_codes)
     for (int r = r0; r < r1; ++r) {
-        q2g_row_multi<NT>(w + (size_t) r * row_bytes, a, nblocks, res);
+        q2g_row_multi<NT>(w + (size_t) r * row_bytes, a, nblocks, res, lim);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
@@ -663,6 +718,13 @@ void k_s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_to
     }
 }
 
+// Test hook (expert_variant_test): the prefetch distance, so one process can show the outputs do not depend on it.
+int k_set_q2_prefetch(int bytes) {
+    const int old = q2_pf_bytes;
+    q2_pf_bytes = bytes < 0 ? 0 : bytes;
+    return old;
+}
+
 void k_unpack64(const uint8_t* codes16, uint8_t* out64) { _mm512_storeu_si512((void*) out64, unpack64_q2_0(codes16)); }
 void k_unpack32(const uint8_t* codes8, uint8_t* out32) { _mm256_storeu_si256((__m256i*) out32, unpack_q2_0(codes8)); }
 
@@ -679,7 +741,8 @@ const ExpertKernels& STRATA_EXPERT_KERNELS() {
                                     &STRATA_EXPERT_NS::k_s2_expert_vnni_multi,
                                     &STRATA_EXPERT_NS::k_q2_0_gguf_rows_multi,
                                     &STRATA_EXPERT_NS::k_unpack64,
-                                    &STRATA_EXPERT_NS::k_unpack32};
+                                    &STRATA_EXPERT_NS::k_unpack32,
+                                    &STRATA_EXPERT_NS::k_set_q2_prefetch};
     return k;
 }
 

@@ -40,6 +40,10 @@ struct ExpertKernels {
     /// (the 256-bit ones).  Output byte j is `(codes[j / 4] >> (2 * (j % 4))) & 3`.
     void (*unpack64)(const uint8_t* codes16, uint8_t* out64);
     void (*unpack32)(const uint8_t* codes8, uint8_t* out32);
+    /// Test hook: set the software-prefetch distance of the Q2_0 row kernels in bytes (0 = off) and return the previous one.
+    /// Prefetch is a hint, so every output must be bitwise the same at any distance; expert_variant_test shows it.  Not
+    /// thread-safe: call it while no kernel runs.
+    int (*set_q2_prefetch)(int bytes);
 };
 
 /// Compiled with -mavx512vbmi: call only where `cpu_features().vbmi()`.

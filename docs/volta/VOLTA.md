@@ -245,7 +245,18 @@ and TLB cost. Two ways to get them, neither required (4 KiB pages work, a little
   (Ubuntu's default is `madvise`). The startup log's placement lines say whether a copy came out in hugetlb pages, THP or 4 KiB
   pages; `STRATA_NO_THP=1` switches the request off for an A/B.
 
-A hugetlb pool is memory the rest of the machine cannot use (it is not in `MemFree`): size it for the copies and nothing more.
+A hugetlb pool is memory the rest of the machine cannot use (it is not in `MemFree`): size it for the copies and nothing more. A
+pool smaller than one copy is not used at all (the copy takes THP and the log says so), so it is wasted RAM: a whole copy or 0. Only
+the 2 MiB pool is read. A hugetlb copy is prefaulted with `MADV_POPULATE_WRITE` (Linux 5.14+) so a pool that runs dry at the wrong
+moment gives a fallback to THP, not a SIGBUS at start-up.
+
+**Pinning.** The primary copy is registered with CUDA (the GPU reads it). Each replica is registered too (pinning only, `PORTABLE`;
+the GPU never reads it), which keeps it out of swap without counting against `ulimit -l`; if the driver refuses, the engine falls
+back to `mlock` (then `ulimit -l` matters: RUNBOOK step 1d) and finally to a note. `STRATA_NUMA_PIN_REPLICA=0` skips the
+registration (mlock only); watch `nvidia-smi`'s memory use after the arena opens if you suspect the registrations cost VRAM.
+
+**Sub-NUMA clustering.** `--numa auto` makes one copy per physical package (socket), so with SNC on a Gold 6226 (4 nodes) it still
+makes 2 copies, not 4; `--numa mirror` makes one per node.
 
 **Do not combine it with `numactl --interleave=all`** (or BIOS node interleaving): interleaving spreads every page of every
 allocation over both nodes, which is the opposite of placing a copy on each. The mirror binds its copies explicitly, and a

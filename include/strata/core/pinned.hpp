@@ -20,7 +20,9 @@
 
 namespace strata::core {
 
-enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
+/// `LargePages`: 2 MiB hugetlb pages (Windows: MEM_LARGE_PAGES).  `Thp`: transparent hugepages (a 2 MiB-aligned mapping that
+/// asked for them with madvise before its first touch), same TLB reach with no pool.  `NormalPages`: 4 KiB.
+enum class PageBacking { LargePages, NormalPages, PinnedByCuda, Thp };
 
 /// #243: STRATA_ARENA_PIN_GIB, the cap on the expert arena's CUDA registration in GiB.  -1 when unset (the engine
 /// decides, as in 0.1.30), 0 = no cap (the whole arena, or as many slices as the driver takes), N > 0 = at most N GiB,
@@ -58,8 +60,11 @@ struct PinnedArena {
     /// after it is mapped and BEFORE `cudaHostRegister` (or anything else) touches a page, so the pages the driver pins
     /// - and every one the loader writes - are allocated on that node and only there.  This is the PRIMARY copy of a
     /// mirrored arena: it lives on the GPU's node, it is the one CUDA registers, and it is the only one a GPU DMA ever
-    /// reads.  `bound` / `bind_note` report the outcome (a failed bind leaves a usable, unbound arena).  A hugetlb mapping
-    /// is attempted only when that node's own 2 MiB pool holds the arena (a bound mapping on a dry pool is a SIGBUS).
+    /// reads.  `bound` / `bind_note` report the outcome (a failed bind leaves a usable, unbound arena).  Page backing (any
+    /// `numa_node`, Linux): 2 MiB hugetlb pages when the pool holds the arena - a BOUND mapping only when that node's own pool
+    /// does (a bound mapping on a dry pool is a SIGBUS), and then prefaulted so a pool promised elsewhere is an error, not a
+    /// crash - else transparent hugepages (`madvise(MADV_HUGEPAGE)` on a 2 MiB-aligned mapping before the first touch), else
+    /// 4 KiB pages; `backing` and `note` say which.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
                 const std::string& shared_file = {}, uint64_t shared_pack_hash = 0, int numa_node = -1);
     int bind_node = -1;               ///< the node it was asked to be bound to (-1: not asked)
@@ -75,6 +80,13 @@ struct PinnedArena {
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
 };
+
+/// WP-F: pin [p, p + bytes) for the GPU runtime (`cudaHostRegister`, PORTABLE only - not for kernels to read): the replicas of
+/// a mirrored arena, which the primary's own registration does not cover.  Registration is not charged to RLIMIT_MEMLOCK
+/// (mlock is: 8 MiB for a user by default).  False + `how` when the driver refuses; `unpin_host_range` undoes it and must
+/// run before the memory is unmapped.  (The platform library that builds the replicas has no CUDA: it takes these as callbacks.)
+bool pin_host_range(void* p, uint64_t bytes, std::string& how);
+void unpin_host_range(void* p, uint64_t bytes);
 
 struct LoadStats {
     double seconds = 0.0;

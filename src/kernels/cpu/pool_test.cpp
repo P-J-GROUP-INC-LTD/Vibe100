@@ -272,6 +272,44 @@ bool make_fake_box(FakeBox& b, uint64_t arena_cap) {
     return b.plan.mirror;
 }
 
+// A fake sysfs tree of `cpus.size()` nodes (an empty cpu list = a memory-only node), the cpu topology files when `pkg` is given, the
+// GPU on node `gpu_node`; the topology, and the plan the engine's own planner makes for it.
+struct FakeTree {
+    std::filesystem::path root;
+    plat::NumaTopology topo;
+    plat::MirrorPlan plan;
+    ~FakeTree() { std::error_code ec; std::filesystem::remove_all(root, ec); }
+};
+bool make_fake_tree(FakeTree& f, const std::string& tag, const std::vector<std::vector<int>>& cpus, const std::vector<int>& pkg,
+                    int gpu_node, plat::NumaMode mode, uint64_t arena_cap) {
+    f.root = std::filesystem::temp_directory_path() / ("strata_pool_test_" + tag + "_" + std::to_string((long) getpid()));
+    std::filesystem::remove_all(f.root);
+    auto put = [&](const std::filesystem::path& p, const std::string& t) {
+        std::filesystem::create_directories(p.parent_path());
+        std::ofstream(p) << t;
+    };
+    const std::string mem = "Node %d MemTotal: 67108864 kB\nNode %d MemFree: 52428800 kB\nNode %d Active(file): 1048576 kB\nNode %d Inactive(file): 1048576 kB\n";
+    for (size_t id = 0; id < cpus.size(); ++id) {
+        char t[256];
+        std::snprintf(t, sizeof t, mem.c_str(), (int) id, (int) id, (int) id, (int) id);
+        const auto d = f.root / "devices/system/node" / ("node" + std::to_string(id));
+        put(d / "cpulist", plat::format_cpulist(cpus[id]) + "\n");
+        put(d / "meminfo", t);
+        if (!pkg.empty())
+            for (int c : cpus[id]) put(f.root / "devices/system/cpu" / ("cpu" + std::to_string(c)) / "topology/physical_package_id", std::to_string(pkg[id]) + "\n");
+    }
+    put(f.root / "bus/pci/devices/0000:3b:00.0/numa_node", std::to_string(gpu_node) + "\n");
+    f.topo = plat::numa_discover(f.root.string());
+    plat::numa_set_gpu(f.topo, "0000:3B:00.0");
+    plat::MirrorInputs in;
+    in.mode = mode;
+    in.topo = &f.topo;
+    in.arena_bytes = arena_cap;
+    in.headroom = 1ull << 30;
+    f.plan = plat::plan_arena_mirror(in);
+    return f.plan.mirror;
+}
+
 cpu::PoolNuma layout(const std::vector<int>& n0, const std::vector<int>& n1, int host_node) {
     cpu::PoolNuma p;
     p.node_cpus = {n0, n1};
@@ -432,6 +470,122 @@ int numa_mirror_test() {
                 expect(from_a > 0 && from_b > 0, "both nodes' workers took jobs, each from its own node's copy");
             });
         }
+    }
+    // ---- 5. (audit A4) more nodes than the pool used to track, and one copy per socket (sub-NUMA clustering).  Q2_0 experts only:
+    // the pool's translation does not depend on the kernel family.
+    {
+        Kind& k = kinds[0];
+        std::printf("\n  --- many nodes, shared copies (%s experts) ---\n", k.name.c_str());
+        cpu::clear_pool_numa();
+        const size_t cap = arena_bytes(k);
+        std::vector<uint8_t> A, B, stray(k.blob);
+        fill_arena(k, A, 1);
+        fill_arena(k, B, 2);
+        k.fill_one(stray.data(), 99);
+        std::vector<std::vector<float>> refA, refB;
+        {
+            cpu::ExpertPool plain;
+            refA = k.exec(plain, A.data(), stray.data());
+            refB = k.exec(plain, B.data(), stray.data());
+        }
+        // build the replicas of `ft.plan` from A, then poison the primary with B, and hand the body a pool laid out as `pn`
+        auto poisoned_on = [&](FakeTree& ft, const cpu::PoolNuma& pn, auto&& body) {
+            cpu::set_pool_numa(pn);
+            cpu::ExpertPool pool;
+            std::vector<uint8_t> primary = A;
+            plat::NumaReplicas rep;
+            plat::MirrorOptions mo;
+            mo.faked = true; mo.threads = 2; mo.lock = false; mo.samples = 4;
+            std::vector<std::string> log;
+            rep.build(primary.data(), cap, cap, ft.plan, ft.topo, mo, log);
+            std::memcpy(primary.data(), B.data(), cap);   // primary = B: POISONED
+            pool.set_mirror(rep.mirror());
+            body(pool, primary.data(), rep.mirror());
+        };
+        const std::vector<int> cores = cpu::physical_cores(false);
+        std::vector<int> every = cores;
+        std::sort(every.begin(), every.end());
+        {   // TEN nodes, the workers on node index 9 (nodes 1-8 memory-only): it used to read the primary - the replica of index >= 8 was built and never read
+            FakeTree ft;
+            std::vector<std::vector<int>> cpus(10);
+            cpus[0] = {every.front()};
+            cpus[9] = std::vector<int>(every.begin() + 1, every.end());
+            const bool made = every.size() >= 2 && make_fake_tree(ft, "n10", cpus, {}, 0, plat::NumaMode::Mirror, cap);
+            expect(made && ft.plan.replica_nodes == std::vector<int>{9}, "ten nodes: the plan puts a replica on node 9 (the only other node with CPUs)");
+            if (made) {
+                cpu::PoolNuma pn;
+                pn.node_cpus.assign(10, {});
+                pn.node_cpus[9] = every;       // every worker (and the host) on node index 9
+                pn.host_node = 9;
+                poisoned_on(ft, pn, [&](cpu::ExpertPool& pool, const uint8_t* primary, const plat::ArenaMirror& m) {
+                    expect(m.copy.size() == 10 && m.copy[9] != nullptr && m.copy[9] != m.primary, "the mirror has a slot, and a replica, for node index 9");
+                    bool all9 = true;
+                    for (int i = 0; i < pool.workers(); ++i) all9 = all9 && pool.worker_node(i) == 9;
+                    expect(all9 && pool.host_node() == 9, "every worker and the host are on node index 9");
+                    bool ok = true;
+                    for (int r = 0; r < 10 && ok; ++r) ok = all_same(k.exec(pool, primary, stray.data()), refA);
+                    expect(ok, "primary POISONED: every output is node 9's REPLICA's (index >= 8 is read now)");
+                });
+            }
+        }
+        {   // SNC: four nodes, sockets {0,1} and {2,3}, the GPU on node 1; auto mode makes ONE replica, on node 2, that node 3 reads too
+            FakeTree ft;
+            const bool four = every.size() >= 4;
+            std::vector<std::vector<int>> cpus(4);
+            if (four) {
+                const size_t q = every.size() / 4;
+                for (size_t n = 0; n < 4; ++n)
+                    cpus[n].assign(every.begin() + (long) (n * q), n == 3 ? every.end() : every.begin() + (long) ((n + 1) * q));
+            }
+            const bool made = four && make_fake_tree(ft, "snc", cpus, {0, 0, 1, 1}, 1, plat::NumaMode::Auto, cap);
+            if (!four) std::printf("  (fewer than 4 physical cores: the SNC case is SKIPPED)\n");
+            if (four) {
+                expect(made && ft.plan.replica_nodes == std::vector<int>{2}, "SNC auto: one replica, on node 2 (not one per node)");
+                const std::vector<std::pair<int, int>> want{{0, 1}, {1, 1}, {2, 2}, {3, 2}};
+                expect(ft.plan.reads == want, "...nodes 0,1 read the primary, nodes 2,3 read the replica");
+            }
+            if (made) {
+                auto only = [&](int node, int host) {
+                    cpu::PoolNuma pn;
+                    pn.node_cpus.assign(4, {});
+                    pn.node_cpus[(size_t) node] = every;
+                    pn.host_node = host;
+                    return pn;
+                };
+                poisoned_on(ft, only(3, 3), [&](cpu::ExpertPool& pool, const uint8_t* primary, const plat::ArenaMirror& m) {
+                    expect(m.copy.size() == 4 && m.copy[3] == m.copy[2] && m.copy[3] != m.primary && m.copy[0] == m.primary && m.copy[1] == m.primary,
+                           "the mirror: nodes 0,1 -> primary, nodes 2,3 -> the one replica");
+                    bool ok = true;
+                    for (int r = 0; r < 10 && ok; ++r) ok = all_same(k.exec(pool, primary, stray.data()), refA);
+                    expect(ok, "everything on node 3, primary POISONED: node 3 reads node 2's replica (its socket's copy)");
+                });
+                poisoned_on(ft, only(0, 0), [&](cpu::ExpertPool& pool, const uint8_t* primary, const plat::ArenaMirror&) {
+                    bool ok = true;
+                    for (int r = 0; r < 10 && ok; ++r) ok = all_same(k.exec(pool, primary, stray.data()), refB);
+                    expect(ok, "everything on node 0, primary POISONED: node 0 reads the primary (its socket's copy is on node 1)");
+                });
+            }
+        }
+        {   // set_mirror between batches, repeatedly, from the host thread: the wait at its entry returns at once when the workers are parked
+            FakeBox kbox;
+            if (make_fake_box(kbox, cap)) {
+                cpu::set_pool_numa(layout(kbox.node0, kbox.node1, 0));
+                cpu::ExpertPool pool;
+                plat::NumaReplicas rep;
+                plat::MirrorOptions mo;
+                mo.faked = true; mo.threads = 2; mo.lock = false; mo.samples = 4;
+                std::vector<std::string> log;
+                rep.build(A.data(), cap, cap, kbox.plan, kbox.topo, mo, log);
+                bool ok = true;
+                for (int r = 0; r < 200 && ok; ++r) {
+                    pool.set_mirror(r % 2 ? rep.mirror() : plat::ArenaMirror{});
+                    ok = pool.mirrored() == (r % 2 == 1);
+                    if (r % 20 == 0) ok = ok && all_same(k.exec(pool, A.data(), stray.data()), refA);
+                }
+                expect(ok, "set_mirror on and off 200 times between batches (it waits for the workers to be parked)");
+            }
+        }
+        (void) refB;
     }
     cpu::clear_pool_numa();
     return bad;

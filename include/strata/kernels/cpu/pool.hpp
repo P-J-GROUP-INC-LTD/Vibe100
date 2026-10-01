@@ -139,8 +139,16 @@ public:
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
 
-    /// **THE MIRRORED ARENA** (see `PoolNuma`).  Call it between batches (the workers are parked): from then on every job
-    /// whose blob lies in `m.primary` is read from the copy of the node that runs it.  An inactive `m` switches it off.
+    /// **THE MIRRORED ARENA** (see `PoolNuma`).  From then on every job whose blob lies in `m.primary` is read from the copy of
+    /// the node that runs it.  An inactive `m` switches it off.  `m.copy` is indexed by node INDEX, any number of nodes: a
+    /// node whose entry is null (no copy, or its holder was not kept) reads the primary, and nodes may share one pointer
+    /// (sub-NUMA clustering: one copy per socket).
+    ///
+    /// **CONTRACT: HOST THREAD ONLY, BETWEEN BATCHES.**  The workers read the mirror's description (`mir_*`, `weff_`) with plain
+    /// loads after the epoch's acquire, exactly as they read the batch's own description, so it may be written only while every
+    /// worker is parked.  The call WAITS for that (`wait_parked`, the same bounded wait `run` starts with) rather than trusting
+    /// the caller: it returns once the workers are parked, and it must not be called from a worker or while a `run*` is in
+    /// flight on another thread (the pool has one host).
     void set_mirror(const strata::platform::ArenaMirror& m);
     bool mirrored() const { return mir_len_ != 0; }
     /// The node INDEX each worker (and the host) belongs to, or -1 (unpinned / a core no node claims).
@@ -220,8 +228,7 @@ private:
     // epoch's acquire.
     uintptr_t mir_lo_ = 0;
     uint64_t mir_len_ = 0;
-    static constexpr int kMaxNodes = 8;
-    const uint8_t* mir_copy_[kMaxNodes] = {};
+    std::vector<const uint8_t*> mir_copy_;   // per node INDEX, however many nodes the machine has (never null once set)
     int mir_nodes_ = 0, mir_primary_ = 0;
     std::vector<int> wnode_, weff_, wcpu_;   // per worker: its node index, the index it reads (valid), its CPU
     int hnode_ = -1, heff_ = 0;              // the same for the host thread

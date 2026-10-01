@@ -619,9 +619,18 @@ public:
     // and registers it with CUDA as ever, then makes one more copy on every other node that has CPUs, bound to that node,
     // filled by threads pinned to it.  `blob()`, `pinned()` and `device_alias()` keep naming the primary, which is the only
     // copy any GPU DMA (cache fills, `--pcie-frac` misses, prompt streaming) ever sees; the POOL translates a job's pointer
-    // to its own node's copy (`ExpertPool::set_mirror`, pool.hpp), so no other code changes.  Replicas are never
-    // CUDA-registered; they are mlock'ed when the arena's lock policy allows.  Placement is VERIFIED (move_pages in query
+    // to its own node's copy (`ExpertPool::set_mirror`, pool.hpp), so no other code changes.  A replica is PINNED the way the
+    // primary is (`cudaHostRegister` PORTABLE: pinning only, nothing but the CPU pool reads it - and unlike mlock that is not
+    // charged to RLIMIT_MEMLOCK, 8 MiB for a user by default), mlock'ed (when the arena's lock policy allows) only where the
+    // registration is refused; STRATA_NUMA_PIN_REPLICA=0 skips the registration.  Placement is VERIFIED (move_pages in query
     // mode, on a sample) and reported; a replica that did not land on its node is dropped.
+    //
+    // WHICH NODES GET A COPY: `Mirror` - every node with CPUs; `Auto` - one per physical package (socket), so sub-NUMA clustering
+    // (SNC / NPS: a Gold 6226 then shows 4 nodes) does not make four 50 GB copies: the nodes of the GPU's socket read the primary,
+    // the nodes of another socket read that socket's one replica (`mirror().copy[node]` points the nodes of a socket at it).
+    // PAGE SIZE: each copy is 2 MiB hugetlb pages when its own node's pool holds the whole copy (prefaulted, so a pool promised
+    // elsewhere is an error and not a SIGBUS), else transparent hugepages (madvise before the first touch), else 4 KiB pages;
+    // `note()` and the replica lines of `numa_notes()` say which, with what smaps shows (platform/numa.hpp).
     //
     // Call before `open`: the mode is `--numa` after STRATA_NUMA_MIRROR's say (platform::numa_mode_with_env).
     void set_numa(strata::platform::NumaMode mode) { numa_mode_ = mode; }

@@ -2268,6 +2268,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
     }
+    // what the kernel really gave the primary (the arena's note says what was asked for): hugetlb / THP / 4 KiB pages, from smaps
+    const strata::platform::PageStats primary_pages = strata::platform::numa_page_stats(a->data(), want);
     // ---- NUMA (WP-F): the replicas, now that the primary holds the experts.  A failed bind of the PRIMARY (a container that
     // forbids mbind, say) leaves the arena as it always was and the mirror off: replicas whose readers cannot be told
     // from the unbound primary would only cost memory.
@@ -2279,6 +2281,13 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         mo.faked = topo.faked;
         mo.threads = 12;
         mo.lock = plat::arena_lock_allowed();
+        // A replica is PINNED the way the primary is (cudaHostRegister, pinning only: the GPU never reads it) rather than only
+        // mlock-ed, which RLIMIT_MEMLOCK (8 MiB for a user by default) refuses; mlock stays the fallback.  STRATA_NUMA_PIN_REPLICA=0
+        // is the A/B arm: mlock only, as before.
+        if (const char* e = std::getenv("STRATA_NUMA_PIN_REPLICA"); !(e != nullptr && e[0] == '0')) {
+            mo.pin = &strata::core::pin_host_range;
+            mo.unpin = &strata::core::unpin_host_range;
+        }
         std::vector<std::string> log;
         replicas_.build(a->data(), want, arena_cap, plan, topo, mo, log);
         auto gib = [](uint64_t v) {
@@ -2290,12 +2299,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                            ": primary " + gib(arena_cap) + " on node " + std::to_string(plan.primary_node) + " [" +
                            (plan.gpu_node_assumed ? "ASSUMED the GPU's node" : "the GPU's node") + "; " +
                            (a->registered_bytes > 0 ? "CUDA-registered " + gib(a->registered_bytes) : std::string("not CUDA-registered")) +
-                           "; " + (a->bound ? "bound" : "UNBOUND") + "; the only copy any GPU DMA reads] + " +
+                           "; " + (a->bound ? "bound" : "UNBOUND") + "; " + primary_pages.text() +
+                           "; the only copy any GPU DMA reads] + " +
                            std::to_string(replicas_.count()) + " replica" + (replicas_.count() == 1 ? "" : "s") + " of " +
                            gib(arena_cap) + " on node" + (plan.replica_nodes.size() == 1 ? "" : "s");
         for (size_t i = 0; i < plan.replica_nodes.size(); ++i) line += (i ? "," : " ") + std::to_string(plan.replica_nodes[i]);
         if (plan.gpu_node_assumed) line += " (GPU node: " + topo.gpu_note + ")";
         numa_notes_.push_back(line);
+        // sub-NUMA clustering: a socket's nodes share its copy ("one copy per socket"), so say which node reads which
+        if (plan.reads.size() > 1 + plan.replica_nodes.size()) numa_notes_.push_back("NUMA: one copy per socket (sub-NUMA clustering): " + plan.layout);
         for (const std::string& l : log) numa_notes_.push_back("NUMA:   " + l);
         if (replicas_.count() > 0) {
             for (const auto& n : topo.nodes) pool_numa_.node_cpus.push_back(n.cpus);
@@ -2326,6 +2338,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     n_expert_ = n_expert;
     reads_ = 0;
     note_ = a->note;
+    if (primary_pages.ok) note_ += "; " + primary_pages.text();
     gib_per_s_ = st.gib_per_second();
     load_seconds_ = st.seconds;
     load_read_s_ = st.read_seconds;

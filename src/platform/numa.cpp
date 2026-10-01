@@ -2,6 +2,7 @@
 #include "strata/platform/numa.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -22,6 +23,12 @@
 #include <linux/mman.h>
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
+#endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
+#endif
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23   // Linux 5.14; older libc headers lack the name, older kernels answer EINVAL
 #endif
 #endif
 
@@ -58,6 +65,15 @@ std::string resolve_root(const std::string& arg, bool& faked) {
     if (!arg.empty()) { faked = true; return arg; }
     if (const char* e = std::getenv("STRATA_SYSFS_ROOT"); e != nullptr && *e != '\0') { faked = true; return e; }
     return "/sys";
+}
+
+// "always [madvise] never" -> "madvise"; empty when unreadable
+std::string thp_mode_of(const std::string& root) {
+    std::string text;
+    if (!slurp(root + "/kernel/mm/transparent_hugepage/enabled", text)) return {};
+    const size_t a = text.find('['), b = text.find(']');
+    if (a == std::string::npos || b == std::string::npos || b < a + 2) return {};
+    return text.substr(a + 1, b - a - 1);
 }
 
 }  // namespace
@@ -186,10 +202,36 @@ NumaTopology numa_discover(const std::string& sysfs_root) {
         }
         n.mem_file = active_file + inactive_file;
         n.has_meminfo = saw_total && saw_free;
+        // the node's own 2 MiB hugetlb pool: pages `vm.nr_hugepages` reserved are not in MemFree, and a bound MAP_HUGETLB
+        // mapping draws on THIS node's pool only
+        {
+            const std::string hp = base + "/hugepages/hugepages-2048kB/";
+            std::string f, nr;
+            if (slurp(hp + "free_hugepages", f) && slurp(hp + "nr_hugepages", nr)) {
+                char *e1 = nullptr, *e2 = nullptr;
+                const unsigned long long vf = std::strtoull(f.c_str(), &e1, 10), vn = std::strtoull(nr.c_str(), &e2, 10);
+                if (e1 != f.c_str() && e2 != nr.c_str()) {
+                    n.has_huge = true;
+                    n.huge_free = (uint64_t) vf * kHuge;
+                    n.huge_total = (uint64_t) vn * kHuge;
+                }
+            }
+        }
+        // the package (socket) of the node's CPUs: sub-NUMA clustering makes several nodes of one
+        for (int c : n.cpus) {
+            std::string pk;
+            if (!slurp(t.root + "/devices/system/cpu/cpu" + std::to_string(c) + "/topology/physical_package_id", pk)) continue;
+            char* end = nullptr;
+            const long v = std::strtol(pk.c_str(), &end, 10);
+            if (end == pk.c_str() || v < 0) continue;
+            if (n.package == -1) n.package = (int) v;
+            else if (n.package != (int) v) { n.package = -2; break; }
+        }
         t.nodes.push_back(std::move(n));
     }
     t.available = true;
     t.gpu_node = t.nodes.front().id;
+    t.thp_mode = thp_mode_of(t.root);
 #else
     (void) sysfs_root;
     t.why = "not Linux: the topology comes from sysfs";
@@ -253,7 +295,14 @@ std::string numa_describe(const NumaTopology& t) {
         const NumaNode& n = t.nodes[i];
         if (i) s += ", ";
         s += "node" + std::to_string(n.id) + " cpus " + (n.cpus.empty() ? std::string("none") : format_cpulist(n.cpus));
-        if (n.has_meminfo) s += " (" + gib(n.usable_bytes()) + " usable)";
+        if (n.package >= 0) s += " socket " + std::to_string(n.package);
+        if (n.has_meminfo) {
+            s += " (" + gib(n.usable_bytes()) + " usable";
+            if (n.has_huge && n.huge_total > 0) s += ", " + gib(n.huge_free) + " free in its 2 MiB hugepage pool of " + gib(n.huge_total);
+            s += ")";
+        } else if (n.has_huge && n.huge_total > 0) {
+            s += " (" + gib(n.huge_free) + " free in its 2 MiB hugepage pool)";
+        }
     }
     if (!t.gpu_bdf.empty())
         s += std::string("; GPU ") + t.gpu_bdf + " on node " + std::to_string(t.gpu_node) +
@@ -398,12 +447,251 @@ uint64_t numa_node_free_hugepage_bytes(int node, bool& known, const std::string&
 #endif
 }
 
+// ================================ PAGE BACKING ================================
+
+const char* page_kind_name(PageKind k) {
+    return k == PageKind::Hugetlb ? "2 MiB hugetlb pages" : k == PageKind::Thp ? "THP (2 MiB pages, madvise)" : "4 KiB pages";
+}
+
+std::string numa_thp_mode(const std::string& sysfs_root) {
+    bool faked = false;
+    return thp_mode_of(resolve_root(sysfs_root, faked));
+}
+
+#if defined(__linux__)
+namespace {
+// Whether the kernel knows MADV_POPULATE_WRITE (>= 5.14): probed once on a scratch page, EINVAL = no.
+bool populate_supported() {
+    static const bool ok = [] {
+        void* p = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return false;
+        const int r = madvise(p, 4096, MADV_POPULATE_WRITE);
+        const int e = errno;
+        munmap(p, 4096);
+        return r == 0 || e != EINVAL;
+    }();
+    return ok;
+}
+}  // namespace
+
+Populate numa_populate_write(void* p, uint64_t bytes, int threads, const std::vector<int>& cpus, std::string& err) {
+    if (p == nullptr || bytes == 0) return Populate::Ok;
+    if (!populate_supported()) {
+        err = "madvise(MADV_POPULATE_WRITE) needs Linux >= 5.14";
+        return Populate::Unsupported;
+    }
+    const uint64_t chunk = 64ull << 20;   // a multiple of 2 MiB: a hugetlb page is populated by exactly one thread
+    const uint64_t nchunks = (bytes + chunk - 1) / chunk;
+    const int n = (int) std::max<uint64_t>(1, std::min<uint64_t>((uint64_t) std::max(1, threads), nchunks));
+    std::atomic<uint64_t> next{0};
+    std::atomic<int> bad{0};
+    auto run = [&](int t) {
+        if (!cpus.empty()) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpus[(size_t) t % cpus.size()], &set);
+            pthread_setaffinity_np(pthread_self(), sizeof set, &set);   // best effort: the page is zeroed by a CPU of its node
+        }
+        for (;;) {
+            if (bad.load(std::memory_order_relaxed) != 0) return;
+            const uint64_t c = next.fetch_add(1);
+            if (c >= nchunks) return;
+            const uint64_t a = c * chunk, len = std::min(chunk, bytes - a);
+            while (madvise((uint8_t*) p + a, (size_t) len, MADV_POPULATE_WRITE) != 0) {
+                if (errno == EINTR) continue;
+                bad.store(errno);
+                return;
+            }
+        }
+    };
+    std::vector<std::thread> th;
+    th.reserve((size_t) n);
+    for (int t = 0; t < n; ++t) {
+        try { th.emplace_back(run, t); }
+        catch (...) { run(t); }   // no thread to be had: do its share here
+    }
+    for (auto& x : th) x.join();
+    if (const int e = bad.load(); e != 0) {
+        err = std::string(std::strerror(e)) +
+              (e == EFAULT ? " (a page fault there would have been a SIGBUS: the node's hugepage pool was promised elsewhere)" : "");
+        return Populate::Failed;
+    }
+    return Populate::Ok;
+}
+
+bool numa_map_arena(uint64_t requested, const ArenaMapOptions& opt, ArenaMap& out) {
+    out = ArenaMap{};
+    if (requested == 0) { out.note = "zero bytes"; return false; }
+    bool faked = false;
+    const std::string root = resolve_root(opt.sysfs_root, faked);
+    const std::string nd = std::to_string(opt.node);
+    const uint64_t len = round_up(requested, kHuge);
+    std::string why;   // what kept hugetlb from being the answer
+    auto bind = [&](void* p, uint64_t page) {
+        if (opt.node < 0) return;
+        std::string err;
+        out.bound = numa_bind_memory(p, len, opt.node, err, page);
+        out.bind_note = out.bound ? "mbind(MPOL_BIND) to node " + nd : "mbind to node " + nd + " FAILED (" + err + ")";
+    };
+
+    // ---- 1. hugetlb.  A mapping bound to a node draws its pages from THAT node's pool, and a pool that runs dry is a SIGBUS
+    // at the first touch, not a fallback: so the pool is asked first (an unreadable one counts as none), and a mapping that
+    // got through is prefaulted at once, which turns that SIGBUS into an error here.  (`free_hugepages` also counts pages another
+    // reservation has been promised, and the mmap's own reservation is global, not per node: neither is a guarantee for THIS node.)
+    if (opt.hugetlb) {
+        bool try_huge = true, known = false;
+        uint64_t room = 0;
+        if (opt.node >= 0) {
+            room = numa_node_free_hugepage_bytes(opt.node, known, root);
+            if (!known) { try_huge = false; why = "no 2 MiB hugepage pool on node " + nd; }
+            else if (room < len) {
+                try_huge = false;
+                why = room == 0 ? "node " + nd + "'s 2 MiB hugepage pool is empty"
+                                : "node " + nd + "'s 2 MiB hugepage pool has " + gib(room) + " free, " + gib(len) +
+                                      " needed (Linux spreads vm.nr_hugepages evenly over the nodes: size every node's pool for a whole copy)";
+            }
+        }
+        if (try_huge) {
+            void* p = mmap(nullptr, (size_t) len, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+            if (p == MAP_FAILED) {
+                why = std::string("MAP_HUGETLB refused (") + std::strerror(errno) + (opt.node < 0 ? "; no hugetlb pool configured?)" : ")");
+            } else {
+                out.base = p;
+                out.bytes = len;
+                out.kind = PageKind::Hugetlb;
+                bind(p, kHuge);
+                std::string extra;
+                bool keep = true;
+                // (an unbound mapping too: the task policy `numactl --membind` / `--interleave` restricts a hugetlb fault to the nodes it
+                // names just as a bind does, and their pools are what runs dry)
+                if (opt.prefault_hugetlb && (opt.node < 0 || out.bound)) {
+                    std::string perr;
+                    Populate r = numa_populate_write(p, len, opt.threads, opt.cpus, perr);
+                    if (opt.fail_prefault_for_test) { r = Populate::Failed; perr = "injected by the test"; }
+                    if (r == Populate::Failed) {
+                        keep = false;
+                        why = "the prefault of the hugetlb mapping failed (" + perr + ")";
+                    } else if (r == Populate::Unsupported) {
+                        extra = "; not prefaulted (" + perr + "): a pool that runs dry would SIGBUS at the first touch";
+                    } else {
+                        extra = "; prefaulted";
+                    }
+                }
+                if (keep) {
+                    out.note = std::string(page_kind_name(PageKind::Hugetlb)) +
+                               (opt.node >= 0 && known ? " (node " + nd + "'s pool had " + gib(room) + " free)" : std::string()) + extra;
+                    return true;
+                }
+                munmap(p, (size_t) len);   // the pages it did get go back to the pool
+                out.base = nullptr;
+                out.bytes = 0;
+                out.bound = false;
+                out.bind_note.clear();
+                out.kind = PageKind::Small;
+            }
+        }
+    }
+
+    // ---- 2. a 2 MiB-ALIGNED mapping (THP only backs aligned 2 MiB ranges: an unaligned 50 GB mapping gets 4 KiB pages at both
+    // ends and, on kernels before 6.7, wherever the kernel put the start), then MADV_HUGEPAGE before the first touch
+    const uint64_t span = len + kHuge;
+    void* raw = mmap(nullptr, (size_t) span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+        out.note = "mmap of " + gib(requested) + " failed: " + std::strerror(errno);
+        return false;
+    }
+    const uintptr_t r0 = (uintptr_t) raw, a0 = round_up(r0, kHuge), a1 = a0 + len, r1 = r0 + span;
+    if (a0 > r0) munmap(raw, (size_t) (a0 - r0));
+    if (r1 > a1) munmap((void*) a1, (size_t) (r1 - a1));
+    out.base = (void*) a0;
+    out.bytes = len;
+    out.kind = PageKind::Small;
+    std::string thp_note;
+    const bool no_thp = [] { const char* e = std::getenv("STRATA_NO_THP"); return e != nullptr && e[0] == '1'; }();   // A/B arm
+    if (opt.thp && !no_thp) {
+        const std::string mode = thp_mode_of(root);
+        if (madvise(out.base, (size_t) len, MADV_HUGEPAGE) != 0)
+            thp_note = std::string("madvise(MADV_HUGEPAGE) refused (") + std::strerror(errno) + ")";
+        else if (mode == "never")
+            thp_note = "THP is off system-wide (transparent_hugepage/enabled = never)";
+        else {
+            out.kind = PageKind::Thp;
+            if (!mode.empty()) thp_note = "system THP mode " + mode;
+        }
+    } else if (opt.thp) {
+        thp_note = "THP off (STRATA_NO_THP=1)";
+    }
+    bind(out.base, 4096);
+    std::string tail = why;
+    if (!thp_note.empty()) tail += (tail.empty() ? "" : "; ") + thp_note;
+    out.note = std::string(page_kind_name(out.kind)) + (tail.empty() ? "" : " [" + tail + "]");
+    return true;
+}
+
+void numa_unmap_arena(void* base, uint64_t bytes) {
+    if (base != nullptr) munmap(base, (size_t) round_up(bytes, kHuge));
+}
+
+PageStats numa_page_stats(const void* p, uint64_t bytes) {
+    PageStats st;
+    std::ifstream f("/proc/self/smaps");
+    if (!f || p == nullptr || bytes == 0) return st;
+    const uint64_t lo = (uint64_t) (uintptr_t) p, hi = lo + bytes;
+    double frac = 0.0, rss = 0.0, thp = 0.0, huge = 0.0;
+    std::string line;
+    while (std::getline(f, line)) {
+        unsigned long long a = 0, b = 0;
+        if (std::sscanf(line.c_str(), "%llx-%llx ", &a, &b) == 2) {   // a VMA header; the field lines never match this
+            const uint64_t s = std::max<uint64_t>(a, lo), e = std::min<uint64_t>(b, hi);
+            frac = e > s && b > a ? (double) (e - s) / (double) (b - a) : 0.0;
+            continue;
+        }
+        if (frac <= 0.0) continue;
+        unsigned long long kb = 0;
+        if (line.compare(0, 4, "Rss:") == 0 && std::sscanf(line.c_str() + 4, " %llu", &kb) == 1) rss += frac * (double) kb;
+        else if (line.compare(0, 14, "AnonHugePages:") == 0 && std::sscanf(line.c_str() + 14, " %llu", &kb) == 1) thp += frac * (double) kb;
+        else if (line.compare(0, 16, "Private_Hugetlb:") == 0 && std::sscanf(line.c_str() + 16, " %llu", &kb) == 1) huge += frac * (double) kb;
+        else if (line.compare(0, 15, "Shared_Hugetlb:") == 0 && std::sscanf(line.c_str() + 15, " %llu", &kb) == 1) huge += frac * (double) kb;
+    }
+    st.ok = true;
+    st.rss = (uint64_t) (rss * 1024.0);
+    st.thp = (uint64_t) (thp * 1024.0);
+    st.hugetlb = (uint64_t) (huge * 1024.0);
+    return st;
+}
+#else
+Populate numa_populate_write(void*, uint64_t, int, const std::vector<int>&, std::string& err) {
+    err = "no madvise on this OS";
+    return Populate::Unsupported;
+}
+bool numa_map_arena(uint64_t, const ArenaMapOptions&, ArenaMap& out) {
+    out = ArenaMap{};
+    out.note = "no NUMA mapping on this OS";
+    return false;
+}
+void numa_unmap_arena(void*, uint64_t) {}
+PageStats numa_page_stats(const void*, uint64_t) { return PageStats{}; }
+#endif
+
+std::string PageStats::text() const {
+    if (!ok) return "page sizes not checked";
+    if (hugetlb > 0 && hugetlb >= rss) return "2 MiB hugetlb pages: " + gib(hugetlb) + " resident";   // smaps' Rss leaves hugetlb out
+    if (rss == 0) return "no page resident yet";
+    if (thp > 0) return "THP: " + gib(thp) + " of " + gib(rss) + " resident in 2 MiB pages";
+    return "4 KiB pages: " + gib(rss) + " resident (no THP)";
+}
+
+// ================================ NumaBuffer ================================
+
 NumaBuffer& NumaBuffer::operator=(NumaBuffer&& o) noexcept {
     if (this != &o) {
         release();
         base_ = o.base_; bytes_ = o.bytes_; map_bytes_ = o.map_bytes_; locked_ = o.locked_; node_ = o.node_;
-        bound_ = o.bound_; huge_ = o.huge_; note_ = std::move(o.note_); lock_note_ = std::move(o.lock_note_);
-        o.base_ = nullptr; o.bytes_ = o.map_bytes_ = o.locked_ = 0; o.bound_ = o.huge_ = false;
+        bound_ = o.bound_; pinned_ = o.pinned_; kind_ = o.kind_; unpin_ = std::move(o.unpin_);
+        note_ = std::move(o.note_); lock_note_ = std::move(o.lock_note_); pin_note_ = std::move(o.pin_note_);
+        o.base_ = nullptr; o.bytes_ = o.map_bytes_ = o.locked_ = 0; o.bound_ = o.pinned_ = false; o.kind_ = PageKind::Small;
+        o.unpin_ = nullptr;
     }
     return *this;
 }
@@ -413,62 +701,56 @@ NumaBuffer::~NumaBuffer() { release(); }
 void NumaBuffer::release() {
 #if defined(__linux__)
     if (base_ != nullptr) {
+        if (pinned_ && unpin_) unpin_(base_, bytes_);   // the registration must not outlive the pages
         if (locked_ > 0) munlock(base_, (size_t) locked_);
-        munmap(base_, (size_t) map_bytes_);
+        numa_unmap_arena(base_, map_bytes_);
     }
 #endif
     base_ = nullptr;
     bytes_ = map_bytes_ = locked_ = 0;
-    bound_ = huge_ = false;
+    bound_ = pinned_ = false;
+    kind_ = PageKind::Small;
+    unpin_ = nullptr;
 }
 
-bool NumaBuffer::allocate(uint64_t bytes, int node, bool use_hugepages) {
+bool NumaBuffer::allocate(uint64_t bytes, int node, bool use_hugepages, const std::vector<int>& cpus) {
     release();
     note_.clear();
     lock_note_.clear();
+    pin_note_.clear();
     node_ = node;
 #if defined(__linux__)
     if (bytes == 0) { note_ = "zero bytes"; return false; }
-    void* p = MAP_FAILED;
-    uint64_t map_bytes = 0;
-    std::string huge_note;
-    if (use_hugepages) {
-        // A hugetlb mapping bound to a node takes its pages from THAT node's pool, and a pool that runs dry is a SIGBUS at
-        // the first touch, not a fallback - so the pool is checked first, per node.
-        bool known = false;
-        const uint64_t room = numa_node_free_hugepage_bytes(node, known);
-        const uint64_t need = round_up(bytes, kHuge);
-        if (known && room >= need) {
-            p = mmap(nullptr, (size_t) need, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
-            if (p != MAP_FAILED) { huge_ = true; map_bytes = need; }
-        }
-        if (p == MAP_FAILED)
-            huge_note = known ? "node " + std::to_string(node) + " has " + gib(room) + " of free 2 MiB hugepages, " + gib(need) +
-                                    " needed; "
-                              : "no 2 MiB hugepage pool on node " + std::to_string(node) + "; ";
-    }
-    if (p == MAP_FAILED) {
-        map_bytes = round_up(bytes, 4096);
-        p = mmap(nullptr, (size_t) map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    }
-    if (p == MAP_FAILED) {
-        note_ = std::string("mmap of ") + gib(bytes) + " failed: " + std::strerror(errno);
-        return false;
-    }
-    base_ = (uint8_t*) p;
+    ArenaMapOptions o;
+    o.node = node;
+    o.hugetlb = use_hugepages;
+    o.thp = use_hugepages;
+    o.cpus = cpus;
+    ArenaMap m;
+    if (!numa_map_arena(bytes, o, m)) { note_ = m.note; return false; }
+    base_ = (uint8_t*) m.base;
     bytes_ = bytes;
-    map_bytes_ = map_bytes;
-    std::string err;
-    bound_ = numa_bind_memory(base_, map_bytes_, node, err, huge_ ? kHuge : 4096);
-    note_ = huge_note + (huge_ ? "2 MiB pages; " : "4 KiB pages; ") +
-            (bound_ ? "mbind(MPOL_BIND) to node " + std::to_string(node) : "mbind to node " + std::to_string(node) + " FAILED (" + err + ")");
+    map_bytes_ = m.bytes;
+    kind_ = m.kind;
+    bound_ = m.bound;
+    note_ = m.note + "; " + m.bind_note;
     return true;
 #else
-    (void) bytes; (void) use_hugepages;
+    (void) bytes; (void) use_hugepages; (void) cpus;
     note_ = "no NUMA binding on this OS";
     return false;
 #endif
+}
+
+bool NumaBuffer::pin(const PinFn& pin_fn, const UnpinFn& unpin_fn) {
+    pin_note_.clear();
+    if (base_ == nullptr || !pin_fn) { pin_note_ = "nothing to pin"; return false; }
+    std::string how;
+    if (!pin_fn(base_, bytes_, how)) { pin_note_ = how; return false; }
+    pinned_ = true;
+    unpin_ = unpin_fn;
+    pin_note_ = how;
+    return true;
 }
 
 bool NumaBuffer::lock() {
@@ -590,30 +872,104 @@ MirrorPlan plan_arena_mirror(const MirrorInputs& in) {
     }
     p.primary_node = t.gpu_node;
     p.gpu_node_assumed = !t.gpu_node_known;
-    for (int id : p.cpu_nodes)
-        if (id != p.primary_node) p.replica_nodes.push_back(id);
-    if (p.replica_nodes.empty())
-        return no("every CPU this process may use is on node " + std::to_string(p.primary_node) +
-                  (p.gpu_node_assumed ? " (assumed to be the GPU's)" : " (the GPU's)") +
-                  " (taskset / numactl --cpunodebind?): nothing would read a replica");
+    const int pidx = t.index_of_node(p.primary_node);
+    if (pidx < 0) return no("the GPU's node " + std::to_string(p.primary_node) + " is not in the topology: one copy");
+    auto node_of = [&](int id) -> const NumaNode& { return t.nodes[(size_t) t.index_of_node(id)]; };
+    // The package (socket) of a node for the one-copy-per-socket rule; a node whose package is unknown (no cpu topology
+    // files) or spans several counts as a package of its own, which is the one-copy-per-node rule.
+    auto pkg = [&](const NumaNode& n) { return n.package >= 0 ? n.package : -1000 - n.id; };
+    // Room for a copy on node `n`: a node whose own free hugepage pool holds the whole copy takes it from the pool and needs
+    // only the headroom in normal memory; every other node takes the copy from normal memory (hugetlb needs the whole copy).
+    auto room_for = [&](const NumaNode& n) { return n.usable_bytes() + (n.pool_holds(in.arena_bytes) ? in.arena_bytes : 0); };
+
+    int others = 0;
+    for (int id : p.cpu_nodes) others += id != p.primary_node ? 1 : 0;
+    if (in.mode == NumaMode::Mirror) {
+        // asked for: one replica on every other node that has CPUs, however the sockets divide into nodes
+        for (int id : p.cpu_nodes)
+            if (id != p.primary_node) p.replica_nodes.push_back(id);
+    } else {
+        // Auto: ONE copy per package.  The GPU's package is served by the primary; every other package gets one replica, on its
+        // node with the most room, and its other nodes (sub-NUMA clustering) read that one.
+        std::vector<int> pkgs;
+        for (int id : p.cpu_nodes) {
+            const int k = pkg(node_of(id));
+            if (k != pkg(t.nodes[(size_t) pidx]) && std::find(pkgs.begin(), pkgs.end(), k) == pkgs.end()) pkgs.push_back(k);
+        }
+        for (int k : pkgs) {
+            const NumaNode* best = nullptr;
+            for (int id : p.cpu_nodes) {
+                const NumaNode& n = node_of(id);
+                if (pkg(n) != k) continue;
+                if (best == nullptr || room_for(n) > room_for(*best)) best = &n;   // ascending ids: the lowest wins a tie
+            }
+            p.replica_nodes.push_back(best->id);
+        }
+    }
+    if (p.replica_nodes.empty()) {
+        if (others == 0)
+            return no("every CPU this process may use is on node " + std::to_string(p.primary_node) +
+                      (p.gpu_node_assumed ? " (assumed to be the GPU's)" : " (the GPU's)") +
+                      " (taskset / numactl --cpunodebind?): nothing would read a replica");
+        std::string ids;
+        for (int id : p.cpu_nodes)
+            if (id != p.primary_node) ids += (ids.empty() ? "" : ",") + std::to_string(id);
+        return no("the other NUMA node" + std::string(others == 1 ? " with CPUs (node " : "s with CPUs (nodes ") + ids +
+                  ") sit in the GPU's own socket (sub-NUMA clustering / NPS): --numa auto keeps one copy per socket, so "
+                  "there is nothing to mirror (--numa mirror makes one per node)");
+    }
+    // who reads which copy: a holder reads its own, a node of a package without a holder... every package has one by now
+    for (int id : p.cpu_nodes) {
+        int src = id;
+        const bool holder = id == p.primary_node || std::find(p.replica_nodes.begin(), p.replica_nodes.end(), id) != p.replica_nodes.end();
+        if (!holder) {
+            const int k = pkg(node_of(id));
+            src = k == pkg(t.nodes[(size_t) pidx]) ? p.primary_node : id;
+            for (int h : p.replica_nodes)
+                if (pkg(node_of(h)) == k) { src = h; break; }
+        }
+        p.reads.emplace_back(id, src);
+    }
+    {
+        std::vector<int> hold{p.primary_node};
+        hold.insert(hold.end(), p.replica_nodes.begin(), p.replica_nodes.end());
+        for (int h : hold) {
+            std::string rd;
+            for (const auto& r : p.reads)
+                if (r.second == h) rd += (rd.empty() ? "" : ",") + std::to_string(r.first);
+            p.layout += (p.layout.empty() ? "" : "; ") + std::string(h == p.primary_node ? "the primary on node " : "a replica on node ") +
+                        std::to_string(h) + " is read by node" + (rd.find(',') != std::string::npos ? "s " : " ") + (rd.empty() ? std::string("none") : rd);
+        }
+    }
 
     // The room: each node that gets a copy must have the copy plus the headroom, counting the file cache the kernel
-    // reclaims for a bound allocation.
+    // reclaims for a bound allocation - or just the headroom where its own free hugepage pool holds the whole copy.
     std::vector<int> holders{p.primary_node};
     holders.insert(holders.end(), p.replica_nodes.begin(), p.replica_nodes.end());
+    uint64_t normal_copies = 0;   // bytes of copies that will come from normal memory (a pooled copy is not in MemAvailable)
     for (int id : holders) {
-        const NumaNode& n = t.nodes[(size_t) t.index_of_node(id)];
+        const NumaNode& n = node_of(id);
         if (!n.has_meminfo) return no("node " + std::to_string(id) + "'s free memory cannot be read: one copy is kept");
-        if (n.usable_bytes() < in.arena_bytes + in.headroom)
+        const bool pooled = n.pool_holds(in.arena_bytes);
+        const uint64_t own = pooled ? 0 : in.arena_bytes;
+        normal_copies += own;
+        if (n.usable_bytes() < own + in.headroom) {
+            std::string pool;
+            if (n.has_huge && n.huge_total > 0)
+                pool = pooled ? "; its " + gib(n.huge_free) + " free hugepage pool holds the copy"
+                              : "; its 2 MiB hugepage pool has " + gib(n.huge_free) + " free, not a whole copy, so the copy takes normal memory";
             return no("node " + std::to_string(id) + " has " + gib(n.usable_bytes()) + " usable (" + gib(n.mem_free) + " free + " +
-                      gib(n.mem_file) + " file cache) but a " + gib(in.arena_bytes) + " copy plus " + gib(in.headroom) +
-                      " of headroom (STRATA_NUMA_HEADROOM_GIB) needs " + gib(in.arena_bytes + in.headroom) + ": one copy is kept");
+                      gib(n.mem_file) + " file cache" + pool + ") but " +
+                      (pooled ? std::string("the headroom") : "a " + gib(in.arena_bytes) + " copy plus " + "the headroom") + " of " +
+                      gib(in.headroom) + " (STRATA_NUMA_HEADROOM_GIB) needs " + gib(own + in.headroom) + ": one copy is kept");
+        }
     }
-    const uint64_t all = in.arena_bytes * holders.size() + in.headroom;
+    const uint64_t all = normal_copies + in.headroom;
     if (in.global_available != 0 && in.global_available < all)
         return no("the system has " + gib(in.global_available) + " available (MemAvailable, cgroup limit included) but " +
                   std::to_string(holders.size()) + " copies of " + gib(in.arena_bytes) + " plus " + gib(in.headroom) +
-                  " of headroom need " + gib(all) + ": one copy is kept");
+                  " of headroom need " + gib(all) + (normal_copies != in.arena_bytes * holders.size() ? " (copies in the hugepage pools excluded)" : "") +
+                  ": one copy is kept");
     p.mirror = true;
     return p;
 }
@@ -658,12 +1014,7 @@ int NumaReplicas::build(const uint8_t* primary, uint64_t bytes, uint64_t capacit
     for (int id : plan.replica_nodes) {
         const int ni = topo.index_of_node(id);
         if (ni < 0) { log.push_back("replica for node " + std::to_string(id) + " skipped: not in the topology"); continue; }
-        NumaBuffer b;
-        if (!b.allocate(capacity, id, opt.hugepages)) {
-            log.push_back("replica on node " + std::to_string(id) + " not made: " + b.note());
-            continue;
-        }
-        // THE FIRST TOUCH IS THE COPY, and it runs on CPUs of the node: the bind above is the guarantee, this is the
+        // THE FIRST TOUCH IS THE COPY, and it runs on CPUs of the node: the bind below is the guarantee, this is the
         // second line of defence (and what places the pages where the bind failed, or where the node does not exist in
         // a test).
         // the node's CPUs this process may actually run on (a taskset that leaves some out would refuse the pin)
@@ -674,12 +1025,20 @@ int NumaReplicas::build(const uint8_t* primary, uint64_t bytes, uint64_t capacit
                 if (std::binary_search(allowed.begin(), allowed.end(), c)) ok.push_back(c);
             if (!ok.empty()) cpus.swap(ok);
         }
+        NumaBuffer b;
+        if (!b.allocate(capacity, id, opt.hugepages, cpus)) {
+            log.push_back("replica on node " + std::to_string(id) + " not made: " + b.note());
+            continue;
+        }
         const double sec = numa_copy(b.data(), primary, bytes, cpus, opt.threads);
         const PlacementReport rep = numa_sample_placement(b.data(), bytes, opt.samples);
         char tbuf[96];
         std::snprintf(tbuf, sizeof tbuf, "%s copied in %.2f s (%.1f GiB/s)", gib(bytes).c_str(), sec,
                       sec > 0 ? (double) bytes / (double) kGiB / sec : 0.0);
-        std::string line = "replica on node " + std::to_string(id) + ": " + b.note() + "; " + tbuf + "; " + rep.text();
+        // b.note() says which page size was asked for and got ("THP ... [hugetlb: node 0's pool has 25 GiB free, 50 GiB needed]");
+        // the smaps check after the copy says what the kernel really delivered
+        std::string line = "replica on node " + std::to_string(id) + ": " + b.note() + "; " + tbuf + "; " + rep.text() + "; " +
+                           numa_page_stats(b.data(), bytes).text();
         const bool landed = rep.ok && rep.sampled > 0 && rep.on_node(id) * 10 >= rep.sampled * 9;
         if (!landed && !opt.faked) {
             // a replica that is not on its node costs 30-50 GB and buys nothing (its readers would cross UPI to it)
@@ -688,17 +1047,35 @@ int NumaReplicas::build(const uint8_t* primary, uint64_t bytes, uint64_t capacit
             continue;
         }
         if (!landed) line += "; (test topology: continuing)";
-        if (opt.lock) {
-            b.lock();
-            line += "; " + b.lock_note();
-        } else {
-            line += "; not locked (the arena lock policy is off: STRATA_ARENA_LOCK=0)";
+        // KEEP IT RESIDENT.  The primary is pinned by the CUDA registration, which is not charged to RLIMIT_MEMLOCK; mlock is
+        // (8 MiB for a user by default), so a replica that only mlock-ed was pageable.  Register it the same way (pinning
+        // only: nothing but the CPU pool reads a replica), and mlock - under the arena lock policy - only where that fails.
+        bool kept_resident = false;
+        if (opt.pin) {
+            kept_resident = b.pin(opt.pin, opt.unpin);
+            line += kept_resident ? "; pinned: " + b.pin_note() : "; not pinned: " + b.pin_note();
+        }
+        if (!kept_resident) {
+            if (opt.lock) {
+                b.lock();
+                line += "; " + b.lock_note();
+            } else {
+                line += "; not locked (the arena lock policy is off: STRATA_ARENA_LOCK=0)";
+            }
         }
         log.push_back(line);
         m.copy[(size_t) ni] = b.data();
         bufs_.push_back(std::move(b));
     }
     if (bufs_.empty()) return 0;
+    // the nodes that share a socket's copy (sub-NUMA clustering) read the same one; a node whose holder was not kept reads the
+    // primary (null -> the pool's identity translation)
+    for (const auto& r : plan.reads) {
+        const int ri = topo.index_of_node(r.first), hi = topo.index_of_node(r.second);
+        if (ri < 0 || hi < 0 || ri == hi) continue;
+        if (m.copy[(size_t) hi] != nullptr) m.copy[(size_t) ri] = m.copy[(size_t) hi];
+        else log.push_back("node " + std::to_string(r.first) + "'s workers read the primary: the copy on node " + std::to_string(r.second) + " was not kept");
+    }
     mirror_ = std::move(m);
     return (int) bufs_.size();
 }

@@ -228,6 +228,82 @@ int compare_builds(const c::ExpertKernels& A, const c::ExpertKernels& B) {
     return bad + (int) n_diff;
 }
 
+/// A hash of every output buffer of every row-kernel entry point (ranges that start and stop mid-plane, 1..8 tokens, the
+/// canonical layout and the GGUF-block one) at the build's CURRENT software-prefetch distance.
+uint64_t hash_all_outputs(const c::ExpertKernels& K) {
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int E = 4;
+    std::vector<uint8_t> blobs((size_t) E * c::BLOB);
+    for (int e = 0; e < E; ++e) make_blob(&blobs[(size_t) e * c::BLOB], rng);
+    static c::ActQ acts[c::MAXT], a2s[c::MAXT];
+    std::vector<float> x(c::H);
+    for (int t = 0; t < c::MAXT; ++t) {
+        for (float& v : x) v = nd(rng);
+        K.act_quant(x.data(), c::H, acts[t]);
+    }
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const float* p, size_t n) {
+        const uint8_t* b = (const uint8_t*) p;
+        for (size_t i = 0; i < n * sizeof(float); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    };
+    static c::ExpertScratch ws;
+    static c::ExpertScratchMulti wm;
+    static float out[c::MAXT][c::H], ff[c::MAXT][c::FF];
+    float* po[c::MAXT];
+    float* pf[c::MAXT];
+    const c::ActQ* pa[c::MAXT];
+    const c::ActQ* p2[c::MAXT];
+    for (int t = 0; t < c::MAXT; ++t) { po[t] = out[t]; pf[t] = ff[t]; pa[t] = &acts[t]; p2[t] = &a2s[t]; }
+    for (int e = 0; e < E; ++e) {
+        const uint8_t* b = &blobs[(size_t) e * c::BLOB];
+        K.expert_q(b, acts[0], out[0], ws);
+        mix(out[0], c::H);
+        for (int t = 0; t < c::MAXT; ++t) { K.gu_rows(b, acts[t], ff[t], 0, c::FF); K.act_quant(ff[t], c::FF, a2s[t]); }
+        for (const auto& r : {std::pair<int, int>{0, c::FF}, {3, 77}, {c::FF - 1, c::FF}, {100, 101}}) {
+            std::fill(&ff[0][0], &ff[0][0] + c::FF, 0.f);
+            K.gu_rows(b, acts[e], ff[0], r.first, r.second);
+            mix(ff[0], c::FF);
+        }
+        for (const auto& r : {std::pair<int, int>{0, c::H}, {5, 999}, {c::H - 1, c::H}, {1000, 1001}}) {
+            std::fill(&out[0][0], &out[0][0] + c::H, 0.f);
+            K.down_rows(b, a2s[0], out[0], r.first, r.second);
+            mix(out[0], c::H);
+        }
+        for (int n : {1, 3, 8}) {
+            for (int t = 0; t < n; ++t) { std::fill(ff[t], ff[t] + c::FF, 0.f); std::fill(out[t], out[t] + c::H, 0.f); }
+            K.gu_rows_multi(b, pa, n, pf, 7, 613);
+            K.down_rows_multi(b, p2, n, po, 5, 2501);
+            for (int t = 0; t < n; ++t) { mix(ff[t], c::FF); mix(out[t], c::H); }
+            K.expert_multi(b, pa, n, po, wm);
+            for (int t = 0; t < n; ++t) mix(out[t], c::H);
+        }
+        for (int n : {1, 2, 5, 8}) {
+            K.q2g_rows_multi(b, 720, 40, pa, n, po, 0, 1280);
+            for (int t = 0; t < n; ++t) mix(out[t], 1280);
+            K.q2g_rows_multi(b + 921600, 180, 10, pa, n, po, 3, c::H);
+            for (int t = 0; t < n; ++t) mix(out[t], c::H);
+        }
+    }
+    return h;
+}
+
+/// The software prefetch of the row kernels is a hint: whatever the distance - off, one line, the default, far past the end of
+/// the arena - every output is bit for bit the same.
+void check_prefetch_invariance(const c::ExpertKernels& K) {
+    const int saved = K.set_q2_prefetch(0);
+    const uint64_t ref = hash_all_outputs(K);
+    bool same = true;
+    for (int d : {1, 64, 640, 2048, 4096, 1 << 20}) {
+        K.set_q2_prefetch(d);
+        same = same && hash_all_outputs(K) == ref;
+    }
+    K.set_q2_prefetch(saved);
+    char msg[120];
+    std::snprintf(msg, sizeof msg, "%s: outputs bit-identical at prefetch distances 0..1 MiB (default %d B)", K.name, saved);
+    check(same, msg);
+}
+
 /// One build's expert kernel against the scalar transcription of the formula (the same bound as expert_parity).
 void check_vs_scalar(const c::ExpertKernels& K) {
     std::mt19937 rng(77);
@@ -448,6 +524,11 @@ int main(int argc, char** argv) {
     std::printf("\nthe kernels of each build against the scalar oracle\n");
     check_vs_scalar(nov);
     if (vb) check_vs_scalar(*vb);
+
+    std::printf("\nsoftware prefetch is only a hint\n");
+    check_prefetch_invariance(nov);
+    if (vb) check_prefetch_invariance(*vb);
+    else std::printf("  AVX-512 VNNI + VBMI build: SKIPPED (no VBMI here; the prefetch is the same source in both builds)\n");
 
     std::printf("\nbuild against build, bit for bit\n");
     if (vb) compare_builds(nov, *vb);
