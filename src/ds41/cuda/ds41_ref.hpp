@@ -53,13 +53,36 @@ struct Rng {
     }
 };
 
-// ---- the activation quantiser (the CPU's rule: strata::ds41::cpu::quantize_act) --------------------------------------------
-/// x[32] -> q[32] natural order, scale d.  d = amax/127, q = lrintf(x * (127/amax)) clamped to +-127.
+// ---- the activation quantiser (the CPU's rule: strata::ds41::cpu::quantize_act; CONTRACTS.md "Activations") ------------------------
+inline uint32_t f32_bits(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+inline float bits_f32(uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+/// x[32] -> q[32] natural order, scale d.  The largest magnitude is the INTEGER maximum of (bits & 0x7FFFFFFF);
+///   >= 0x7F800000 (an Inf or a NaN in the block):  d = the canonical NaN 0x7FC00000, every q = 0
+///   <  0x0D800000 (amax < 2^-100, zero included):   d = 0, every q = 0
+///   otherwise d = amax / 127, id = 127 / amax (FP32 divisions), q = lrintf(x * id) (FP32 product, ties to EVEN) clamped to +-127.
 inline void quantize_block(const float* x, int8_t* q, float& d) {
-    float amax = 0.0f;
-    for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
+    uint32_t m = 0;
+    for (int j = 0; j < 32; ++j) m = std::max(m, f32_bits(x[j]) & 0x7FFFFFFFu);
+    for (int j = 0; j < 32; ++j) q[j] = 0;
+    if (m >= 0x7F800000u) {
+        d = bits_f32(0x7FC00000u);
+        return;
+    }
+    if (m < 0x0D800000u) {
+        d = 0.0f;
+        return;
+    }
+    const float amax = bits_f32(m);
     d = amax / 127.0f;
-    const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+    const float id = 127.0f / amax;
     for (int j = 0; j < 32; ++j) {
         volatile float t = x[j] * id;
         long v = std::lrintf(t);
@@ -148,13 +171,16 @@ inline double dot_f(const uint8_t* row, int nblk, const float* x, double* mass =
 
 inline double silu(double x) { return x / (1.0 + std::exp(-x)); }
 
+/// The clamps of CONTRACTS.md with NaN PROPAGATING (as torch.clamp does): g = g > 10 ? 10 : g, u = u > 10 ? 10 : (u < -10 ? -10 : u).
+inline double clamp_g(double g) { return g > (double) kSwigluLimit ? (double) kSwigluLimit : g; }
+inline double clamp_u(double u) { return u > (double) kSwigluLimit ? (double) kSwigluLimit : (u < -(double) kSwigluLimit ? -(double) kSwigluLimit : u); }
 /// h[r] = silu(min(g,10)) * clamp(u,-10,10) * w for the 2304 intermediate rows, from natural-order int8 activations.
 inline void expert_h_q(const uint8_t* blob, const int8_t* xq, const float* xs, double w, std::vector<double>& h) {
     h.assign(kFF, 0.0);
     for (int r = 0; r < kFF; ++r) {
         const double g = dot_q(blob + kBlobGate + (size_t) r * kGateRowBytes, kGateRowBlocks, xq, xs);
         const double u = dot_q(blob + kBlobUp + (size_t) r * kGateRowBytes, kGateRowBlocks, xq, xs);
-        h[r] = silu(std::min(g, (double) kSwigluLimit)) * std::min(std::max(u, -(double) kSwigluLimit), (double) kSwigluLimit) * w;
+        h[r] = silu(clamp_g(g)) * clamp_u(u) * w;
     }
 }
 /// the same with exact FP32 x.
@@ -163,7 +189,7 @@ inline void expert_h_f(const uint8_t* blob, const float* x, double w, std::vecto
     for (int r = 0; r < kFF; ++r) {
         const double g = dot_f(blob + kBlobGate + (size_t) r * kGateRowBytes, kGateRowBlocks, x);
         const double u = dot_f(blob + kBlobUp + (size_t) r * kGateRowBytes, kGateRowBlocks, x);
-        h[r] = silu(std::min(g, (double) kSwigluLimit)) * std::min(std::max(u, -(double) kSwigluLimit), (double) kSwigluLimit) * w;
+        h[r] = silu(clamp_g(g)) * clamp_u(u) * w;
     }
 }
 /// y[row] = W2 . h, h given as natural-order int8 + scales; also the error-bound mass per row.

@@ -15,6 +15,9 @@
 //
 // There are only 16 ymm registers, so the tiles are small: the decode is repeated per half group and the accumulators
 // are the budget.
+//
+// Attribution: the activation quantiser at the end follows ggml's x86 SIMD quantize_row_q8_0 (ggml-cpu/arch/x86/quants.c) - llama.cpp, MIT License,
+// Copyright (c) 2023-2026 The ggml authors (notice: src/ds41/cuda/ds41_math.cuh, third_party/ggml/LICENSE).
 #include "mxfp4_internal.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -189,26 +192,32 @@ void dot_rows_avx2(const uint8_t* w, size_t stride, int ng, int nrows, const Act
     }
 }
 
-// 32 floats -> block `blk` of `a`; bit-identical to quantize_block_scalar.
+// 32 floats -> block `blk` of `a`; bit-identical to quantize_block_scalar (the rule: quant_scale() in mxfp4_internal.hpp).  The largest
+// magnitude is the INTEGER maximum of the magnitude bits (a float max with a NaN operand depends on the operand order); the scale
+// and the Inf / NaN / tiny cases come from the shared scalar quant_scale(); the codes are vcvtps2dq (round half to EVEN) of x * (127 / amax).
+// vpackssdw / vpacksswb saturate at -128..127, never reached: |x * id| <= 127 (1 + 2^-23) for a finite, non-tiny block.
 void quantize_block_avx2(const float* x, ActQ& a, int blk) {
     const __m256 v0 = _mm256_loadu_ps(x), v1 = _mm256_loadu_ps(x + 8), v2 = _mm256_loadu_ps(x + 16),
                  v3 = _mm256_loadu_ps(x + 24);
-    const __m256 sign = _mm256_set1_ps(-0.0f);
-    __m256 m = _mm256_max_ps(_mm256_andnot_ps(sign, v0), _mm256_andnot_ps(sign, v1));
-    m = _mm256_max_ps(m, _mm256_max_ps(_mm256_andnot_ps(sign, v2), _mm256_andnot_ps(sign, v3)));
-    __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m), _mm256_extractf128_ps(m, 1));
-    m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
-    m4 = _mm_max_ss(m4, _mm_shuffle_ps(m4, m4, 1));
-    const float amax = _mm_cvtss_f32(m4);
-    const float d = amax / 127.0f;
-    const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
-    const __m256 vid = _mm256_set1_ps(id);
-    const __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, vid)), i1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, vid)),
-                  i2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, vid)), i3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, vid));
-    // packs works within 128-bit lanes: the permute restores the natural order of the 32 bytes
-    __m256i p = _mm256_packs_epi16(_mm256_packs_epi32(i0, i1), _mm256_packs_epi32(i2, i3));
-    p = _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
-    const __m128i lo = _mm256_castsi256_si128(p), hi = _mm256_extracti128_si256(p, 1);
+    const __m256i magmask = _mm256_set1_epi32(0x7FFFFFFF);
+    __m256i m = _mm256_max_epi32(_mm256_and_si256(_mm256_castps_si256(v0), magmask), _mm256_and_si256(_mm256_castps_si256(v1), magmask));
+    m = _mm256_max_epi32(m, _mm256_max_epi32(_mm256_and_si256(_mm256_castps_si256(v2), magmask), _mm256_and_si256(_mm256_castps_si256(v3), magmask)));
+    __m128i m4 = _mm_max_epi32(_mm256_castsi256_si128(m), _mm256_extracti128_si256(m, 1));    // magnitudes are < 2^31: signed max is fine
+    m4 = _mm_max_epi32(m4, _mm_shuffle_epi32(m4, _MM_SHUFFLE(1, 0, 3, 2)));
+    m4 = _mm_max_epi32(m4, _mm_shuffle_epi32(m4, _MM_SHUFFLE(2, 3, 0, 1)));
+    const QuantScale qs = quant_scale((uint32_t) _mm_cvtsi128_si32(m4));
+    const float d = qs.d;
+    __m128i lo = _mm_setzero_si128(), hi = _mm_setzero_si128();      // every q = 0 for an all-zero / tiny / non-finite block
+    if (!qs.zero) {
+        const __m256 vid = _mm256_set1_ps(qs.id);
+        const __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(v0, vid)), i1 = _mm256_cvtps_epi32(_mm256_mul_ps(v1, vid)),
+                      i2 = _mm256_cvtps_epi32(_mm256_mul_ps(v2, vid)), i3 = _mm256_cvtps_epi32(_mm256_mul_ps(v3, vid));
+        // packs works within 128-bit lanes: the permute restores the natural order of the 32 bytes
+        __m256i p = _mm256_packs_epi16(_mm256_packs_epi32(i0, i1), _mm256_packs_epi32(i2, i3));
+        p = _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+        lo = _mm256_castsi256_si128(p);
+        hi = _mm256_extracti128_si256(p, 1);
+    }
     const int g = blk >> 2, k = blk & 3;
     _mm_storeu_si128((__m128i*) (a.q + g * kGroupValues + k * 16), lo);
     _mm_storeu_si128((__m128i*) (a.q + g * kGroupValues + 64 + k * 16), hi);

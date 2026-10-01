@@ -110,20 +110,26 @@ this oracle at the engine's own precision, and whole-model output statistically 
   whose weight is fp8/fp4 in the reference (attention q/kv/o, indexer wq_b, shared and routed experts incl. W2's input, Engram wkv),
   fp8 SWA KV, fp4 (block 32, E8M0) indexer q and index-K, fp4 (block 16, E4M3 scale) compressed KV. Not applied to the bf16 tensors
   (gate, compressor, wo_a, weights_proj, indexer wk, head).
-* `int8()`: the engine's choice (CONTRACTS.md): int8 per 32 with fp32 scale `d = max|x|/127`, ties away from zero, at the same GEMM sites,
+* `int8()`: the engine's choice (CONTRACTS.md "Activations"): int8 per 32 with fp32 scale `d = amax/127` and `q = rint(x * (127/amax))` - **ties to even**, ggml's x86 SIMD
+  `quantize_row_q8_0`, bit for bit the rule of the CPU (scalar/AVX2/AVX-512) and GPU kernels (`quant.quantize_int8_blocks` gives q and d); NOT `quantize_row_q8_0_ref`
+  (`1/d`, ties away from zero), which an earlier version of this mode followed (audits A5/A6: +-1 code on ~1e-3 of bf16-valued inputs). A block holding an Inf or a NaN has
+  d = NaN, q = 0 (the NaN reaches the output); a block with amax < 2^-100 (zero included) has d = 0, q = 0. At the same GEMM sites as `reference()`,
   fp16-equivalent KV. On Gaussian data its rms error is 0.5 % against 2.7 % for e4m3 (heavy-tailed: 1.0 % vs 2.6 %).
 
 ## Known deviations from the reference, and reference quirks
 
-1. **Reference bug (reproducible switch `stale_index_k`).** `model.py:560` scores the indexer against `shared_attn.index_k`, which an
-   index-K owner (layers 2, 8, 14, 20) refreshes only when its compressor emitted a latent this step (`:548-549`). On ratio-2
-   decode steps where the group is still incomplete (every other token), layers 2/8/14 therefore score against layer 20's cache (a
-   different ratio) instead of their own: wrong top-512 selections, only visible once a layer has more than 512 compressed positions
-   (context > 1024 tokens). Prefill is unaffected. The oracle's default is the evident intent (own cache); `Model(..., stale_index_k=True)`
-   reproduces the reference exactly and the tiny-model test proves both statements (quirk on == stock official to 1.6e-6; quirk off ==
+1. **Reference bug, decided (reproducible switch `stale_index_k`).** `model.py:560` scores the indexer against `shared_attn.index_k`,
+   which an index-K owner (layers 2, 8, 14, 20) refreshes only when its compressor emitted a latent this step (`:548-549`). On ratio-2
+   decode steps where the group is still incomplete (every other token), the ratio-2 owners 2/8/14 therefore score against layer 20's
+   cache (a different ratio) instead of their own: wrong top-512 selections, only visible once a layer has more than 512 compressed
+   positions (context > ~1,024 tokens). They reach **all 18 ratio-2 layers, not 3**: the Reuse layers 3-7, 9-13 and 15-19 take their
+   owner's `topk_idxs`. Prefill and training (full sequences) are unaffected. **Decided (CONTRACTS.md, 2026-10-01): the port follows the
+   intent - each owner always scores against its own cache** (the class's own invariant "every source writes before its consumers read";
+   it is also what makes prefill(N) == prefill + decode hold). That is the oracle's default; `Model(..., stale_index_k=True)` reproduces
+   the shipped reference bit for bit, and the tiny-model test proves both statements (quirk on == stock official to 1.6e-6; quirk off ==
    the official with a one-line wrapper fix, `tests/official.py:patch_index_k_fix`, to 1.6e-6; stock vs fixed differ by up to 0.8 in
-   logits in the tiny model). With the default, prefill of N tokens == prefill of N-k + k decode steps to 1e-15 (asserted); with the quirk it does not.
-   **Needs a decision**: follow the intent (recommended; matches how it was trained, presumably) or the shipped code, and ask DeepSeek / check llama.cpp #28696.
+   logits in the tiny model). With the default, prefill of N tokens == prefill of N-k + k decode steps to 1e-15 (asserted); with the quirk
+   it does not. To revisit if DeepSeek or llama.cpp PR #28696 show that their production decode does otherwise.
 2. RoPE tables are float64 by default (truth); the reference's are float32, whose angles are inaccurate at long positions (error ~position x 6e-8 rad:
    0.06 rad at 1M). `rope_dtype=np.float32` gives the reference's table.
 3. Top-k ties (router, indexer, candidate blocks): the reference uses `torch.topk` (unspecified tie order); the oracle takes the lower index.
@@ -150,7 +156,7 @@ All pass against the saved header of the target GGUF (`gguf-headers-mxxm-t-MXFP4
 
 ## Open questions / risks
 
-1. The stale-index-K behaviour above (decide, then freeze the default).
+1. The stale-index-K behaviour above is decided (own cache; CONTRACTS.md); revisit only if DeepSeek or llama.cpp PR #28696 show that their production decode does otherwise.
 2. The real GGUF has not been read here (not downloaded): the loader is validated on the mini GGUF (real names/types, small dims) and its name map and shape contract
    on all 1006 tensor records of the real header; dequantisation is cross-checked against the independent codecs of `tools/ds41/ggml_codecs.py` and a scalar transcription
    of GGML's C. Q8_0 dense tensors are decoded whole (up to 168 MB as fp32), experts and Engram rows lazily; speed is ~0.1 s per expert matrix, so a full-model

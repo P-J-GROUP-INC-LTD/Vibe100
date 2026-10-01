@@ -38,6 +38,12 @@
 // every thread the same row range in phase 2 for all experts of the layer (static ownership: no two threads ever touch a
 // row), or use one `y` per expert and add them afterwards.
 //
+// ONE `y` PER SOCKET (CONTRACTS.md, "Tensor-parallel halves").  The two halves of an expert both cover ALL 5120 down rows (half k
+// supplies columns [1152 k, 1152 k + 1152) of W2 to every row), so two sockets that add into one buffer touch the same elements:
+// a data race that loses updates (audit A5: 510 of 2,000 concurrent runs).  Each socket therefore writes its OWN partial y_k (an FP32
+// [T][5120] buffer in its own node's memory, zeroed before the layer), and the partials are added ONCE per layer, after both sockets are
+// finished (the engine does it on the GPU, with the hits' output).  Within a socket the rule above applies.
+//
 // THE WEIGHTS ARE READ ONCE FOR ALL T TOKENS (T = 1..8, a verify window).  A 17-byte block is decoded to int8 once
 // per group of four blocks and applied to every token's activation from registers, so a verify window costs one
 // pass over the expert's bytes plus T times the (much cheaper) integer work.  That is the whole reason the
@@ -66,9 +72,14 @@
 // activations.  Use act_unpack() / act_q() to read the values in natural order; quantize_act() is the only producer.
 // A weight row therefore must have a multiple of 4 blocks (all of this model's rows do: 160, 72, 36).
 //
-// ACTIVATION QUANTISATION (CONTRACTS.md): per 32 values d = max|x| / 127, q = round-to-nearest-even(x * (127 / max|x|))
-// (all zero -> d = 0, q = 0).  All three implementations are bit-identical on finite input.  This is more precise than
-// the reference's FP8-e4m3 fake quantisation; DS-A's oracle provides both.
+// ACTIVATION QUANTISATION (CONTRACTS.md "Activations"; ggml's x86 SIMD quantize_row_q8_0 with an FP32 d): per 32 values
+// d = amax / 127 and q = rint(x * (127 / amax)) (FP32 product, round half to EVEN, clamped to +-127).  amax is the largest |x|, found as an
+// INTEGER maximum of the magnitude bits, so that the two special cases do not depend on the order of the elements: a block holding an
+// Inf or a NaN has d = NaN (the canonical 0x7FC00000) and q = 0 - the NaN reaches y - and a block with amax < 2^-100 (zero included) has
+// d = 0 and q = 0.  All three implementations (scalar, AVX2, AVX-512), the GPU kernel and the oracle's int8 mode are bit-identical on
+// EVERY input, specials included (src/ds41/cpu/mxfp4_expert_test.cpp, ds41_cuda_emu_test --quant, tools/ds41/test_quant_xcheck.py).
+// This is more precise than the reference's FP8-e4m3 fake quantisation; DS-A's oracle provides both.
+// NaN also propagates through the SwiGLU clamps (min(g, 10), clamp(u, -10, 10)), so a NaN anywhere upstream reaches y.
 //
 // WHICH CODE RUNS: Isa::kAuto picks the best the CPU has (CPUID + OS state).  Scalar is the exact-semantics
 // reference (slow); AVX2 needs AVX2 + FMA + F16C; AVX-512 needs F/BW/VL/DQ + VNNI and does NOT need VBMI (the
@@ -143,8 +154,8 @@ void quantize_acts(const float* x, int n, int T, ActQ* out, Isa isa = Isa::kAuto
 /// Three row-major MXFP4 matrices.  gate and up have `hidden / 32` blocks per row (stride hidden / 32 * 17 B); down has
 /// `hidden` rows of `ff / 32` blocks, `down_row_stride` bytes apart.  A view carries no ownership.
 ///
-/// The three builders below describe the real layouts; the fields are public so the tests can also run tiny shapes
-/// (any hidden and ff that are multiples of 128; ff <= 5120).
+/// The three builders below describe the real layouts; the fields are public so the tests can also run tiny shapes: `hidden` and the
+/// view's `ff` must be multiples of 128 (<= 5120), i.e. an expert FF of 256 for a CPU half view (ff = FF / 2), of 128 for a whole expert.
 struct ExpertView {
     const uint8_t* gate = nullptr;     // `ff` rows
     const uint8_t* up = nullptr;       // `ff` rows
@@ -185,12 +196,16 @@ void expert_gate_up(Isa isa, const ExpertView& v, const ActQ* x, int T, const fl
                     int chunk0, int chunk1);
 
 /// PHASE 2 for the output rows [row0, row1): y[t * view.hidden + r] += W2[r, :] . h_t.  `y` is [T][hidden], FP32,
-/// ADDED to (zero it before the first expert of a layer; the halves and the experts of a layer all accumulate into it).
+/// ADDED to (zero it before the first expert of a layer; the experts of a layer ON ONE SOCKET accumulate into it).  `y` is the
+/// socket's OWN partial y_k: the two halves of an expert each cover all 5120 rows, so two sockets must NEVER add into the same
+/// buffer (a data race that loses updates); add y_0 + y_1 once per layer afterwards.  Within a socket: static row ownership across
+/// experts, or one buffer per expert (see "ONE y PER SOCKET" above).
 /// Needs every chunk of phase 1 to be done.  Threads call it with disjoint row ranges.
 void expert_down(Isa isa, const ExpertView& v, const ExpertScratch& s, int T, float* y, int row0, int row1);
 
 /// Both phases on the calling thread: the whole view, T tokens.  The reference arrangement of the two functions
-/// above, the non-NUMA single-thread path, and what the tests compare the multi-threaded schedules with.
+/// above, the non-NUMA single-thread path, and what the tests compare the multi-threaded schedules with.  `y` accumulates, so run the
+/// two halves of an expert one after the other into one buffer, or (concurrently, one per socket) into two partials added afterwards.
 void expert_run(Isa isa, const ExpertView& v, const ActQ* x, int T, const float* route_w, ExpertScratch& s, float* y);
 
 /// The whole expert of a GPU-layout blob in one pass (ff = 2304, so one down row is 72 blocks and there is no

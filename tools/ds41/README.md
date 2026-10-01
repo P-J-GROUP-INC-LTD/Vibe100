@@ -38,9 +38,14 @@ python3 tools/ds41/manifest.py $GGUF/DeepSeek-V4.1-Flash-MXFP4-000{01..12}-of-00
 #    your box, if different:  --vram-gib 31.75 --ram-gib 376 --numa-nodes 2 --cache-gib 18 --dspark-on-cpu
 
 # 2. is expert (layer, e) laid out right?  (reads only that expert, via mmap)
-python3 tools/ds41/expert_layout.py verify ds41.manifest.json --sample 8 --c-oracle
+python3 tools/ds41/expert_layout.py verify ds41.manifest.json --sample 8 --c-oracle     # --c-oracle needs a ggml SOURCE tree: see below
 python3 tools/ds41/expert_layout.py extract ds41.manifest.json --layer 20 --expert 100 --out /tmp/experts
 #    -> l20_e100.blob (18,800,640 B), .half0, .half1 (9,400,320 B each)
+
+#    `verify --c-oracle` compiles ggml's own ggml-quants.c on the fly to compare the dequantisation bit for bit, so it needs a ggml SOURCE
+#    tree and a C compiler: after ./setup.sh it is found automatically (third_party/llama.cpp/ggml/src, or the llama.cpp the engine build
+#    fetched, build*/_deps/strata_llamacpp-src/ggml/src); otherwise `export STRATA_GGML_SRC=<llama.cpp>/ggml/src` (the directory holding
+#    ggml-quants.c). Without one the check fails with "oracle unavailable"; leave the flag out to skip it.
 
 # without the files (headers JSON only; offsets stay relative to each shard's data section):
 python3 tools/ds41/manifest.py third_party/deepseek-v41-flash-reference/gguf-headers-mxxm-t-MXFP4.json.gz
@@ -148,24 +153,26 @@ in float64 (clamps are hit); with `--c-oracle` the numpy dequantisation equals G
 ## The mini GGUF
 
 ```bash
-python3 tools/ds41/make_mini_gguf.py /tmp/mini --seed 0 --shards 3          # or any --hidden/--ff/--n-expert/... (see --help)
+python3 tools/ds41/make_mini_gguf.py /tmp/mini --seed 0 --n-shards 3        # or any --hidden/--ff/--n-expert/... (see --help)
 python3 tools/ds41/manifest.py /tmp/mini --geometry self --no-plan
 python3 tools/ds41/expert_layout.py verify /tmp/mini --geometry self --sample 5
 ```
 
-Same tensor names, ggml types and the 72 metadata keys of shard 1 as mxxm-t, 218 tensors, 3.3 MB of experts: hidden 256,
-8 layers (L0-1 SWA, L2 and L4 Full, L3/L5/L7 Reuse, L6 Reindex), 16 experts top-2, FF 64, Engram tables on layers 1 and 3
+Same tensor names, ggml types and the 72 metadata keys of shard 1 as mxxm-t, 218 tensors, 13.4 MB of experts: hidden 256,
+8 layers (L0-1 SWA, L2 and L4 Full, L3/L5/L7 Reuse, L6 Reindex), 16 experts top-2, FF 256, Engram tables on layers 1 and 3
 (6,126 and 6,332 rows of 34 B), vocab 512. Every tensor is generated from `(seed, crc32(name))` and quantised with
 `ggml_codecs` (bit-identical to GGML's `quantize_row_mxfp4_ref` / `quantize_row_q8_0_ref`), so the same seed gives the
-same bytes. `--alignment 64` and `--shards 1..n` work. **Kernels whose geometry is compiled in (`kHidden = 5120`, `kFF =
+same bytes. `--alignment 64` and `--n-shards 1..n` work. **Kernels whose geometry is compiled in (`kHidden = 5120`, `kFF =
 2304`, 384 experts, ...) cannot run this file**: use it for runtime-dimensioned code (loaders, the numpy oracle, these
 tools), and test the fixed-geometry kernels with random blocks at the real shapes (`expert_layout.REAL`, see
-`test_random_blob_at_real_shape`). The expert FF is a multiple of 64 so that the CPU halves fall on MXFP4 block boundaries.
+`test_random_blob_at_real_shape`). The CPU kernels are runtime-dimensioned (`ExpertView`), and the default dims satisfy their `check_view`: hidden a
+multiple of 128 and the expert FF a multiple of 256 (a CPU half is FF / 2 rows, in whole 4-block kernel groups; the CONTRACTS.md halves alone would need only
+FF % 64), so a mini expert's blob and halves can be fed to `src/ds41/cpu`'s kernels. `MiniConfig.validate` and `expert_layout.ExpertGeom` enforce the same rule.
 
 ## Tests
 
 ```bash
-python3 -m unittest discover tools/ds41           # 99 tests, ~15 s
+python3 -m unittest discover tools/ds41           # 106 tests, ~40 s (the mini GGUF's experts are 256 x 256 now)
 export STRATA_GGML_SRC=<llama.cpp>/ggml/src       # directory holding ggml-quants.c: enables the bit-exact C cross-checks
 ```
 
@@ -178,10 +185,14 @@ export STRATA_GGML_SRC=<llama.cpp>/ggml/src       # directory holding ggml-quant
 * `test_mini_gguf.py` - the mini file read back with `tools/gguf_reader.py` (types, dims, metadata, offsets, bytes ==
   an independent re-encoding), determinism, same key set and tensor-name/type set as mxxm-t, writer round trips for every
   metadata type at alignments 32/64/128.
+* `test_quant_xcheck.py` - the activation quantiser of CONTRACTS.md: the oracle's `quantize_int8_blocks` against DS-C's C++ kernels (scalar / AVX2 /
+  AVX-512, compiled on the fly by `cpu_pack_xcheck.py`) on hand-written special blocks (all-zero, 1e-37, the 2^-100 boundary, ties to even, Inf / NaN at every
+  position) and random bit patterns: identical bytes (int8 values and scale bits). The GPU kernel is compared with the same C++ library in `ds41_cuda_emu_test --quant`.
 * `test_expert_layout.py` - blob = the three GGUF slices (cut out with the reference reader), halves re-derived with
   plain loops, every mini expert verified, wrong halves detected, the file against the codec-only quantised weights,
-  real-shape random blob, and DS-C's C++ `pack_cpu_half` byte-identical to the Python halves (skipped when g++ or the
-  DS-C sources are absent).
+  real-shape random blob, DS-C's C++ `pack_cpu_half` byte-identical to the Python halves, and the mini GGUF's experts (whole
+  and as two CPU halves, every ISA) run through the C++ CPU kernels at their runtime dimensions and match the float64 contract (all
+  skipped when g++ or the DS-C sources are absent); `ExpertGeom` rejects dimensions the kernels' `check_view` would abort on.
 
 ## Not verified / limits
 

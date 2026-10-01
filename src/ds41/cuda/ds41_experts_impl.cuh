@@ -7,7 +7,7 @@
 //   quantize_acts_kernel   x fp32 -> int8 per 32 + fp32 scale (the CPU's rule, bit for bit), in the dp4a-friendly byte order.
 //   gate_up_kernel         per GROUP of hits sharing a cache slot (= one expert, 1..NT tokens): for a tile of 32 intermediate
 //                          rows, stream the rows of W1 and W3 ONCE, dot them with every token of the group, then
-//                          h = silu(min(g,10)) * clamp(u,-10,10) * w and quantise h per 32 rows (exactly one tile) to int8 + scale.
+//                          h = silu(min(g,10)) * clamp(u,-10,10) * w (NaN propagates through the clamps) and quantise h per 32 rows (exactly one tile) to int8 + scale.
 //   down_kernel            per group: for a tile of 64 output rows stream W2's rows once and dot them with every token's h:
 //                          parts[(token*6+k)][row] = W2.h.
 //   One launch per phase covers EVERY hit of the layer: grid.y = 6*T group slots, the blocks past counts->n_groups return
@@ -137,7 +137,10 @@ DS41_FI void gu_store(const uint4 (&pf)[6], unsigned char* stage, int lane) {
     DS41_UNROLL
     for (int j = 0; j < 6; ++j) {
         const int u = lane + 32 * j;
-        if (u < 170) *reinterpret_cast<uint4*>(stage + 16 * u + (u >= 85 ? kGuSeg - 1360 : 0)) = pf[j];
+        if (u < 170) {
+            DS41_ASSERT_ALIGNED(stage + 16 * u + (u >= 85 ? kGuSeg - 1360 : 0), 16);          // ST.E.128 to shared memory: misaligned = a fault
+            *reinterpret_cast<uint4*>(stage + 16 * u + (u >= 85 ? kGuSeg - 1360 : 0)) = pf[j];
+        }
     }
 }
 /// W2: `base` = first byte of the stage's first row; the two rows are contiguous (2448 B = 306 pieces of 8 B).
@@ -152,7 +155,10 @@ DS41_FI void dn_store(const uint2 (&pf)[10], unsigned char* stage, int lane) {
     DS41_UNROLL
     for (int j = 0; j < 10; ++j) {
         const int p = lane + 32 * j;
-        if (p < 306) *reinterpret_cast<uint2*>(stage + 8 * p + (p >= 153 ? kDnSeg - 1224 : 0)) = pf[j];
+        if (p < 306) {
+            DS41_ASSERT_ALIGNED(stage + 8 * p + (p >= 153 ? kDnSeg - 1224 : 0), 8);           // ST.E.64 to shared memory
+            *reinterpret_cast<uint2*>(stage + 8 * p + (p >= 153 ? kDnSeg - 1224 : 0)) = pf[j];
+        }
     }
 }
 
@@ -185,6 +191,8 @@ DS41_FI void stage_dot(const unsigned char* seg, int kk, int blk0, const uint4* 
             DS41_UNROLL
             for (int t = 0; t < NT; ++t) {
                 if (t == 0 || t < n) {                      // token 0 always exists (n >= 1): no test, no branch
+                    DS41_ASSERT_ALIGNED(act_lo + t * STRIDE + b, 16);                  // LDS.128
+                    DS41_ASSERT_ALIGNED(act_hi + t * STRIDE + b, 16);
                     const uint4 x0 = act_lo[t * STRIDE + b];
                     const uint4 x1 = act_hi[t * STRIDE + b];
                     const float dx = act_sc[t * STRIDE + b];
@@ -262,8 +270,10 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void gate_up_kernel(const
             const uint4 v = ldg4(src + 16 * c);
             (c & 1 ? act_hi : act_lo)[j * kActBlocks + (c >> 1)] = v;
         }
-        for (int c = threadIdx.x; c < kActBlocks / 4; c += kExThreads)
+        for (int c = threadIdx.x; c < kActBlocks / 4; c += kExThreads) {
+            DS41_ASSERT_ALIGNED(act_sc + j * kActBlocks + 4 * c, 16);
             reinterpret_cast<float4*>(act_sc + j * kActBlocks)[c] = ldgf4(xs + (size_t) token * kActBlocks + 4 * c);
+        }
     }
     sync_block();
 
@@ -306,8 +316,10 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void gate_up_kernel(const
             const float other = shfl_xor(mine, 8);                   // lane kk < 8 gets the matching up value
             const int idx = kk >> (4 - S);
             if (kk < 8 && (kk & ((1 << (4 - S)) - 1)) == 0 && idx < n) {
-                const float gv = fminf(mine, kSwigluLimit);
-                const float uv = fminf(fmaxf(other, -kSwigluLimit), kSwigluLimit);
+                // NaN PROPAGATES through the clamps, as through torch.clamp (CONTRACTS.md): the ternaries compare false for a NaN and return it.
+                // Not fminf / fmaxf (they return the constant for a NaN operand and would launder a failure upstream into a finite number).
+                const float gv = mine > kSwigluLimit ? kSwigluLimit : mine;
+                const float uv = other > kSwigluLimit ? kSwigluLimit : (other < -kSwigluLimit ? -kSwigluLimit : other);
                 const float w = hits[gp->hit[idx]].weight;
                 s_h[idx * 32 + warp * 4 + 2 * p + rr] = (gv / (1.0f + expf(-gv))) * uv * w;
             }
@@ -363,8 +375,10 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void down_kernel(const ui
             const uint4 v = ldg4(src + 16 * c);
             (c & 1 ? act_hi : act_lo)[j * kHBlocks + (c >> 1)] = v;
         }
-        for (int c = threadIdx.x; c < kHBlocks / 4; c += kExThreads)
+        for (int c = threadIdx.x; c < kHBlocks / 4; c += kExThreads) {
+            DS41_ASSERT_ALIGNED(act_sc + j * kHBlocks + 4 * c, 16);
             reinterpret_cast<float4*>(act_sc + j * kHBlocks)[c] = ldgf4(hs + (size_t) hit * kHBlocks + 4 * c);
+        }
     }
     sync_block();
 

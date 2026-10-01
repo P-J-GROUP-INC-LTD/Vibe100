@@ -170,15 +170,17 @@ class MiniFile(unittest.TestCase):
         gate = next(t for g in self.files for t in g.tensors if t.name == "blk.0.ffn_gate_exps.weight")
         self.assertEqual(gate.shape, [cfg.hidden, cfg.ff, cfg.n_expert])
         self.assertEqual(gate.expected_bytes(), cfg.n_expert * cfg.ff * (cfg.hidden // 32) * 17)
-        self.assertEqual(cfg.ff % 64, 0)
+        self.assertEqual(cfg.ff % 256, 0)             # the C++ CPU kernels' check_view: a half (ff / 2) is a whole number of 128-value groups
+        self.assertEqual(cfg.hidden % 128, 0)
 
 
 class Determinism(unittest.TestCase):
     def test_same_seed_same_bytes_other_seed_other_bytes(self):
         with tempfile.TemporaryDirectory() as d:
-            a = MM.build_mini(Path(d) / "a", MM.MiniConfig(seed=3))
-            b = MM.build_mini(Path(d) / "b", MM.MiniConfig(seed=3))
-            c = MM.build_mini(Path(d) / "c", MM.MiniConfig(seed=4))
+            # (4 experts instead of 16: determinism does not depend on the expert count, and the mini experts are 256 x 256 now)
+            a = MM.build_mini(Path(d) / "a", MM.MiniConfig(seed=3, n_expert=4))
+            b = MM.build_mini(Path(d) / "b", MM.MiniConfig(seed=3, n_expert=4))
+            c = MM.build_mini(Path(d) / "c", MM.MiniConfig(seed=4, n_expert=4))
             for pa, pb in zip(a["paths"], b["paths"]):
                 self.assertEqual(pa.read_bytes(), pb.read_bytes())
             self.assertNotEqual(a["paths"][0].read_bytes(), c["paths"][0].read_bytes())
@@ -186,7 +188,7 @@ class Determinism(unittest.TestCase):
     def test_shard_counts_and_alignment(self):
         for n_shards, align in ((1, 32), (2, 64), (5, 32)):
             with tempfile.TemporaryDirectory() as d:
-                res = MM.build_mini(Path(d), MM.MiniConfig(n_shards=n_shards, alignment=align))
+                res = MM.build_mini(Path(d), MM.MiniConfig(n_shards=n_shards, alignment=align, n_expert=4))
                 self.assertEqual(len(res["paths"]), n_shards)
                 names = 0
                 for p in res["paths"]:
@@ -200,13 +202,15 @@ class Determinism(unittest.TestCase):
 
     def test_config_validation(self):
         for bad in (dict(ff=48), dict(hidden=250), dict(e_head_dim=48), dict(n_used=99), dict(vocab=100),
-                    dict(cand_source=3)):
+                    dict(cand_source=3),
+                    dict(ff=64), dict(ff=128), dict(ff=192),           # valid MXFP4 halves, but not a whole number of the C++ kernels' 128-value groups
+                    dict(hidden=96), dict(hidden=160)):                # multiples of 32, not of 128
             with self.assertRaises(ValueError, msg=str(bad)):
                 dataclasses.replace(MM.MiniConfig(), **bad).validate()
 
     def test_other_dims_build(self):
         with tempfile.TemporaryDirectory() as d:
-            cfg = MM.MiniConfig(hidden=128, ff=128, n_expert=8, n_layer=6, kv_source=(2, 3), index_source=(2, 3, 5),
+            cfg = MM.MiniConfig(hidden=128, ff=256, n_expert=8, n_layer=6, kv_source=(2, 3), index_source=(2, 3, 5),
                                 cand_source=3, engram_layers=(1, 2), n_shards=2)
             res = MM.build_mini(Path(d), cfg)
             self.assertEqual(len(res["paths"]), 2)

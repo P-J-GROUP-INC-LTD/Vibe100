@@ -14,7 +14,7 @@ Layouts (docs/deepseek/CONTRACTS.md, include/strata/ds41/geometry.hpp), E = expe
           ffn_down_exps                [ne0 = F, ne1 = H, ne2 = E]  expert e = rows [e*H, (e+1)*H), F/32 blocks of 17 B
   blob    [gate][up][down]            the expert's three GGUF slices back to back   (real: 18,800,640 B)
   half k  [gate rows kF/2..][up rows kF/2..][down: every row, blocks k*F/64 ..]       (real: 9,400,320 B)
-          k = 0, 1; F/2 must be a whole number of 32-value blocks (F % 64 == 0)
+          k = 0, 1; F/2 must be a whole number of 32-value blocks (F % 64 == 0) and, for the C++ kernels, of 128-value groups (see ExpertGeom)
 
 verify checks, per expert:
   1. halves_to_blob(blob_to_halves(blob)) == blob                       (the split is a bijection)
@@ -41,6 +41,8 @@ import gguf_io as G  # noqa: E402
 
 BLOCK_BYTES = 17
 QK = 32
+KERNEL_HIDDEN_MULTIPLE = 128      # strata::ds41::cpu::check_view: hidden % 128 == 0 ...
+KERNEL_FF_MULTIPLE = 256          # ... and (ff / 2) % 128 == 0 for a CPU half
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,9 +52,14 @@ class ExpertGeom:
     n_expert: int
 
     def __post_init__(self):
-        if self.hidden % QK or self.ff % (2 * QK):
-            raise ValueError(f"hidden {self.hidden} must be a multiple of 32 and ff {self.ff} of 64 "
-                             "(a half must be whole MXFP4 blocks)")
+        # The layout itself needs hidden % 32 and ff % 64 (a half = whole MXFP4 blocks).  The C++ CPU kernels (include/strata/ds41/cpu, check_view)
+        # need more: they take four 32-blocks (128 values) per kernel group, on the activation side (hidden) and on the intermediate (a half's FF =
+        # ff / 2), so hidden % 128 == 0 and ff % 256 == 0.  An expert that fails that cannot run through them (they abort), so it is refused here
+        # too - one rule, in one place, for the tools, the mini GGUF (make_mini_gguf.MiniConfig.validate) and the kernels.
+        if self.hidden % KERNEL_HIDDEN_MULTIPLE or self.ff % KERNEL_FF_MULTIPLE:
+            raise ValueError(f"hidden {self.hidden} must be a multiple of {KERNEL_HIDDEN_MULTIPLE} and ff {self.ff} of {KERNEL_FF_MULTIPLE}: "
+                             "a half (ff / 2) must be whole MXFP4 blocks (ff % 64) and a whole number of the C++ CPU kernels' 4-block "
+                             "(128-value) groups (ff % 256; hidden % 128 likewise)")
 
     gate_row_blocks = property(lambda s: s.hidden // QK)
     down_row_blocks = property(lambda s: s.ff // QK)

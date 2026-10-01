@@ -15,6 +15,7 @@ tools/ds41/test_codecs.py whenever a ggml source tree and a C compiler are avail
 Everything here works on flat float32 data; callers reshape to (rows, ne0).  Row length (ne0) must be a multiple of
 the block size for the block types, exactly as in GGML.
 """
+# Attribution: these codecs follow ggml (llama.cpp ggml-quants.c, ggml-impl.h), MIT License, Copyright (c) 2023-2026 The ggml authors (notice: src/ds41/cuda/ds41_math.cuh, third_party/ggml/LICENSE).
 from __future__ import annotations
 
 import numpy as np

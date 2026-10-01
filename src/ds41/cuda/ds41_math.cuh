@@ -69,17 +69,32 @@ DS41_FI void lut8(uint32_t q, int& lo4, int& hi4) {
     hi4 = (int) prmt(pos, neg, s2);
 }
 
-// ---- activation quantiser (CONTRACTS.md; bit-identical to strata::ds41::cpu::quantize_act) --------------------------------
+// ---- activation quantiser (CONTRACTS.md "Activations"; bit-identical to strata::ds41::cpu::quantize_act on EVERY input) -------------
+// The rule (ggml's x86 SIMD quantize_row_q8_0 with an FP32 d; the CPU's copy of it is quant_scale() in src/ds41/cpu/mxfp4_internal.hpp):
+//   m = the INTEGER maximum of (bits & 0x7FFFFFFF) over the 32 values - order-independent, unlike a float max with a NaN operand;
+//   m >= 0x7F800000 (an Inf or a NaN in the block):  d = the canonical NaN 0x7FC00000, every q = 0   (the NaN reaches y)
+//   m <  0x0D800000 (amax < 2^-100, zero included):  d = 0, every q = 0                              (127 / amax would overflow)
+//   otherwise  amax = float(m), d = amax / 127, id = 127 / amax (two IEEE divisions), q = rint(x * id) (FP32 product, round half to EVEN
+//   = cvt.rni), clamped to [-127, 127].
+// Nothing here relies on what a conversion does with a NaN or an out-of-range float (the old code reached cvt.rni with x * inf).
+inline constexpr uint32_t kQuantInfBits = 0x7F800000u;
+inline constexpr uint32_t kQuantTinyBits = 0x0D800000u;     // 2^-100
+inline constexpr uint32_t kQuantNaNBits = 0x7FC00000u;
+
 /// One warp = one 32-block: lane l holds element l.  Writes the 32 int8 (interleaved order, act_perm_pos) at `dst` (the
-/// block's 32 bytes) and the fp32 scale to *scale_dst (lane 0).  d = amax/127 (0 for an all-zero block), q = rint(v * (127/amax))
-/// clamped to +-127.
+/// block's 32 bytes) and the fp32 scale to *scale_dst (lane 0).
 DS41_FI void quantize_block_warp(float v, int lane, int8_t* DS41_RESTRICT dst, float* DS41_RESTRICT scale_dst) {
-    float amax = fabsf(v);
+    int m = (int) (f2u(v) & 0x7FFFFFFFu);                  // magnitude bits, < 2^31: the signed max is the unsigned one
     DS41_UNROLL
-    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, shfl_xor(amax, off));
-    const float d = fdiv_rn(amax, 127.0f);
-    const float id = amax != 0.0f ? fdiv_rn(127.0f, amax) : 0.0f;
-    int q = f2i_rn(fmul_rn(v, id));
+    for (int off = 16; off > 0; off >>= 1) {
+        const int o = shfl_xor(m, off);
+        m = o > m ? o : m;
+    }
+    const bool special = (uint32_t) m >= kQuantInfBits || (uint32_t) m < kQuantTinyBits;     // every q = 0
+    const float amax = u2f((uint32_t) m);
+    const float d = (uint32_t) m >= kQuantInfBits ? u2f(kQuantNaNBits) : ((uint32_t) m < kQuantTinyBits ? 0.0f : fdiv_rn(amax, 127.0f));
+    const float id = special ? 0.0f : fdiv_rn(127.0f, amax);
+    int q = special ? 0 : f2i_rn(fmul_rn(v, id));
     q = q > 127 ? 127 : (q < -127 ? -127 : q);
     dst[perm_pos(lane)] = (int8_t) q;
     if (lane == 0) *scale_dst = d;

@@ -2,11 +2,15 @@
 // ds41_split.cu (nvcc) and by the CPU emulation test (-DDS41_EMU).
 //
 // ONE BLOCK, any T.  The router's ids [T][6] are walked in (token, k) order in chunks of blockDim.x entries; for every entry the
-// layer's residency row (int32 [384], slot or -1) says hit or miss; the hits and the misses are compacted with a warp-ballot
+// layer's residency row (int32 [384], slot or -1) says hit or miss - a value is a HIT only if 0 <= r < n_slots, anything else (-1 =
+// not resident, or a corrupt / stale entry) is a MISS, and a corrupt one (neither -1 nor in range) is also COUNTED in
+// counts->n_bad_slots so that the caller can assert; the hits and the misses are compacted with a warp-ballot
 // prefix count plus the per-warp totals, so both lists come out in (token, k) order, run to run (no atomics, no races).
-//   hits   [n_hits]   {token, k, slot, weight}
-//   misses [n_misses] {token, k, expert, weight}     <- what the host's CPU pool reads
-//   counts {n_hits, n_misses, n_groups, 0}           written last
+//   hits   [n_hits]   {token, k, slot, weight}                                  DEVICE
+//   misses [n_misses] {token, k, expert, weight}     <- what the host's CPU pool reads   (device, or mapped host memory: the caller's choice)
+//   counts {n_hits, n_misses, n_groups, n_bad_slots}                  DEVICE: what the expert kernels read (n_groups), once per block, from L2
+//   host   {seq, n_hits, n_misses, n_groups, n_bad_slots}  optional, MAPPED HOST memory, one record per layer in flight: the same four
+//          counts, then (after one fence by one thread) the sequence number `seq` stored with RELEASE semantics = the doorbell.
 // For T <= 8 the hits are then GROUPED by slot (groups != nullptr): hit i joins the group of the first hit with the same slot
 // (= the same expert asked by several tokens) and a group lists its members in hit order.  Groups are numbered by DECREASING size
 // (ties: order of first appearance), so the expert kernels can run the rare big groups (5..8 tokens) with a wide-token specialisation
@@ -26,11 +30,13 @@ namespace strata::ds41::cuda::dev {
 inline constexpr int kSpMaxGroupedHits = kMaxExpertTokens * kTopK;     // 48
 
 DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTRICT ids, const float* DS41_RESTRICT weights, int T,
-                                                       const int32_t* DS41_RESTRICT residency_row, HitEntry* DS41_RESTRICT hits,
-                                                       MissEntry* DS41_RESTRICT misses, HitGroup* DS41_RESTRICT groups,
-                                                       SplitCounts* DS41_RESTRICT counts, int host_visible) {
+                                                       const int32_t* DS41_RESTRICT residency_row, int n_slots,
+                                                       HitEntry* DS41_RESTRICT hits, MissEntry* DS41_RESTRICT misses,
+                                                       HitGroup* DS41_RESTRICT groups, SplitCounts* DS41_RESTRICT counts,
+                                                       SplitHostRecord* DS41_RESTRICT host, uint32_t seq) {
     DS41_SHARED int s_wh[32];
     DS41_SHARED int s_wm[32];
+    DS41_SHARED int s_wb[32];
     DS41_SHARED int s_first[kSpMaxGroupedHits];
     DS41_SHARED int s_lead[kSpMaxGroupedHits];
     DS41_SHARED int s_gid[kSpMaxGroupedHits];
@@ -40,25 +46,30 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTR
     const int nwarps = nthreads >> 5;
     const int total = T * kTopK;
 
-    int hit_base = 0, miss_base = 0;
+    int hit_base = 0, miss_base = 0, bad_base = 0;
     for (int c0 = 0; c0 < total; c0 += nthreads) {
         const int e = c0 + tid;
         const bool valid = e < total;
         int id = -1, slot = -1;
+        bool bad = false;
         if (valid) {
             id = ids[e];
-            slot = (id >= 0 && id < kExperts) ? residency_row[id] : -1;      // an invalid id is a miss, passed on unchanged
+            const int r = (id >= 0 && id < kExperts) ? residency_row[id] : -1;      // an invalid id is a miss, passed on unchanged
+            const bool in_range = r >= 0 && r < n_slots;
+            slot = in_range ? r : -1;                                                // a hit ONLY inside [0, n_slots)
+            bad = r != -1 && !in_range;                                              // -1 is the "not resident" marker, anything else out of range is corrupt
         }
         const bool is_hit = valid && slot >= 0, is_miss = valid && slot < 0;
-        const uint32_t bh = ballot(is_hit), bm = ballot(is_miss);
+        const uint32_t bh = ballot(is_hit), bm = ballot(is_miss), bb = ballot(bad);
         const uint32_t below = (1u << lane) - 1u;
         const int ph = popc(bh & below), pm = popc(bm & below);
         if (lane == 0) {
             s_wh[warp] = popc(bh);
             s_wm[warp] = popc(bm);
+            s_wb[warp] = popc(bb);
         }
         sync_block();
-        int oh = 0, om = 0, th = 0, tm = 0;
+        int oh = 0, om = 0, th = 0, tm = 0, tb = 0;
         for (int w = 0; w < nwarps; ++w) {
             if (w < warp) {
                 oh += s_wh[w];
@@ -66,6 +77,7 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTR
             }
             th += s_wh[w];
             tm += s_wm[w];
+            tb += s_wb[w];
         }
         if (is_hit) {
             HitEntry h;
@@ -84,7 +96,8 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTR
         }
         hit_base += th;
         miss_base += tm;
-        sync_block();                                                          // s_wh / s_wm are reused by the next chunk
+        bad_base += tb;
+        sync_block();                                                          // s_wh / s_wm / s_wb are reused by the next chunk
     }
 
     int n_groups = 0;
@@ -126,15 +139,24 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTR
         if (tid == 0)
             for (int j = 0; j < nh; ++j) n_groups += s_lead[j];
     }
-    // The lists first, then (after a system-scope fence when the miss list / counts are mapped host memory) the counts.
-    if (host_visible) threadfence_system();
+    // The lists first (every thread's stores, ordered before thread 0's by the barrier), then the counts.  The expert kernels read the counts
+    // from DEVICE memory.  When the caller wants the result on the host, thread 0 also writes the host record, issues ONE fence.acq_rel.sys
+    // and stores the sequence number with release semantics: a host that reads `seq` with an acquire load and finds the value it expects sees
+    // the counts and every entry of the miss list (written, if `misses` is mapped host memory, before the barrier).  No other thread fences.
     sync_block();
     if (tid == 0) {
         counts->n_hits = hit_base;
         counts->n_misses = miss_base;
         counts->n_groups = n_groups;
-        if (host_visible) threadfence_system();            // `reserved` is the doorbell: written last, after the three counts
-        counts->reserved = 0;
+        counts->n_bad_slots = bad_base;
+        if (host != nullptr) {
+            host->n_hits = hit_base;
+            host->n_misses = miss_base;
+            host->n_groups = n_groups;
+            host->n_bad_slots = bad_base;
+            fence_acq_rel_sys();
+            store_release_sys(&host->seq, seq);
+        }
     }
 }
 
@@ -142,11 +164,14 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTR
 
 namespace strata::ds41::cuda {
 
-void split_hits_misses(const int32_t* ids, const float* weights, int T, const int32_t* residency_table, int layer, HitEntry* hits,
-                       MissEntry* misses, HitGroup* groups, SplitCounts* counts, bool host_visible, void* stream) {
+void split_hits_misses(const int32_t* ids, const float* weights, int T, const int32_t* residency_table, int n_slots, int layer, HitEntry* hits,
+                       MissEntry* misses, HitGroup* groups, SplitCounts* counts, SplitHostRecord* host, uint32_t seq, void* stream) {
     if (T < 1) throw std::invalid_argument("split_hits_misses: T must be >= 1");
     if (layer < 0 || layer >= kLayers) throw std::invalid_argument("split_hits_misses: layer out of range");
+    if (n_slots < 0) throw std::invalid_argument("split_hits_misses: n_slots must be >= 0 (the number of cache slots the residency table may name)");
     if (groups != nullptr && T > kMaxExpertTokens) throw std::invalid_argument("split_hits_misses: groups need T <= 8");
+    if (host != nullptr && seq == 0) throw std::invalid_argument("split_hits_misses: seq 0 is the cleared state of a host record; start at 1");
+    if (host != nullptr && reinterpret_cast<uintptr_t>(host) % 16 != 0) throw std::invalid_argument("split_hits_misses: the host record must be 16-byte aligned");
     const int total = T * kTopK;
     int threads = (total + 31) & ~31;
     threads = threads < 64 ? 64 : (threads > 1024 ? 1024 : threads);
@@ -154,9 +179,9 @@ void split_hits_misses(const int32_t* ids, const float* weights, int T, const in
 #if defined(DS41_EMU)
     (void) stream;
     ds41_emu::launch(dim3(1), dim3((unsigned) threads), 0,
-                     [&] { dev::split_kernel(ids, weights, T, row, hits, misses, groups, counts, host_visible ? 1 : 0); });
+                     [&] { dev::split_kernel(ids, weights, T, row, n_slots, hits, misses, groups, counts, host, seq); });
 #else
-    dev::split_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(ids, weights, T, row, hits, misses, groups, counts, host_visible ? 1 : 0);
+    dev::split_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(ids, weights, T, row, n_slots, hits, misses, groups, counts, host, seq);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("ds41 split_hits_misses: ") + cudaGetErrorString(e));
 #endif

@@ -14,11 +14,21 @@
 //     multiplied with every token of the group (NT = 1, 2 or 4 tokens per block; more tokens = more blocks along y, re-reading the
 //     3.9 MB weight matrix from L2).
 //     Bytes: 3.93 MB of weights per call = ~4.4 us at 900 GB/s; the FP32 FMAs (T x 2 M) are far below the FMA roof.
-//   * router_logits_tiled_kernel (T > 32): a plain shared-memory tiled FP32 GEMM, 64 tokens x 64 experts x 16 per step, 4x4 outputs
-//     per thread (prefill: 2 x T x 384 x 5120 FMA; ~5-8 TFLOPS on a V100, i.e. ~2-3 ms per 4096 tokens per layer).  FP32 on purpose:
-//     the logits decide the routing, so they are not rounded to fp16 for the tensor cores.
+//   * router_logits_prefill_kernel (T > 32): the SAME per-(token, expert) reduction as the GEMV above - bit for bit - with the token loop
+//     inside the block: a block of 10 warps holds the weights of 4 experts in registers (converted to FP32 once) and walks 16 tokens, so
+//     Wg is read once per 16 tokens and each token's x once per 4 experts, from L2 (prefill: 2 x T x 384 x 5120 FMA; FP32 on purpose: the
+//     logits decide the routing, so they are not rounded to fp16 for the tensor cores).  It replaces the shared-memory tiled GEMM this file
+//     had, whose K order (one sequential chain over all 5120) differed from the GEMV's: a token routed in a prompt chunk and the same
+//     token routed alone in decode got logits that differed in the last bits, so a near-tie could pick different experts (CONTRACTS.md:
+//     "Routing must not depend on T").
 //   * router_select_kernel: one warp per token: 12 experts per lane, 6 rounds of warp argmax with a (value, index) total order.
-// Every reduction has a fixed order: the same input gives the same bits, run to run.
+// ONE REDUCTION ORDER FOR EVERY T (the definition, shared by both logits kernels; the GEMV's NT = 1, 2, 4 and the prefill kernel give the same bits):
+//   lane partial   s = 0; for the lane's 2 chunk groups g = 0, 1 (chunk c = lane + 32 * (2 * warp + g), 8 consecutive k each):
+//                  s = fma(bf16(wg[e][k]), x[t][k], s)   for the 8 k of the chunk, in order      (16 chained FMAs)
+//   warp total     a 32-lane butterfly, offsets 16, 8, 4, 2, 1:  s += shfl_xor(s, off)            (lanes_vector_sum: any number of values
+//                  per lane gives the same tree; every lane ends with the same bits)
+//   logit          tot = 0; tot += total of warp 0, 1, ..., 9 in this order
+// Every reduction has a fixed order: the same input gives the same bits, run to run, and for every T.
 #pragma once
 
 #include <cstdint>
@@ -116,63 +126,92 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(320) void router_logits_gemv_kernel(const float* 
     }
 }
 
-// ---- logits, large T (prefill): FP32 tiled GEMM ---------------------------------------------------------------------------------
-inline constexpr int kTbm = 64, kTbn = 64, kTbk = 16, kTpad = 4;
+// ---- logits, large T (prefill): the GEMV's reduction, tokens looped inside the block --------------------------------------------
+// Block = 10 warps (the K axis in 10 slices, exactly as the GEMV), kRtPfExperts experts and up to kRtPfTokens tokens.  Each lane converts its
+// 2 weight chunks of every expert to FP32 once, then for every token of the block loads its 2 x 2 float4 of x (the next token's loads are issued
+// before the current token is multiplied), runs the 16 chained FMAs per expert, butterflies the kRtPfExperts values over the warp and parks the
+// warp totals in shared memory; after the last token the ten totals of every (token, expert) are added in order by one thread each.
+inline constexpr int kRtPfExperts = 4;                         // experts per block (grid.x = 384 / 4)
+inline constexpr int kRtPfTokens = 16;                         // tokens per block (grid.y = ceil(T / 16))
+static_assert(kExperts % kRtPfExperts == 0 && (kRtPfExperts & (kRtPfExperts - 1)) == 0);
 
-DS41_KERNEL DS41_LAUNCH_BOUNDS(256) void router_logits_tiled_kernel(const float* DS41_RESTRICT x, const uint16_t* DS41_RESTRICT wg, int T,
-                                                                    float* DS41_RESTRICT logits) {
-    DS41_SHARED float Xs[2][kTbk][kTbm + kTpad];             // [k][token]
-    DS41_SHARED float Ws[2][kTbk][kTbn + kTpad];             // [k][expert]
-    const int tid = threadIdx.x;
-    const int tx = tid & 15, ty = tid >> 4;
-    const int m0 = blockIdx.x * kTbm, n0 = blockIdx.y * kTbn;
-    const int lr = tid >> 2, k4 = (tid & 3) * 4;             // this thread's tile row and its 4 consecutive k
-    const bool xin = m0 + lr < T;
-    const float* xrow = x + (size_t) (m0 + lr) * kHidden;
-    const uint16_t* wrow = wg + (size_t) (n0 + lr) * kHidden;
+DS41_KERNEL DS41_LAUNCH_BOUNDS(32 * kRtSliceWarps) void router_logits_prefill_kernel(const float* DS41_RESTRICT x, const uint16_t* DS41_RESTRICT wg, int T,
+                                                                                    float* DS41_RESTRICT logits) {
+    constexpr int NE = kRtPfExperts, TB = kRtPfTokens, G = kRtGroupsPerWarp;
+    DS41_SHARED float s_part[TB][kRtSliceWarps][NE];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int e0 = blockIdx.x * NE;
+    const int t0 = blockIdx.y * TB;
+    const int nt = T - t0 < TB ? T - t0 : TB;                      // tokens of this block, >= 1 (uniform)
 
-    float acc[4][4];
+    float w[NE][G][8];                                             // this lane's weights, FP32, for the whole block
     DS41_UNROLL
-    for (int i = 0; i < 4; ++i)
+    for (int ee = 0; ee < NE; ++ee) {
+        const unsigned char* wrow = reinterpret_cast<const unsigned char*>(wg + (size_t) (e0 + ee) * kHidden);
         DS41_UNROLL
-        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
-
-    constexpr int KT = kHidden / kTbk;                        // 320
-    float4 xr = xin ? ldgf4(xrow + k4) : make_float4(0.f, 0.f, 0.f, 0.f);
-    uint2 wr = ldg2(wrow + k4);
-    DS41_UNROLL1
-    for (int kt = 0; kt < KT; ++kt) {
-        const int buf = kt & 1;
-        Xs[buf][k4 + 0][lr] = xr.x;
-        Xs[buf][k4 + 1][lr] = xr.y;
-        Xs[buf][k4 + 2][lr] = xr.z;
-        Xs[buf][k4 + 3][lr] = xr.w;
-        Ws[buf][k4 + 0][lr] = u2f(wr.x << 16);
-        Ws[buf][k4 + 1][lr] = u2f(wr.x & 0xFFFF0000u);
-        Ws[buf][k4 + 2][lr] = u2f(wr.y << 16);
-        Ws[buf][k4 + 3][lr] = u2f(wr.y & 0xFFFF0000u);
-        sync_block();
-        if (kt + 1 < KT) {                                    // the next step's loads fly while this one is multiplied
-            const int k0 = (kt + 1) * kTbk + k4;
-            xr = xin ? ldgf4(xrow + k0) : make_float4(0.f, 0.f, 0.f, 0.f);
-            wr = ldg2(wrow + k0);
-        }
-        DS41_UNROLL
-        for (int kk = 0; kk < kTbk; ++kk) {
-            const float4 a = *reinterpret_cast<const float4*>(&Xs[buf][kk][ty * 4]);
-            const float4 b = *reinterpret_cast<const float4*>(&Ws[buf][kk][tx * 4]);
-            const float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
-            DS41_UNROLL
-            for (int i = 0; i < 4; ++i)
-                DS41_UNROLL
-                for (int j = 0; j < 4; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+        for (int g = 0; g < G; ++g) {
+            const int c = lane + 32 * (warp * G + g);              // chunk index 0..639 (8 elements each), as in the GEMV
+            const uint4 q = ldg4(wrow + 16 * c);
+            w[ee][g][0] = u2f(q.x << 16);                          // bf16 -> fp32: the bits are the top half
+            w[ee][g][1] = u2f(q.x & 0xFFFF0000u);
+            w[ee][g][2] = u2f(q.y << 16);
+            w[ee][g][3] = u2f(q.y & 0xFFFF0000u);
+            w[ee][g][4] = u2f(q.z << 16);
+            w[ee][g][5] = u2f(q.z & 0xFFFF0000u);
+            w[ee][g][6] = u2f(q.w << 16);
+            w[ee][g][7] = u2f(q.w & 0xFFFF0000u);
         }
     }
-    DS41_UNROLL
-    for (int i = 0; i < 4; ++i) {
-        const int m = m0 + ty * 4 + i;
-        if (m < T)
-            *reinterpret_cast<float4*>(logits + (size_t) m * kExperts + n0 + tx * 4) = make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+    auto load_x = [&](float4 (&xa)[G][2], int tt) {
+        DS41_UNROLL
+        for (int g = 0; g < G; ++g) {
+            const int c = lane + 32 * (warp * G + g);
+            const float* xp = x + (size_t) (t0 + tt) * kHidden + 8 * c;
+            xa[g][0] = ldgf4(xp);
+            xa[g][1] = ldgf4(xp + 4);
+        }
+    };
+    float4 xc[G][2];
+    load_x(xc, 0);
+    DS41_UNROLL1
+    for (int tt = 0; tt < nt; ++tt) {
+        float4 xn[G][2];
+        load_x(xn, tt + 1 < nt ? tt + 1 : tt);                     // the next token's x flies while this one is multiplied
+        float acc[NE];
+        DS41_UNROLL
+        for (int ee = 0; ee < NE; ++ee) {
+            float sacc = 0.0f;
+            DS41_UNROLL
+            for (int g = 0; g < G; ++g) {
+                const float4 a = xc[g][0], b = xc[g][1];
+                sacc = fmaf(w[ee][g][0], a.x, sacc);
+                sacc = fmaf(w[ee][g][1], a.y, sacc);
+                sacc = fmaf(w[ee][g][2], a.z, sacc);
+                sacc = fmaf(w[ee][g][3], a.w, sacc);
+                sacc = fmaf(w[ee][g][4], b.x, sacc);
+                sacc = fmaf(w[ee][g][5], b.y, sacc);
+                sacc = fmaf(w[ee][g][6], b.z, sacc);
+                sacc = fmaf(w[ee][g][7], b.w, sacc);
+            }
+            acc[ee] = sacc;
+        }
+        const float mine = lanes_vector_sum<32, NE>(acc);
+        constexpr int S = ilog2(NE);
+        const int idx = lane >> (5 - S);
+        if ((lane & ((1 << (5 - S)) - 1)) == 0) s_part[tt][warp][idx] = mine;
+        DS41_UNROLL
+        for (int g = 0; g < G; ++g) {
+            xc[g][0] = xn[g][0];
+            xc[g][1] = xn[g][1];
+        }
+    }
+    sync_block();
+    for (int i = threadIdx.x; i < nt * NE; i += 32 * kRtSliceWarps) {
+        const int tt = i / NE, ee = i - tt * NE;
+        float tot = 0.0f;
+        DS41_UNROLL
+        for (int wi = 0; wi < kRtSliceWarps; ++wi) tot += s_part[tt][wi][ee];       // fixed order, as the GEMV
+        logits[(size_t) (t0 + tt) * kExperts + e0 + ee] = tot;
     }
 }
 
@@ -268,14 +307,14 @@ void router_logits(const float* x, const uint16_t* wg_bf16, int T, float* logits
     if (reinterpret_cast<uintptr_t>(x) % 16 != 0 || reinterpret_cast<uintptr_t>(wg_bf16) % 16 != 0 || reinterpret_cast<uintptr_t>(logits) % 16 != 0)
         throw std::invalid_argument("ds41 router_logits: x, wg and logits must be 16-byte aligned");
     if (T > kRouterSmallT) {
-        const dim3 grid((unsigned) ((T + dev::kTbm - 1) / dev::kTbm), (unsigned) (kExperts / dev::kTbn));
+        const dim3 grid((unsigned) (kExperts / dev::kRtPfExperts), (unsigned) ((T + dev::kRtPfTokens - 1) / dev::kRtPfTokens));
 #if defined(DS41_EMU)
         (void) stream;
-        ds41_emu::launch(grid, dim3(256), 0, [&] { dev::router_logits_tiled_kernel(x, wg_bf16, T, logits); });
+        ds41_emu::launch(grid, dim3(32 * dev::kRtSliceWarps), 0, [&] { dev::router_logits_prefill_kernel(x, wg_bf16, T, logits); });
 #else
-        dev::router_logits_tiled_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(x, wg_bf16, T, logits);
+        dev::router_logits_prefill_kernel<<<grid, 32 * dev::kRtSliceWarps, 0, (cudaStream_t) stream>>>(x, wg_bf16, T, logits);
 #endif
-        dev::rt_check_launch("router_logits(tiled)");
+        dev::rt_check_launch("router_logits(prefill)");
     } else if (T == 1) {
         dev::launch_logits_gemv<1>(x, wg_bf16, T, logits, stream);
     } else if (T == 2) {

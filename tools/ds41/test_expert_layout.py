@@ -63,6 +63,25 @@ class RealGeometry(unittest.TestCase):
         with self.assertRaises(ValueError):
             X.ExpertGeom(hidden=256, ff=96, n_expert=4)       # 48 values per half: not whole blocks
 
+    def test_geometry_validation_is_the_cpu_kernels_rule(self):
+        """expert_layout says what the C++ kernels' check_view says: hidden % 128 and (ff / 2) % 128, i.e. ff % 256."""
+        self.assertEqual((X.KERNEL_HIDDEN_MULTIPLE, X.KERNEL_FF_MULTIPLE), (128, 256))
+        X.ExpertGeom(hidden=128, ff=256, n_expert=2)            # the smallest geometry the kernels accept
+        X.ExpertGeom(hidden=256, ff=512, n_expert=2)
+        for hidden, ff in ((256, 64), (256, 128), (256, 192), (96, 256), (160, 256), (64, 256)):
+            with self.assertRaises(ValueError, msg=f"hidden={hidden} ff={ff}") as cm:
+                X.ExpertGeom(hidden=hidden, ff=ff, n_expert=2)
+            self.assertIn("256", str(cm.exception))             # the message names the kernels' multiples
+        # ... and the source of the rule is the C++ check: both numbers appear in it
+        src = (T.REPO / "src" / "ds41" / "cpu" / "mxfp4_expert.cpp")
+        if src.is_file():
+            text = src.read_text()
+            self.assertIn("v.hidden % kGroupValues != 0", text)
+            self.assertIn("(v.ff / kQK) % kGroupBlocks != 0", text)
+            hpp = (T.REPO / "include" / "strata" / "ds41" / "cpu" / "mxfp4_expert.hpp").read_text()
+            self.assertIn("kGroupBlocks = 4", hpp)
+            self.assertIn("kGroupValues = kGroupBlocks * kQK", hpp)
+
     def test_random_blob_at_real_shape(self):
         """No GGUF needed: a random valid expert at the real dimensions goes through the whole chain."""
         g = X.REAL
@@ -97,6 +116,48 @@ class CpuPackCrossCheck(unittest.TestCase):
             self.assertEqual(CP.pack_cpu_half(blob, 1), h1)
 
 
+class MiniExpertsRunThroughTheCppKernels(unittest.TestCase):
+    """The mini GGUF's experts (runtime dims 256 x 256, not the compiled-in 5120 x 2304) go through DS-C's kernels: the default dims satisfy
+    their check_view (hidden % 128, expert FF % 256), which the old defaults (FF 64) did not - the kernels abort on those."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.res = T.mini()
+        recs = [G.load_shard(p, i) for i, p in enumerate(cls.res["paths"])]
+        cls.manifest, F = M.analyze(recs, geometry="self")
+        assert not F.errors
+        cls.src = X.ExpertSource(cls.manifest)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.src.close()
+
+    @unittest.skipUnless(CP.available(), "DS-C sources / C++ compiler not available: " + (CP.why_not() or ""))
+    def test_mini_experts_run_and_match_float64(self):
+        g = self.src.geom
+        rng = np.random.default_rng(8)
+        for layer, e in ((0, 0), (3, 9), (7, 15)):
+            blob = self.src.blob(layer, e)
+            Wg, Wu, Wd = X.dequant_blob(blob, g)
+            x = (rng.standard_normal((3, g.hidden)) * 3.0).astype(np.float32)        # loud enough to reach the clamps
+            w = rng.uniform(0.2, 1.5, size=3).astype(np.float32)
+            ref = np.stack([X.expert_forward(x[t].astype(np.float64), Wg, Wu, Wd, float(w[t]))[0] for t in range(3)])
+            for isa in (n for n in CP.ISAS if CP.isa_supported(n)):
+                y_whole = CP.expert_run(blob, g.hidden, g.ff, -1, x, w, isa)
+                y0 = CP.expert_run(blob, g.hidden, g.ff, 0, x, w, isa)      # one partial per half (per socket): never one shared buffer
+                y1 = CP.expert_run(blob, g.hidden, g.ff, 1, x, w, isa)
+                for name, y in (("whole", y_whole), ("halves", y0 + y1)):
+                    rel = np.linalg.norm(y - ref) / np.linalg.norm(ref)
+                    self.assertTrue(np.isfinite(y).all(), (layer, e, isa, name))
+                    self.assertLess(rel, 0.05, f"layer {layer} expert {e} {isa} {name}: relative error {rel:.3g}")     # the int8 activation error (~1 %)
+                self.assertLess(np.linalg.norm(y_whole - (y0 + y1)) / np.linalg.norm(y_whole), 1e-4)        # only the FP32 order of the down sum differs
+
+    @unittest.skipUnless(CP.available(), "DS-C sources / C++ compiler not available: " + (CP.why_not() or ""))
+    def test_the_old_default_dims_are_refused_before_the_kernels_could_abort(self):
+        with self.assertRaises(ValueError):                    # FF 64 (the old mini default): the kernels' check_view would abort the process
+            CP.expert_run(bytes(100), 256, 64, -1, np.zeros((1, 256), np.float32), [1.0])
+
+
 class MiniExperts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -127,8 +188,8 @@ class MiniExperts(unittest.TestCase):
 
     def test_geometry_from_the_file(self):
         g = self.g
-        self.assertEqual((g.hidden, g.ff, g.n_expert), (256, 64, 16))
-        self.assertEqual(g.blob_bytes, 2 * 64 * 8 * 17 + 256 * 2 * 17)
+        self.assertEqual((g.hidden, g.ff, g.n_expert), (256, 256, 16))
+        self.assertEqual(g.blob_bytes, 2 * 256 * 8 * 17 + 256 * 8 * 17)
         self.assertEqual(self.src.layers, list(range(8)))
 
     def test_blob_is_the_three_gguf_slices(self):

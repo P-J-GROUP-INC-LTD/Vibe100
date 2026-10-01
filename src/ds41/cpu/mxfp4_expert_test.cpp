@@ -35,6 +35,14 @@
 //   7. threads     ragged row-range splits on real threads with a barrier, and T tokens against T single-token calls:
 //                  BITWISE equal to the single-thread run (per (row, token) the arithmetic is one fixed sequence).
 //   8. accumulate  y is added to, not overwritten.
+//   9. quantiser rule  (CONTRACTS.md "Activations") on the blocks that used to differ between the implementations: all-zero, 1e-37 everywhere
+//                  (127 / amax overflows: the old scalar code gave -127, the SIMD code -128), the 2^-100 boundary, one NaN / Inf at every position,
+//                  negative and signalling NaNs, ties (hand-written expected bytes), and random BIT PATTERNS: identical bytes on every ISA and
+//                  against the independent reference.
+//  10. NaN         through the SwiGLU clamps: NaN in g only, in u only, and in x reaches every element of y on every ISA (a finite control token
+//                  stays finite).  fminf-style clamps would turn them into numbers.
+//  11. sockets     the two halves of an expert run CONCURRENTLY, each into its own partial y_k; y_0 + y_1 equals the sequential accumulation
+//                  (one buffer for both halves would race: every half covers all 5120 rows).
 #include "strata/ds41/cpu/mxfp4_expert.hpp"
 
 #include <algorithm>
@@ -112,17 +120,35 @@ void fill_rows(Rng& rng, uint8_t* w, size_t rows, int nb, EMode mode, int efixed
 }
 
 // ---- independent references ----------------------------------------------------------------------------------------
-// The natural-order quantiser of CONTRACTS.md with the rounding spelled out; no layout, no SIMD.
+// The natural-order quantiser of CONTRACTS.md with the rounding spelled out; no layout, no SIMD, no shared helper: the largest magnitude
+// is an integer maximum of the magnitude bits, a non-finite block has d = the canonical NaN 0x7FC00000 and q = 0, a block below 2^-100 has d = 0
+// and q = 0, otherwise d = amax / 127, id = 127 / amax, q = rint(x * id) clamped to +-127 (FE_TONEAREST: ties to even).
+uint32_t f2bits(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+float bits2f(uint32_t u) {
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
 void ref_quantize(const float* x, int n, std::vector<int8_t>& q, std::vector<float>& d) {
     q.assign((size_t) n, 0);
     d.assign((size_t) n / 32, 0.f);
     for (int b = 0; b < n / 32; ++b) {
-        float amax = 0;
-        for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[b * 32 + j]));
+        uint32_t m = 0;
+        for (int j = 0; j < 32; ++j) m = std::max(m, f2bits(x[b * 32 + j]) & 0x7FFFFFFFu);
+        if (m >= 0x7F800000u) {
+            d[b] = bits2f(0x7FC00000u);
+            continue;
+        }
+        if (m < 0x0D800000u) continue;                        // 2^-100: d = 0, q = 0
+        const float amax = bits2f(m);
         d[b] = amax / 127.0f;
-        const float id = amax != 0 ? 127.0f / amax : 0.0f;
+        const float id = 127.0f / amax;
         for (int j = 0; j < 32; ++j) {
-            const float t = x[b * 32 + j] * id;
+            volatile float t = x[b * 32 + j] * id;
             q[(size_t) b * 32 + j] = (int8_t) std::clamp((int) std::nearbyintf(t), -127, 127);   // ties to even (FE_TONEAREST)
         }
     }
@@ -872,6 +898,213 @@ void test_accumulate(Rng& rng) {
     }
 }
 
+
+// ---- 9. the quantiser rule on the special blocks ---------------------------------------------------------------------------------
+// Expected BYTES written by hand (not computed by any quantiser): d as a bit pattern, q in natural order.
+struct EdgeBlock {
+    const char* what;
+    float x[32];
+    uint32_t d_bits;
+    int8_t q[32];
+};
+
+void test_quantiser_rule(Rng& rng) {
+    std::printf("[9] quantiser rule (CONTRACTS.md): special blocks, hand-written expectations + random bit patterns, all ISAs\n");
+    const float tiny = 1e-37f, inf = INFINITY, qnan = bits2f(0x7FC00000u), nnan = bits2f(0xFFC00000u), snan = bits2f(0x7FA00000u);
+    std::vector<EdgeBlock> edges;
+    auto add = [&](const char* what, std::initializer_list<float> head, float fill, uint32_t d_bits, std::initializer_list<int> qhead) {
+        EdgeBlock e{};
+        e.what = what;
+        for (int j = 0; j < 32; ++j) e.x[j] = fill;
+        int j = 0;
+        for (float v : head) e.x[j++] = v;
+        e.d_bits = d_bits;
+        j = 0;
+        for (int v : qhead) e.q[j++] = (int8_t) v;
+        edges.push_back(e);
+    };
+    // all-zero, -0.0: d = 0, q = 0
+    add("all zero", {}, 0.0f, 0u, {});
+    add("all -0.0", {}, -0.0f, 0u, {});
+    // 1e-37 everywhere (127 / 1e-37 overflows FP32: the old scalar code produced -127, the SIMD code -128): d = 0, q = 0
+    add("1e-37 everywhere", {}, tiny, 0u, {});
+    add("-1e-37 everywhere", {}, -tiny, 0u, {});
+    add("denormals", {1e-40f, -3e-39f, 1e-45f}, 0.0f, 0u, {});
+    // the 2^-100 boundary: below it d = 0, q = 0; at it an ordinary block (amax = 2^-100: id = 127 * 2^100, d = 2^-100 / 127)
+    add("just below 2^-100", {bits2f(0x0D7FFFFFu), -bits2f(0x0D7FFFFFu)}, 0.0f, 0u, {});
+    {
+        const float a = bits2f(0x0D800000u);
+        const float d = a / 127.0f;
+        add("exactly 2^-100", {a, -a, a * 0.5f}, 0.0f, f2bits(d), {127, -127, 64});    // x * id = 63.5 -> ties to even = 64
+    }
+    // ties: [254, 5, 1, -5, 0 ...]: amax = 254, id = 0.5, d = 2: 127, 2.5 -> 2, 0.5 -> 0, -2.5 -> -2 (ties AWAY from zero would give 3, 1, -3)
+    add("ties to even", {254.0f, 5.0f, 1.0f, -5.0f}, 0.0f, f2bits(2.0f), {127, 2, 0, -2});
+    add("ties to even, odd side", {254.0f, 3.0f, -3.0f, 7.0f, -1.0f, 9.0f}, 0.0f, f2bits(2.0f), {127, 2, -2, 4, 0, 4});   // 1.5 -> 2, 3.5 -> 4, 0.5 -> 0, 4.5 -> 4
+    // non-finite: d = the canonical NaN 0x7FC00000, every q = 0 - wherever the Inf / NaN sits and whatever else is in the block
+    add("NaN first", {qnan, 1.0f, 2.0f}, 0.5f, 0x7FC00000u, {});
+    add("Inf first", {inf, 1.0f, 2.0f}, 0.5f, 0x7FC00000u, {});
+    add("-Inf", {-inf}, 1.0f, 0x7FC00000u, {});
+    add("negative NaN", {nnan}, 1.0f, 0x7FC00000u, {});
+    add("signalling NaN", {snan}, 1.0f, 0x7FC00000u, {});
+    add("NaN and Inf", {qnan, inf, -inf}, 3.0f, 0x7FC00000u, {});
+    for (int pos : {1, 7, 8, 15, 16, 24, 31}) {
+        EdgeBlock e{};
+        e.what = "NaN at one position";
+        for (int j = 0; j < 32; ++j) e.x[j] = (float) (j - 15) * 3.0f;
+        e.x[pos] = qnan;
+        e.d_bits = 0x7FC00000u;
+        edges.push_back(e);
+        EdgeBlock f = e;
+        f.what = "Inf at one position";
+        f.x[pos] = (pos & 1) ? inf : -inf;
+        edges.push_back(f);
+    }
+    // an overflowing-but-finite block: amax = FLT_MAX: finite, d = amax / 127, id = 127 / amax
+    {
+        const float big = 3.4028234663852886e38f;
+        add("FLT_MAX", {big, -big, big * 0.25f}, 0.0f, f2bits(big / 127.0f), {127, -127, 32});   // 31.75 +- 4e-6: no tie
+    }
+    std::vector<float> x(kHidden, 0.0f);
+    std::vector<int8_t> rq, got((size_t) kHidden);
+    std::vector<float> rd;
+    // the hand-written expectations against the reference quantiser AND every ISA, 4 blocks (one group) at a time
+    for (size_t i0 = 0; i0 < edges.size(); i0 += 4) {
+        for (int b = 0; b < 4; ++b)
+            for (int j = 0; j < 32; ++j) x[b * 32 + j] = (i0 + b < edges.size()) ? edges[i0 + b].x[j] : 0.0f;
+        ref_quantize(x.data(), 128, rq, rd);
+        for (int b = 0; b < 4 && i0 + b < edges.size(); ++b) {
+            const EdgeBlock& e = edges[i0 + b];
+            bool ok = f2bits(rd[b]) == e.d_bits;
+            for (int j = 0; j < 32; ++j) ok = ok && rq[b * 32 + j] == e.q[j];
+            CHECK(ok, "the independent reference disagrees with the hand-written bytes of '%s': d %08x want %08x", e.what, f2bits(rd[b]), e.d_bits);
+        }
+        for (Isa isa : all_isas()) {
+            static ActQ a;
+            std::memset(&a, 0xAB, sizeof a);
+            quantize_act(x.data(), 128, a, isa);
+            act_unpack(a, 128, got.data());
+            for (int b = 0; b < 4 && i0 + b < edges.size(); ++b) {
+                const EdgeBlock& e = edges[i0 + b];
+                bool ok = f2bits(a.scale[b]) == e.d_bits;
+                for (int j = 0; j < 32; ++j) ok = ok && got[b * 32 + j] == e.q[j];
+                // sc4 repeats d over the lane's four lanes; corr = -12 * (sum of the lane's q), 0 for the special blocks
+                for (int l = 0; l < 4; ++l) ok = ok && f2bits(a.sc4[(b / 4) * 16 + (b % 4) * 4 + l]) == e.d_bits;
+                CHECK(ok, "%s: block '%s': d %08x (want %08x), q[0..3] = %d %d %d %d", isa_name(isa), e.what, f2bits(a.scale[b]), e.d_bits,
+                      got[b * 32], got[b * 32 + 1], got[b * 32 + 2], got[b * 32 + 3]);
+            }
+        }
+    }
+    // random BIT PATTERNS (NaN, Inf, denormals, tiny, huge in the same blocks), scaled mixtures: every ISA == the reference, byte for byte
+    const int reps = g_quick ? 20 : 120;
+    for (int rep = 0; rep < reps; ++rep) {
+        for (int b = 0; b < kHidden / 32; ++b) {
+            const int kind = rng.range(0, 5);
+            for (int j = 0; j < 32; ++j) {
+                float v;
+                switch (kind) {
+                    case 0: v = bits2f(rng.u32()); break;                                                                 // any bit pattern
+                    case 1: v = rng.normal() * std::ldexp(1.0f, rng.range(-140, 100)); break;                              // all magnitudes, 2^-100 included
+                    case 2: v = (rng.range(0, 40) == 0) ? bits2f(0x7F800000u | (rng.u32() & 0x807FFFFFu)) : rng.normal(); break;   // rare Inf / NaN
+                    case 3: v = (float) rng.range(-300, 300) * 0.5f; break;                                                // integer and half-integer ties
+                    case 4: v = rng.normal() * std::ldexp(1.0f, -100) * (1.0f + 1e-3f * (float) rng.range(-5, 5)); break;  // straddling 2^-100
+                    default: v = rng.normal(); break;
+                }
+                x[(size_t) b * 32 + j] = v;
+            }
+        }
+        // block 0 is pinned: all tiny (amax 1.6e-36 < 2^-100: d = 0, q = 0)
+        for (int j = 0; j < 32; ++j) x[j] = tiny * (float) (j - 15);
+        ref_quantize(x.data(), kHidden, rq, rd);
+        static ActQ a;
+        for (Isa isa : all_isas()) {
+            std::memset(&a, 0xAB, sizeof a);
+            quantize_act(x.data(), kHidden, a, isa);
+            act_unpack(a, kHidden, got.data());
+            long bad = 0;
+            for (int i = 0; i < kHidden; ++i) bad += got[i] != rq[i];
+            for (int b = 0; b < kHidden / 32; ++b) bad += std::memcmp(&a.scale[b], &rd[b], 4) != 0;
+            CHECK(bad == 0, "%s: random bit patterns, rep %d: %ld differing bytes against the reference", isa_name(isa), rep, bad);
+        }
+    }
+}
+
+// ---- 10. NaN through the SwiGLU clamps -------------------------------------------------------------------------------------------
+// A weight row whose block 0 holds the code 0 (value 0) or the code 7 (+12) in every position, and an activation whose block-0 scale is +Inf:
+//   zero row:  s = 2^(e-128) * Inf = Inf, isum = 0   ->  Inf * 0 = NaN        (the row's sum is NaN)
+//   +12 row:   isum = 12 * 32 * q > 0               ->  +Inf                  (the row's sum is +Inf, which the clamps turn into 10)
+// so "gate rows zero, up rows +12" gives g = NaN and u = +Inf -> 10 (a finite u), and "gate +12, up zero" gives g = +Inf -> 10 and u = NaN.
+// h must be NaN either way: if a clamp returned its constant for a NaN (fminf / minps with the constant first), h would be finite and so would y.
+void test_nan_through_clamps(Rng& rng) {
+    std::printf("[10] NaN propagates through the SwiGLU clamps (g only, u only, x), every ISA\n");
+    const int hidden = 128, ff = 128, T = 2;
+    for (int variant = 0; variant < 3; ++variant) {          // 0: NaN in g, 1: NaN in u, 2: NaN in x
+        Expert ex = make_tiny_expert(rng, hidden, ff, EMode::kRealistic, 118, 121);
+        const size_t rb = (size_t) (hidden / 32) * kBlockBytes;
+        uint8_t* gate = const_cast<uint8_t*>(ex.v.gate);
+        uint8_t* up = const_cast<uint8_t*>(ex.v.up);
+        for (int r = 0; r < ff; ++r) {
+            std::memset(gate + (size_t) r * rb + 1, variant == 0 ? 0x00 : 0x77, 16);
+            std::memset(up + (size_t) r * rb + 1, variant == 1 ? 0x00 : 0x77, 16);
+            gate[(size_t) r * rb] = up[(size_t) r * rb] = 120;
+        }
+        std::vector<float> w = {1.0f, 1.0f};
+        for (Isa isa : all_isas()) {
+            static ActQ xq[2];
+            static ExpertScratch s;
+            std::vector<float> y((size_t) T * hidden, 0.f);
+            if (variant < 2) {
+                std::vector<int8_t> q(hidden, 1);
+                std::vector<float> sc = {0.01f, 0.01f, 0.01f, 0.01f};
+                act_from_q8(q.data(), sc.data(), hidden, xq[0]);                 // token 0: the control (finite)
+                sc[0] = INFINITY;
+                act_from_q8(q.data(), sc.data(), hidden, xq[1]);                 // token 1: block-0 scale +Inf
+            } else {
+                std::vector<float> x((size_t) T * hidden, 0.5f);
+                x[(size_t) hidden + 77] = bits2f(0x7FC00000u);                     // token 1 holds one NaN (token 0 is the control)
+                quantize_acts(x.data(), hidden, T, xq, isa);
+            }
+            expert_run(isa, ex.v, xq, T, w.data(), s, y.data());
+            int nan0 = 0, nan1 = 0;
+            for (int r = 0; r < hidden; ++r) {
+                nan0 += std::isnan(y[r]);
+                nan1 += std::isnan(y[(size_t) hidden + r]);
+            }
+            CHECK(nan0 == 0, "%s variant %d: the control token's y has %d NaNs", isa_name(isa), variant, nan0);
+            CHECK(nan1 == hidden, "%s variant %d: only %d of %d y elements are NaN (a NaN was clamped away)", isa_name(isa), variant, nan1, hidden);
+        }
+    }
+}
+
+// ---- 11. one y per socket --------------------------------------------------------------------------------------------------------
+void test_socket_partials(Rng& rng) {
+    std::printf("[11] the two halves run concurrently, each into its own partial y_k: y_0 + y_1 == the sequential accumulation\n");
+    BigExpert be(rng, 117, 122);
+    for (Isa isa : all_isas()) {
+        for (int T : {1, 3}) {
+            std::vector<float> x((size_t) T * kHidden), w((size_t) T);
+            for (auto& v : x) v = rng.normal();
+            for (auto& v : w) v = rng.uniform(0.3f, 1.8f);
+            static ActQ xq[kMaxTokens];
+            static ExpertScratch s_seq, s0, s1;
+            quantize_acts(x.data(), kHidden, T, xq, isa);
+            std::vector<float> seq((size_t) T * kHidden, 0.f), y0 = seq, y1 = seq;
+            expert_run(isa, view_cpu_half(be.half0.data()), xq, T, w.data(), s_seq, seq.data());     // one buffer, one half after the other: fine
+            expert_run(isa, view_cpu_half(be.half1.data()), xq, T, w.data(), s_seq, seq.data());
+            for (int rep = 0; rep < (g_quick ? 2 : 6); ++rep) {                                      // two "sockets" at once, a partial each
+                std::fill(y0.begin(), y0.end(), 0.f);
+                std::fill(y1.begin(), y1.end(), 0.f);
+                std::thread t0([&] { expert_run(isa, view_cpu_half(be.half0.data()), xq, T, w.data(), s0, y0.data()); });
+                std::thread t1([&] { expert_run(isa, view_cpu_half(be.half1.data()), xq, T, w.data(), s1, y1.data()); });
+                t0.join();
+                t1.join();
+                bool same = true;
+                for (size_t i = 0; i < seq.size(); ++i) same = same && (y0[i] + y1[i]) == seq[i];
+                CHECK(same, "%s T=%d rep %d: y_0 + y_1 != the sequential accumulation", isa_name(isa), T, rep);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -908,6 +1141,9 @@ int main(int argc, char** argv) {
     test_halves(rng);
     test_threads(rng);
     test_accumulate(rng);
+    test_quantiser_rule(rng);
+    test_nan_through_clamps(rng);
+    test_socket_partials(rng);
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (!isa_supported(Isa::kAvx512)) std::printf("NOTE: AVX-512 was NOT tested (CPU lacks it): run --require-avx512 on the target box\n");
     if (!isa_supported(Isa::kAvx2)) std::printf("NOTE: AVX2 was NOT tested (CPU lacks it)\n");

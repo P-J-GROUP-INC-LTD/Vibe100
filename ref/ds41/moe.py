@@ -62,6 +62,8 @@ def expert(x: np.ndarray, w1: np.ndarray, w3: np.ndarray, w2: np.ndarray, *, swi
     quantises the input of all three GEMMs).
 
         g = W1 x;  u = W3 x;   u = clamp(u, -L, L);  g = min(g, L)          (L = swiglu_limit = 10, only if > 0)
+                                                                          NaN PROPAGATES through both (np.clip / np.minimum do, as
+                                                                          torch.clamp does; np.fmin / np.fmax would return L: don't)
         h = silu(g) * u;       h = w * h        <- routing weight BEFORE the down projection
         y = W2 h                                  (fp32 out)
     `weights` [n] is the routing weight (None for the shared expert)."""

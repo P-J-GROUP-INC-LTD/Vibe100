@@ -33,6 +33,9 @@
 // (see mxfp4_internal.hpp).  On the dev VM a distance of 6-12 KB lifted one-core streaming from 7.6 GB/s (1 KB) to ~10
 // (none: 6): a core's own line-fill buffers, not the DRAM, are what limits a single stream.  The distance is a
 // run-time knob (set_prefetch_bytes) because the Xeon will want its own value; the benchmark's --sweep-pf finds it.
+//
+// Attribution: the activation quantiser at the end follows ggml's x86 SIMD quantize_row_q8_0 (ggml-cpu/arch/x86/quants.c) - llama.cpp, MIT License,
+// Copyright (c) 2023-2026 The ggml authors (notice: src/ds41/cuda/ds41_math.cuh, third_party/ggml/LICENSE).
 #include "mxfp4_internal.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -198,16 +201,22 @@ void dot_rows_avx512(const uint8_t* w, size_t stride, int ng, int nrows, const A
     }
 }
 
-// 32 floats -> block `blk` of `a`, bit-identical to quantize_block_scalar (same FP32 operations, same rounding).
+// 32 floats -> block `blk` of `a`, bit-identical to quantize_block_scalar (same FP32 operations, same rounding; the rule: quant_scale() in
+// mxfp4_internal.hpp).  The largest magnitude is the INTEGER maximum of the magnitude bits (order-independent with NaN operands); the scale
+// and the Inf / NaN / tiny cases come from the shared scalar quant_scale(); the codes are vcvtps2dq (round half to EVEN, the default MXCSR
+// mode) of x * (127 / amax), and vpmovsdb saturates at -128..127, never reached: |x * id| <= 127 (1 + 2^-23) for a finite, non-tiny block.
 void quantize_block_avx512(const float* x, ActQ& a, int blk) {
     const __m512 v0 = _mm512_loadu_ps(x), v1 = _mm512_loadu_ps(x + 16);
-    const float amax = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_abs_ps(v0), _mm512_abs_ps(v1)));
-    const float d = amax / 127.0f;
-    const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
-    const __m512 vid = _mm512_set1_ps(id);
-    // vcvtps2dq rounds to nearest even (MXCSR default); vpmovsdb saturates to int8 (never reached: |x * id| <= 127.0000x)
-    const __m128i lo = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(v0, vid)));
-    const __m128i hi = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(v1, vid)));
+    const __m512i magmask = _mm512_set1_epi32(0x7FFFFFFF);
+    const __m512i mag = _mm512_max_epu32(_mm512_and_si512(_mm512_castps_si512(v0), magmask), _mm512_and_si512(_mm512_castps_si512(v1), magmask));
+    const QuantScale qs = quant_scale(_mm512_reduce_max_epu32(mag));
+    const float d = qs.d;
+    __m128i lo = _mm_setzero_si128(), hi = _mm_setzero_si128();      // every q = 0 for an all-zero / tiny / non-finite block
+    if (!qs.zero) {
+        const __m512 vid = _mm512_set1_ps(qs.id);
+        lo = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(v0, vid)));
+        hi = _mm512_cvtsepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(v1, vid)));
+    }
     const int g = blk >> 2, k = blk & 3;
     _mm_storeu_si128((__m128i*) (a.q + g * kGroupValues + k * 16), lo);
     _mm_storeu_si128((__m128i*) (a.q + g * kGroupValues + 64 + k * 16), hi);

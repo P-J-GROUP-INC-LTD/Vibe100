@@ -20,29 +20,41 @@ else()
                               "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mfma;-mf16c")
 endif()
 
+# BUILD HYGIENE (audit A3-8).  The benchmark, the test and the ggml cross-check are test programs: like the project's other tests they are
+# part of `all` only when the build asks for tests (STRATA_BUILD_TESTS=ON) and EXCLUDE_FROM_ALL otherwise - but they are always DEFINED, so
+#     cmake --build <dir> --target ds41_cpu_mxfp4_test ds41_cpu_mxfp4_bench ds41_cpu_mxfp4_ggml_xcheck
+# works on any configuration (the xcheck needs the ggml targets of the top level, i.e. STRATA_NATIVE_EXPERTS=ON).  ctest registers them only
+# with STRATA_BUILD_TESTS.  The library stays in `all`.
+set(_ds41c_all EXCLUDE_FROM_ALL)
 if(STRATA_BUILD_TESTS)
-  # the benchmark: GB/s of expert weights consumed vs the plain-read ceiling (a program, not a test; run it by hand)
-  add_executable(ds41_cpu_mxfp4_bench ${_ds41c_src}/mxfp4_expert_bench.cpp)
-  target_link_libraries(ds41_cpu_mxfp4_bench PRIVATE strata_ds41_cpu)
-  if(MSVC)
-    set_source_files_properties(${_ds41c_src}/mxfp4_expert_bench.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-  else()
-    # the bench's read-bandwidth probe uses zmm loads (it checks CPUID itself before running)
-    set_source_files_properties(${_ds41c_src}/mxfp4_expert_bench.cpp PROPERTIES COMPILE_OPTIONS
-                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq")
-  endif()
+  set(_ds41c_all "")
+endif()
 
-  add_executable(ds41_cpu_mxfp4_test ${_ds41c_src}/mxfp4_expert_test.cpp)
-  target_link_libraries(ds41_cpu_mxfp4_test PRIVATE strata_ds41_cpu)
+# the benchmark: GB/s of expert weights consumed vs the plain-read ceiling (a program, not a test; run it by hand)
+add_executable(ds41_cpu_mxfp4_bench ${_ds41c_all} ${_ds41c_src}/mxfp4_expert_bench.cpp)
+target_link_libraries(ds41_cpu_mxfp4_bench PRIVATE strata_ds41_cpu)
+if(MSVC)
+  set_source_files_properties(${_ds41c_src}/mxfp4_expert_bench.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+else()
+  # the bench's read-bandwidth probe uses zmm loads (it checks CPUID itself before running)
+  set_source_files_properties(${_ds41c_src}/mxfp4_expert_bench.cpp PROPERTIES COMPILE_OPTIONS
+                              "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq")
+endif()
+
+add_executable(ds41_cpu_mxfp4_test ${_ds41c_all} ${_ds41c_src}/mxfp4_expert_test.cpp)
+target_link_libraries(ds41_cpu_mxfp4_test PRIVATE strata_ds41_cpu)
+if(STRATA_BUILD_TESTS)
   # skips an ISA the CPU lacks (and says so); the second registration is the gate for the target Xeon
   add_test(NAME ds41_cpu_mxfp4_test COMMAND ds41_cpu_mxfp4_test)
   add_test(NAME ds41_cpu_mxfp4_test_require_avx512 COMMAND ds41_cpu_mxfp4_test --quick --require-avx512 --require-avx2)
   set_tests_properties(ds41_cpu_mxfp4_test ds41_cpu_mxfp4_test_require_avx512 PROPERTIES TIMEOUT 600)
+endif()
 
-  # MXFP4 semantics against ggml itself (to_float and the CPU vec_dot for MXFP4 x Q8_0), when ggml is part of the build
-  if(TARGET ggml-cpu AND TARGET ggml-base)
-    add_executable(ds41_cpu_mxfp4_ggml_xcheck ${_ds41c_src}/mxfp4_ggml_xcheck.cpp)
-    target_link_libraries(ds41_cpu_mxfp4_ggml_xcheck PRIVATE strata_ds41_cpu ggml-cpu ggml-base)
+# MXFP4 semantics against ggml itself (to_float and the CPU vec_dot for MXFP4 x Q8_0), when ggml is part of the build
+if(TARGET ggml-cpu AND TARGET ggml-base)
+  add_executable(ds41_cpu_mxfp4_ggml_xcheck ${_ds41c_all} ${_ds41c_src}/mxfp4_ggml_xcheck.cpp)
+  target_link_libraries(ds41_cpu_mxfp4_ggml_xcheck PRIVATE strata_ds41_cpu ggml-cpu ggml-base)
+  if(STRATA_BUILD_TESTS)
     add_test(NAME ds41_cpu_mxfp4_ggml_xcheck COMMAND ds41_cpu_mxfp4_ggml_xcheck)
     set_tests_properties(ds41_cpu_mxfp4_ggml_xcheck PROPERTIES TIMEOUT 300)
   endif()

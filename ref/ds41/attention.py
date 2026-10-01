@@ -14,9 +14,11 @@ state, and the cross-layer hand-off of compressed KV, index-K, top-k indices and
 
 Known reference quirk (flag `stale_index_k`): model.py:560 reads `shared_attn.index_k`, which an index-K *owner* layer
 only refreshes when its own group completed (`latent is not None`, line 548-549).  On ratio-2 decode steps where the
-group is still incomplete, layers 2/8/14 therefore score against the previous owner's cache (layer 20's, a different
-ratio) instead of their own.  The default here is the intended behaviour (own cache); `stale_index_k=True` reproduces
-the reference exactly so that the tiny-model test can match it bit for bit.  See README "Known deviations".
+group is still incomplete, the ratio-2 owners 2/8/14 therefore score against the previous owner's cache (layer 20's, a
+different ratio) instead of their own - and the Reuse layers 3-7, 9-13, 15-19 take their owner's top-k, so all 18 ratio-2
+layers are affected.  DECIDED (docs/deepseek/CONTRACTS.md, 2026-10-01): the port follows the intent (own cache), which is
+the default here; `stale_index_k=True` reproduces the shipped reference exactly so that the tiny-model test can match it
+bit for bit.  See README "Known deviations".
 """
 from __future__ import annotations
 

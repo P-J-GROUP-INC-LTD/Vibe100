@@ -24,6 +24,8 @@ inline void cuda_check(cudaError_t e, const char* what) {
 struct CudaDev : Dev {
     cudaStream_t s = nullptr;
     CudaDev() {
+        cudaSetDeviceFlags(cudaDeviceMapHost);       // mapped pinned memory for the host records (a no-op under UVA; its error, if the device is already active, is not one)
+        (void) cudaGetLastError();
         cuda_check(cudaSetDevice(0), "cudaSetDevice");
         cuda_check(cudaStreamCreate(&s), "cudaStreamCreate");
     }
@@ -34,6 +36,21 @@ struct CudaDev : Dev {
         return p;
     }
     void release(void* p) override { cudaFree(p); }
+    // mapped pinned host memory: the host reads it while the kernels run.  Under UVA (64-bit Linux / Windows with WDDM2 or TCC) the host pointer
+    // IS the device pointer; anything else cannot be used as a kernel argument here, so it is refused.
+    void* alloc_mapped(size_t bytes) override {
+        void* p = nullptr;
+        cuda_check(cudaHostAlloc(&p, bytes ? bytes : 16, cudaHostAllocMapped), "cudaHostAlloc(mapped)");
+        std::memset(p, 0, bytes ? bytes : 16);
+        void* dp = nullptr;
+        cuda_check(cudaHostGetDevicePointer(&dp, p, 0), "cudaHostGetDevicePointer");
+        if (dp != p) {
+            std::fprintf(stderr, "FAIL cuda: the device pointer of mapped host memory differs from the host pointer (no unified addressing): not supported by these programs\n");
+            std::exit(2);
+        }
+        return p;
+    }
+    void release_mapped(void* p) override { cudaFreeHost(p); }
     void h2d(void* dst, const void* src, size_t n) override { cuda_check(cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, s), "h2d"); cuda_check(cudaStreamSynchronize(s), "h2d sync"); }
     void d2h(void* dst, const void* src, size_t n) override { cuda_check(cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToHost, s), "d2h"); cuda_check(cudaStreamSynchronize(s), "d2h sync"); }
     void fill(void* p, int byte, size_t n) override { cuda_check(cudaMemsetAsync(p, byte, n, s), "memset"); }

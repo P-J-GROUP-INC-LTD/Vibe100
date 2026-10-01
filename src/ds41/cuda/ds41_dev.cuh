@@ -6,8 +6,11 @@
 // kernel bodies use only these names for intrinsics.
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(DS41_EMU)
@@ -16,7 +19,12 @@
 #define DS41_HD
 #define DS41_FI inline
 #define DS41_LAUNCH_BOUNDS(...)
+// static __shared__ arrays: statics in the named section ds41_smem, which the emulator fills with 0xFF at the start of every block (ds41_emu.hpp)
+#if defined(__GNUC__) && defined(__linux__)
+#define DS41_SHARED static __attribute__((section("ds41_smem")))
+#else
 #define DS41_SHARED static
+#endif
 #define DS41_UNROLL
 #define DS41_UNROLL1
 #define DS41_RESTRICT __restrict__
@@ -116,9 +124,14 @@ DS41_FI float fdiv_rn(float a, float b) {
     return __fdiv_rn(a, b);
 #endif
 }
-/// float -> int, round to nearest EVEN (cvt.rni), the CPU's lrintf in the default rounding mode.
+/// float -> int, round to nearest EVEN (cvt.rni.s32.f32), the CPU's lrintf in the default rounding mode.  NaN -> 0 and out-of-range values
+/// SATURATE to INT_MIN / INT_MAX on the device; the emulator does the same (a bare lrintf of a NaN is undefined / INT_MIN on the host,
+/// which would make the emulator disagree with the hardware).  The quantiser does not rely on either: it never converts a non-finite value.
 DS41_FI int f2i_rn(float a) {
 #if defined(DS41_EMU)
+    if (a != a) return 0;
+    if (a >= 2147483648.0f) return 2147483647;
+    if (a <= -2147483648.0f) return (int) 0x80000000u;
     return (int) std::lrintf(a);
 #else
     return __float2int_rn(a);
@@ -182,18 +195,51 @@ DS41_FI int popc(uint32_t v) {
     return __popc(v);
 #endif
 }
-DS41_FI void threadfence_system() {
+/// `fence.acq_rel.sys`: orders this thread's earlier writes (and, after a __syncthreads, those of the block it synchronised with: PTX
+/// release patterns are cumulative) before its later ones, at SYSTEM scope - what the host sees through mapped memory.  One thread issues
+/// it, not every thread (the old __threadfence_system() in every thread was fence.sc.sys each).  The emulator runs one thread of execution:
+/// a C++ fence.
+DS41_FI void fence_acq_rel_sys() {
 #if defined(DS41_EMU)
+    std::atomic_thread_fence(std::memory_order_acq_rel);
 #else
-    __threadfence_system();
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
 #endif
 }
+/// `st.release.sys.global.u32`: a 32-bit store with RELEASE semantics at system scope - every write the storing thread (and the block
+/// it synchronised with) made before it is visible to a host thread that reads the value with an acquire load.  The doorbell of a
+/// host-visible record (sm_70+: the .release qualifier needs PTX 6.0 / Volta).  In the emulator: a plain store behind a release fence.
+DS41_FI void store_release_sys(uint32_t* p, uint32_t v) {
+#if defined(DS41_EMU)
+    std::atomic_thread_fence(std::memory_order_release);
+    *reinterpret_cast<volatile uint32_t*>(p) = v;
+#else
+    asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(__cvta_generic_to_global(p)), "r"(v) : "memory");
+#endif
+}
+
+// ---- alignment (emulator only) ----------------------------------------------------------------------------------------
+// A vector load or store (ld.global.v4 / ld.shared.v2 ...) whose address is not a multiple of its size FAULTS on the hardware
+// ("misaligned address"); the host memcpy the emulator would otherwise use accepts it silently.  Every vector access in the kernels
+// goes through ldg* below or through DS41_ASSERT_ALIGNED, and the emulator aborts with the address instead.
+#if defined(DS41_EMU)
+inline void emu_check_align(const void* p, unsigned bytes, const char* what) {
+    if (reinterpret_cast<uintptr_t>(p) % bytes != 0) {
+        std::fprintf(stderr, "ds41_emu: MISALIGNED %u-byte %s at %p (it faults on a GPU)\n", bytes, what, p);
+        std::abort();
+    }
+}
+#define DS41_ASSERT_ALIGNED(p, bytes) ::strata::ds41::cuda::dev::emu_check_align((p), (bytes), "vector access")
+#else
+#define DS41_ASSERT_ALIGNED(p, bytes) ((void) 0)
+#endif
 
 // ---- global loads -----------------------------------------------------------------------------------------------------
 // Read-only data (weights, activations, tables): the non-coherent path.  The blob bytes are never written while a kernel
 // that reads them runs (the caller orders cache fills on the same stream).
 DS41_FI uint4 ldg4(const void* p) {
 #if defined(DS41_EMU)
+    emu_check_align(p, 16, "ldg4 (LDG.E.128)");
     uint4 v;
     std::memcpy(&v, p, 16);
     return v;
@@ -203,6 +249,7 @@ DS41_FI uint4 ldg4(const void* p) {
 }
 DS41_FI uint2 ldg2(const void* p) {
 #if defined(DS41_EMU)
+    emu_check_align(p, 8, "ldg2 (LDG.E.64)");
     uint2 v;
     std::memcpy(&v, p, 8);
     return v;
@@ -212,6 +259,7 @@ DS41_FI uint2 ldg2(const void* p) {
 }
 DS41_FI float4 ldgf4(const void* p) {
 #if defined(DS41_EMU)
+    emu_check_align(p, 16, "ldgf4 (LDG.E.128)");
     float4 v;
     std::memcpy(&v, p, 16);
     return v;
@@ -221,6 +269,7 @@ DS41_FI float4 ldgf4(const void* p) {
 }
 DS41_FI float ldgf(const void* p) {
 #if defined(DS41_EMU)
+    emu_check_align(p, 4, "ldgf (LDG.E.32)");
     return *reinterpret_cast<const float*>(p);
 #else
     return __ldg(reinterpret_cast<const float*>(p));

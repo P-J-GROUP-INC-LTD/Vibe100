@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """make_mini_gguf.py - write a tiny `deepseek41`-shaped GGUF (split into shards) as a test fixture and oracle input.
 
-    python3 tools/ds41/make_mini_gguf.py /tmp/mini --seed 0 --shards 3
+    python3 tools/ds41/make_mini_gguf.py /tmp/mini --seed 0 --n-shards 3
     python3 tools/ds41/manifest.py /tmp/mini --geometry self --no-plan
 
 What it is: the same tensor NAMES, ggml TYPES (MXFP4 experts and Engram tables, Q8_0 attention / shared experts /
 indexer q / Engram wkv, BF16 router / embeddings / compressors, F32 norms / sinks / mHC) and metadata KEYS as
 mxxm-t/DeepSeek-V4.1-Flash-GGUF, with small dimensions.  With the defaults:
 
-    hidden 256, 8 layers, 16 experts top-2, expert FF 64, 4 heads x 64, q_lora 64, 2 output groups x 32,
+    hidden 256, 8 layers, 16 experts top-2, expert FF 256, 4 heads x 64, q_lora 64, 2 output groups x 32,
     indexer 4 heads x 32, hc 4, Engram 2 tables (layers 1 and 3), 2 heads x 64 values per row, vocab 512
     layer modes  L0 L1 SWA | L2 Full (ratio 2, own compressor + gate + indexer) | L3 Reuse |
                  L4 Full (ratio 1, candidate source) | L5 Reuse | L6 Reindex | L7 Reuse
@@ -16,7 +16,9 @@ mxxm-t/DeepSeek-V4.1-Flash-GGUF, with small dimensions.  With the defaults:
 Everything is deterministic from --seed: every tensor draws from its own generator seeded with (seed, crc32(name)).
 Weights are quantised with the encoders of ggml_codecs.py, which are bit-identical to GGML's C reference.
 
-Constraints (checked): every Q8_0 / MXFP4 row length is a multiple of 32, and the expert FF is a multiple of 64 so the
+Constraints (checked): every Q8_0 / MXFP4 row length is a multiple of 32; the hidden size is a multiple of 128 and the expert FF
+a multiple of 256, which is what the C++ CPU kernels need (strata::ds41::cpu check_view: a CPU half has FF / 2 = a multiple of 128 rows,
+four 32-blocks per kernel group) - so with the defaults the file also runs through them at its own, runtime, dimensions - and the
 CPU halves of CONTRACTS.md fall on MXFP4 block boundaries.
 
 NOTE for kernel authors: the real model's geometry is a compile-time contract (include/strata/ds41/geometry.hpp:
@@ -48,7 +50,7 @@ class MiniConfig:
     n_layer: int = 8
     n_expert: int = 16
     n_used: int = 2
-    ff: int = 64
+    ff: int = 256
     n_head: int = 4
     head_dim: int = 64
     rope_dim: int = 16
@@ -105,8 +107,11 @@ class MiniConfig:
                 errs.append(f"{name} = {v} must be a multiple of 32 (Q8_0 / MXFP4 rows)")
 
         mult32("hidden", self.hidden)
-        if self.ff % 64:
-            errs.append(f"ff = {self.ff} must be a multiple of 64 (a half = a whole number of MXFP4 blocks)")
+        if self.hidden % 128:
+            errs.append(f"hidden = {self.hidden} must be a multiple of 128 (four MXFP4 blocks per kernel group: the C++ CPU kernels' check_view)")
+        if self.ff % 256:
+            errs.append(f"ff = {self.ff} must be a multiple of 256 (a CPU half is FF / 2 rows and must be a whole number of 4-block kernel groups: "
+                        "the C++ CPU kernels' check_view; the CONTRACTS.md halves alone would need only 64)")
         mult32("q_lora", self.q_lora)
         mult32("n_head * head_dim / o_groups", self.nq // max(1, self.o_groups))
         if self.nq % self.o_groups:

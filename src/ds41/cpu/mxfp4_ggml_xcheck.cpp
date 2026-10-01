@@ -11,6 +11,10 @@
 //      mxfp4_dot_rows on every ISA, fed the SAME Q8_0 operand: the int8 values of a quantised vector with the scales rounded to
 //      fp16 as Q8_0 stores them.  The integer parts are identical; the FP32 sums are ordered differently, so the tolerance is
 //      1e-5 of the sum of |terms|.  T = 1..8 tokens, ragged row counts, every exponent edge.
+//   3. ggml's own activation quantiser (the Q8_0 `from_float` of the CPU traits = ggml-cpu/arch/x86/quants.c quantize_row_q8_0, the x86 SIMD one) against
+//      quantize_act of this library: CONTRACTS.md "Activations" says our rule IS that code with an FP32 d, so for every finite block above 2^-100 the
+//      int8 values must be identical and ggml's fp16 scale must be our FP32 scale rounded to fp16.  (Below 2^-100 and for Inf / NaN blocks the
+//      contract pins its own results - d = 0, q = 0 / d = NaN, q = 0 - where ggml's SIMD code produces INT_MIN-saturated garbage: not compared.)
 //
 // Needs the ggml-cpu target (the top-level build has it unless STRATA_NATIVE_EXPERTS=OFF).
 #include "strata/ds41/cpu/mxfp4_expert.hpp"
@@ -174,6 +178,51 @@ int main() {
         for (int T : {1, 4}) run(8, 6, T, e, xl);
     }
     std::printf("ggml vec_dot (MXFP4 x Q8_0) vs ours: worst |err| / sum|terms| = %.2e (limit 1e-5)\n", worst);
+
+    // ---- 3. the activation quantiser against ggml's quantize_row_q8_0 ----
+    {
+        const ggml_type_traits_cpu* q8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_0);
+        if (!q8 || !q8->from_float) {
+            std::printf("FAIL: ggml has no Q8_0 from_float\n");
+            return 1;
+        }
+        const int nblk = 160, n = nblk * 32;
+        long blocks = 0, bad_q = 0, bad_d = 0;
+        std::normal_distribution<float> nd;
+        std::vector<float> x((size_t) n);
+        std::vector<BlockQ8> g((size_t) nblk);
+        for (int rep = 0; rep < 60; ++rep) {
+            for (int b = 0; b < nblk; ++b) {
+                const int kind = (int) (rng() % 4);
+                const float sc = std::ldexp(1.0f, (int) (rng() % 21) - 10);
+                for (int j = 0; j < 32; ++j) {
+                    float v = nd(rng) * sc;
+                    if (kind == 1) v = (float) ((int) (rng() % 601) - 300) * 0.5f;               // integer / half-integer: rounding ties
+                    if (kind == 2) v = j == 0 ? 254.0f * sc : j == 1 ? 5.0f * sc : j == 2 ? 1.0f * sc : j == 3 ? -5.0f * sc : 0.0f;   // the [254, 5, 1, -5, 0 ...] tie pattern
+                    if (kind == 3) v = (j & 1) ? -3.0f * sc : 3.0f * sc;
+                    x[(size_t) b * 32 + j] = v;
+                }
+            }
+            q8->from_float(x.data(), g.data(), n);
+            static ActQ a[3];
+            std::vector<int8_t> q((size_t) n);
+            int ni = 0;
+            for (Isa isa : {Isa::kScalar, Isa::kAvx2, Isa::kAvx512}) {
+                if (!isa_supported(isa)) continue;
+                ActQ& ai = a[ni++];
+                quantize_act(x.data(), n, ai, isa);
+                act_unpack(ai, n, q.data());
+                for (int b = 0; b < nblk; ++b) {
+                    ++blocks;
+                    bad_q += std::memcmp(&q[(size_t) b * 32], g[b].qs, 32) != 0;
+                    bad_d += ggml_fp32_to_fp16(ai.scale[b]) != g[b].d;
+                }
+            }
+        }
+        CHECK(bad_q == 0 && bad_d == 0, "ggml quantize_row_q8_0 differs from quantize_act: %ld of %ld blocks' int8 values, %ld scales", bad_q, blocks, bad_d);
+        std::printf("ggml quantize_row_q8_0 vs quantize_act (every ISA): %ld blocks, int8 values and fp16-rounded scales identical: %s\n", blocks,
+                    (bad_q == 0 && bad_d == 0) ? "yes" : "NO");
+    }
     std::printf("%s: %d checks, %d failed\n", g_fail ? "FAILED" : "PASSED", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -413,7 +413,7 @@ class MiniFiles(unittest.TestCase):
         path = m["shards"][t["shard"]]["path"]
         import numpy as np
         got = G.read_tensor_f32(path, t["abs_offset"], t["type"], t["dims"])
-        self.assertEqual(got.shape, (16, 64, 256))
+        self.assertEqual(got.shape, (16, 256, 256))
         self.assertTrue(np.isfinite(got).all())
         self.assertGreater(float(np.abs(got).max()), 0)
 

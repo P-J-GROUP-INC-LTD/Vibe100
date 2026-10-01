@@ -40,14 +40,14 @@ Spec: `docs/deepseek/RESEARCH.md` (§10 = the target GGUF). Ground truth: the ve
   - `amax` = the largest `|x|` of the block; "non-finite" = the block holds an Inf or a NaN (test the magnitude BITS:
     the integer maximum of `bits & 0x7FFFFFFF` is `>= 0x7F800000` exactly then — order-independent, unlike a float max
     with a NaN operand).
-  - a non-finite block: `d = NaN`, every `q = 0` (the NaN reaches `y`, so a failure upstream is not laundered into a
-    finite value);
+  - a non-finite block: `d = NaN` - the canonical quiet NaN `0x7FC00000`, so the bytes are identical everywhere - every
+    `q = 0` (the NaN reaches `y`, so a failure upstream is not laundered into a finite value);
   - `amax < 2^-100` (zero included — `127 / amax` would overflow below ~3.7e-37): `d = 0`, every `q = 0`;
   - otherwise `d = amax / 127` and `id = 127 / amax` (two FP32 divisions, round-to-nearest), `q = rint(x · id)` (FP32
     product, round half to EVEN), clamped to `[-127, 127]`.
 - **NaN propagates through the clamps** as through `torch.clamp`: `u = u > 10 ? 10 : (u < -10 ? -10 : u)`,
-  `g = g > 10 ? 10 : g` (C `fminf`/`fmaxf` and x86 `minps`/`maxps` with the constant as the first operand return the
-  constant for a NaN — don't).
+  `g = g > 10 ? 10 : g`. Not C99 `fmin`/`fmax`/`fminf` (they drop a NaN operand in either order), and x86 `minps`/`maxps`
+  return their SECOND operand when either is NaN, so only with the variable second do they propagate it.
 
 ## MXFP4 (GGML `block_mxfp4`, 17 bytes per 32 values)
 
@@ -94,8 +94,8 @@ compared against. To revisit if DeepSeek or llama.cpp PR #28696 show their produ
   oracle's int8 mode on the `_ref` rule (`1 / (amax / 127)`, ties away from zero) while the CPU and GPU kernels used
   `127 / amax` and ties-to-even: ±1 code on ~1e-3 of bf16-valued inputs. The oracle follows the kernels.
 - **GPU expert cache slots.** A residency value `r` is a hit only if `0 <= r < n_slots`; the split kernel takes
-  `n_slots` and treats anything else as a miss (so the CPU computes it) and counts it in `SplitCounts` so the caller
-  can assert. A residency table is initialised to -1 (bytes 0xFF), never to 0.
+  `n_slots` and treats anything else as a miss (so the CPU computes it) and counts it in `SplitCounts::n_bad_slots` (unless it is
+  the not-resident marker -1) so the caller can assert. A residency table is initialised to -1 (bytes 0xFF), never to 0.
 - **The host-visible split result is per layer and carries a sequence number.** The expert kernels read
   `n_groups` from DEVICE memory (never from the mapped record: every block would otherwise read it over PCIe); the
   host-visible record (counts + miss list) is one per layer in flight, and its doorbell is a sequence number passed to

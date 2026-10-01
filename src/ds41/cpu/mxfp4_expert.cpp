@@ -3,6 +3,9 @@
 // Read include/strata/ds41/cpu/mxfp4_expert.hpp first; it says what is computed and why it is shaped this way.
 // This file has no ISA flags: the phases, the row ranges, the SwiGLU, the activation layout, CPUID, the scalar
 // reference and the dispatch to the AVX2 / AVX-512 inner loops (mxfp4_avx2.cpp, mxfp4_avx512.cpp).
+//
+// Attribution: e8m0_half() is ggml's ggml_e8m0_to_fp32_half (ggml-impl.h) and the activation quantiser follows ggml's x86 SIMD quantize_row_q8_0
+// (ggml-cpu/arch/x86/quants.c) - llama.cpp, MIT License, Copyright (c) 2023-2026 The ggml authors (notice: src/ds41/cuda/ds41_math.cuh, third_party/ggml/LICENSE).
 #include "strata/ds41/cpu/mxfp4_expert.hpp"
 
 #include "mxfp4_internal.hpp"
@@ -163,18 +166,24 @@ void act_dequant(const ActQ& a, int n, float* out) {
 namespace detail {
 namespace {
 
-// The scalar quantiser: the definition the SIMD ones are bit-identical to.  d = amax / 127 (FP32 division), the
-// codes are round-to-nearest-even of x * (127 / amax) (FP32 multiply, then the FP rounding of cvtps2dq / lrintf), the
-// all-zero block has d = 0 and q = 0.
+// The scalar quantiser: the definition the SIMD ones are bit-identical to (the rule is spelled out at quant_scale() in
+// mxfp4_internal.hpp and in CONTRACTS.md).  The largest magnitude is an integer maximum of the magnitude bits, so a block
+// holding an Inf or a NaN is recognised whatever the order of its elements; d = amax / 127 and the codes are
+// round-half-to-EVEN of x * (127 / amax) (FP32 multiply, then lrintf in the default rounding mode = what vcvtps2dq does);
+// an all-zero / tiny block has d = 0 and q = 0, a non-finite one has d = NaN and q = 0.
 void quantize_block_scalar(const float* x, ActQ& a, int blk) {
-    float amax = 0.0f;
-    for (int j = 0; j < kQK; ++j) amax = std::max(amax, std::fabs(x[j]));
-    const float d = amax / 127.0f;
-    const float id = amax != 0.0f ? 127.0f / amax : 0.0f;
+    uint32_t mbits = 0;
+    for (int j = 0; j < kQK; ++j) {
+        uint32_t b;
+        std::memcpy(&b, x + j, sizeof b);
+        mbits = std::max(mbits, b & 0x7FFFFFFFu);
+    }
+    const QuantScale qs = quant_scale(mbits);
+    const float d = qs.d;
     int8_t qv[kQK];
     for (int j = 0; j < kQK; ++j) {
-        long v = std::lrintf(x[j] * id);
-        qv[j] = (int8_t) std::min(127L, std::max(-127L, v));
+        const float t = x[j] * qs.id;
+        qv[j] = qs.zero ? (int8_t) 0 : (int8_t) std::min(127L, std::max(-127L, std::lrintf(t)));
     }
     const int g = blk >> 2, k = blk & 3;
     for (int j = 0; j < 16; ++j) {
@@ -319,17 +328,22 @@ namespace {
 
 // h = silu(min(g, 10)) * clamp(u, -10, 10) * w.  FP32, expf: ONE definition for all ISAs, so the intermediate differs
 // between them only through g and u (whose FP32 sums differ in the last bits).
+// NaN PROPAGATES through the clamps, as through torch.clamp (CONTRACTS.md): written as the ternaries whose comparison is false for a
+// NaN and so returns the NaN itself (u = u > 10 ? 10 : (u < -10 ? -10 : u), g = g > 10 ? 10 : g).  Not fminf / fmaxf / minps / maxps
+// with the constant first: those return the constant for a NaN operand and would turn a failure upstream into a finite number.
 inline float swiglu_weighted(float g, float u, float w) {
-    g = std::min(g, kSwigluLimit);
-    u = std::min(std::max(u, -kSwigluLimit), kSwigluLimit);
+    g = g > kSwigluLimit ? kSwigluLimit : g;
+    u = u > kSwigluLimit ? kSwigluLimit : (u < -kSwigluLimit ? -kSwigluLimit : u);
     const float s = g / (1.0f + std::exp(-g));
     return (s * u) * w;
 }
 
 void check_view(const ExpertView& v) {
+    // the view's ff is the width of what W2 reads: a CPU HALF has ff = (expert FF) / 2, so the expert FF must be a multiple of 256
+    // for halves (tools/ds41/expert_layout.py and make_mini_gguf.py say the same), of 128 for a whole expert
     if (v.hidden % kGroupValues != 0 || v.ff % kChunkRows != 0 || (v.ff / kQK) % kGroupBlocks != 0 ||
         v.hidden > kActMaxBlocks * kQK || v.ff > kActMaxBlocks * kQK)
-        die("ExpertView: hidden and ff must be multiples of 128 and at most 5120");
+        die("ExpertView: hidden and the view's ff must be multiples of 128 (an expert FF of 256 for a half view) and at most 5120");
 }
 
 }  // namespace

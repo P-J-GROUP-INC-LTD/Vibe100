@@ -17,6 +17,7 @@ more precise than the reference's e4m3 ones, so the difference between the two m
 Everything is NumPy.  Float32 is used wherever kernel.py computes scales in fp32 (the scale arithmetic is done in
 float32 even when the data is float64, so that power-of-two scale choices agree with the GPU kernels).
 """
+# Attribution: the MXFP4 / Q8_0 / E8M0 semantics and the int8 activation rule follow ggml (llama.cpp ggml-quants.c, ggml-impl.h, ggml-cpu/arch/x86/quants.c), MIT License, Copyright (c) 2023-2026 The ggml authors (notice: src/ds41/cuda/ds41_math.cuh, third_party/ggml/LICENSE).
 from __future__ import annotations
 
 import dataclasses
@@ -164,20 +165,52 @@ def fp4_quant_e4m3(x: np.ndarray, block: int = 16) -> np.ndarray:
     return y.reshape(x.shape).astype(x.dtype, copy=False)
 
 
-def act_quant_int8(x: np.ndarray, block: int = 32) -> np.ndarray:
-    """The engine's activation format (docs/deepseek/CONTRACTS.md): int8 per `block` along the last axis with an FP32
-    scale d = max|x| / 127, q = round(x / d) (ties away from zero, as ggml's quantize_row_q8_0_ref `roundf`).
-    Returns the dequantised array q * d.  An all-zero block stays zero."""
+_INT8_INF_BITS = np.uint32(0x7F800000)         # |x| bits >= this: Inf or NaN
+_INT8_TINY_BITS = np.uint32(0x0D800000)        # 2^-100: exponent field 127 - 100 = 27
+_INT8_NAN = np.array([0x7FC00000], np.uint32).view(np.float32)[0]      # the canonical quiet NaN (a pinned payload: the bytes are the same everywhere)
+
+
+def quantize_int8_blocks(x: np.ndarray, block: int = 32) -> tuple[np.ndarray, np.ndarray]:
+    """The engine's activation quantiser, CONTRACTS.md "Activations", bit for bit the rule of the C++ kernels (CPU scalar / AVX2 /
+    AVX-512, the GPU kernel, the GPU emulator).  x [..., n] -> (q int8 [..., n/block, block], d float32 [..., n/block]).
+
+    This is ggml's x86 SIMD `quantize_row_q8_0` (ggml-cpu/arch/x86/quants.c) with an FP32 d, and NOT `quantize_row_q8_0_ref` (which
+    divides, `x * (1 / d)` with ties away from zero, `roundf`): per block of 32, in float32 throughout,
+      * the largest magnitude is the INTEGER maximum of `bits & 0x7FFFFFFF` (order-independent; a float max with a NaN operand is not);
+      * non-finite block (that maximum >= 0x7F800000: an Inf or a NaN):  d = NaN (0x7FC00000), every q = 0  - the NaN reaches the output;
+      * amax < 2^-100 (all-zero blocks and denormals included; 127 / amax would overflow below ~3.7e-37):  d = 0, every q = 0;
+      * otherwise  d = amax / 127,  id = 127 / amax  (two float32 divisions),  q = rint(x * id)  (float32 product, round half to EVEN),
+        clamped to [-127, 127].
+    float64 input is rounded to float32 first (the kernels see float32 activations)."""
     x = np.asarray(x)
     n = x.shape[-1]
     assert n % block == 0, (n, block)
-    xb = x.reshape(*x.shape[:-1], n // block, block)
-    d = (np.abs(xb).max(axis=-1, keepdims=True).astype(np.float32) / np.float32(127.0)).astype(np.float32)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        idv = np.where(d != 0, np.float32(1.0) / d, np.float32(0.0)).astype(np.float32)
-    v = xb.astype(np.float32) * idv
-    q = np.sign(v) * np.floor(np.abs(v) + np.float32(0.5))
-    return (q * d).reshape(x.shape).astype(x.dtype, copy=False)
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        xb = np.ascontiguousarray(x.reshape(*x.shape[:-1], n // block, block), dtype=np.float32)
+        m = (xb.view(np.uint32) & np.uint32(0x7FFFFFFF)).max(axis=-1)
+        nonfinite = m >= _INT8_INF_BITS
+        tiny = m < _INT8_TINY_BITS
+        special = nonfinite | tiny
+        amax = np.ascontiguousarray(m).view(np.float32)
+        d = amax / np.float32(127.0)
+        idv = np.float32(127.0) / amax
+        d = np.where(nonfinite, _INT8_NAN, np.where(tiny, np.float32(0.0), d)).astype(np.float32)
+        idv = np.where(special, np.float32(0.0), idv).astype(np.float32)
+        v = xb * idv[..., None]
+        q = np.where(special[..., None], np.float32(0.0), np.clip(np.rint(v), -127, 127)).astype(np.int8)
+    return q, d
+
+
+def act_quant_int8(x: np.ndarray, block: int = 32) -> np.ndarray:
+    """The engine's activation format (docs/deepseek/CONTRACTS.md): int8 per `block` along the last axis with an FP32 scale, by the rule of
+    `quantize_int8_blocks` (d = max|x| / 127, q = rint(x * (127 / max|x|)) with ties to EVEN, the Inf / NaN / tiny cases pinned; NOT the
+    `1 / d`, ties-away-from-zero rule of ggml's `quantize_row_q8_0_ref` this function used to follow).  Returns the dequantised array q * d
+    in the input's floating dtype (float32 for anything else): an all-zero or tiny block stays 0, a block holding an Inf or a NaN becomes NaN."""
+    x = np.asarray(x)
+    dt = x.dtype if x.dtype in (np.float32, np.float64) else np.dtype(np.float32)
+    q, d = quantize_int8_blocks(x, block)
+    with np.errstate(invalid="ignore", over="ignore"):
+        return (q.astype(dt) * d.astype(dt)[..., None]).reshape(x.shape)
 
 
 @dataclasses.dataclass(frozen=True)
