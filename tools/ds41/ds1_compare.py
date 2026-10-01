@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """ds1_compare.py - compare an engine trace with the NumPy oracle, stage by stage (DS-1 verification, docs/deepseek/DS1_VERIFY.md).
 
-    ds1_compare.py trace   --engine DIR (--oracle DIR | --gguf G... [--quant int8-kv|int8|exact|reference])   whole-run comparison
-    ds1_compare.py layers  --engine DIR --gguf G... --layers 0,5,39,head --positions 3,17,31             layer-by-layer replay (real weights)
+    ds1_compare.py layers  --engine DIR --gguf G... [--layers 0-39,head] [--positions 0,7,31] [--baseline]   stage-isolated replay: THE check (real weights too)
+    ds1_compare.py trace   --engine DIR (--oracle DIR | --gguf G... [--quant int8-kv|int8|exact|reference])   whole-run comparison (the oracle's own trajectory)
     ds1_compare.py oracle  --gguf G... --tokens 1,2,3 --out DIR [--quant ...] [--max-new N]               write the oracle's trace
     ds1_compare.py logits  --engine FILE --oracle FILE                                                    DS-1 gate statistics on two logits dumps
+    ds1_compare.py cost    --real | --trace DIR                                                           bytes per token of an engine trace
 
 Exit status: 0 pass, 1 a stage is outside its tolerance (or, with --strict, a required stage is missing), 2 the tool could not run.
 
@@ -13,12 +14,17 @@ execution order the engine's array is compared with the oracle's:
   * float stages: rms_rel = rms(E - O) / rms(O), max_rel = max|E - O| / max|O| (relative to the TENSOR'S OWN scale, like ref/ds41/README.md),
     cosine; NaN / Inf in the engine where the oracle is finite is always a failure;
   * integer stages (`topk`, `router_idx`, `cand_blocks`): EXACT set equality; a difference is excused only when the oracle's recorded
-    selection margin (gap between the k-th and (k+1)-th candidate) is within the stage's near-tie threshold - a "near-tie", never a pass;
+    selection margin (gap between the k-th and (k+1)-th candidate) is within the stage's near-tie window - a "near-tie", reported, counted, never a pass;
   * router_w: compared per expert id when the two selections agree; logits: the float metrics plus argmax agreement, KL(oracle || engine).
-Each sample gets a level: OK (within the soft tolerance), FLIP (above soft, within hard: a rounding decision of the int8 / fp8 / fp4
-quantisers fell the other way on one element - expected now and then, see DS1_VERIFY.md section "Flips") or FAIL (beyond hard).  A stage fails when
-any sample fails or when the fraction of FLIP samples exceeds the stage's budget (a systematic error shows up there long before it is large).
-The tolerances (class Tolerances below) are derived in docs/deepseek/DS1_VERIFY.md and re-measured by tools/ds41/ds1_noise.py.
+Each sample gets a level: OK (within the soft tolerance), FLIP (above soft, within hard: a rounding decision of an int8 / fp8 / fp4 quantiser inside the stage fell
+the other way on one element, or a near-tie) or FAIL (beyond hard).  A stage also fails when the fraction of FLIP samples exceeds its budget (a systematic error
+shows up there long before it is large).  Tolerances: class Tolerances below, derived and measured in docs/deepseek/DS1_VERIFY.md section 3 (tools/ds41/ds1_noise.py).
+
+TWO MODES.  `layers` hands the oracle the ENGINE's value of everything a stage reads (ds1_replay.py) and compares one stage at a time: no error accumulates, so it
+is strict at every stage of every layer and position.  `trace` lets the oracle run its own trajectory: two correct implementations of a model with int8
+activation quantisers diverge (a 1e-7 difference flips a rounding decision, the next layer's quantisers amplify the 1e-4 that causes), so after the FIRST sample
+above float noise (the "onset", reported) everything downstream is judged against a chaos ceiling only; before it, and in the layers the deviation cannot reach,
+the comparison stays strict.
 """
 from __future__ import annotations
 
@@ -661,6 +667,51 @@ def compare_traces(eng: Trace, ref: Trace, *, positions=None, layers=None, stage
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# what a trace costs (the engine's dump, the oracle's replay)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def trace_cost(summary: dict) -> dict:
+    """Bytes per token position the engine writes for each stage, from a `trace_io.model_summary` dict (vocab_size included): -> {stage: bytes}.
+    `latent` / `index_k` count the positions that publish a row (1 / ratio of them, FULL layers only); `topk` its maximum."""
+    d = Dims.from_summary(summary)
+    n_layers, ratios, modes = int(summary["n_layers"]), summary["compress_ratios"], summary["layer_modes"]
+    out = {st: 0.0 for st in TI.STAGE if TI.STAGE[st].role != "oracle"}
+    out["embed"] = 4.0 * d.dim
+    out["final_hidden"] = 4.0 * d.dim
+    out["logits"] = 4.0 * int(summary["vocab_size"])
+    for l in range(n_layers):
+        r = int(ratios[l])
+        if l in summary["engram_layer_ids"]:
+            out["engram_out"] += 4.0 * d.hc * d.dim
+        out["attn_in"] += 4.0 * d.dim
+        out["q"] += 4.0 * d.n_heads * d.head_dim
+        out["kv_win"] += 4.0 * d.head_dim
+        if r:
+            out["topk"] += 4.0 * int(summary["index_topk"])
+            if modes[l] == "full":
+                out["latent"] += 4.0 * d.head_dim / r
+                out["index_k"] += 4.0 * d.index_head_dim / r
+        out["attn_out"] += 4.0 * d.dim
+        out["ffn_in"] += 4.0 * d.dim
+        out["router_idx"] += 4.0 * d.top_k
+        out["router_w"] += 4.0 * d.top_k
+        out["ffn_out"] += 4.0 * d.dim
+        out["block_out"] += 4.0 * d.hc * d.dim
+        out["pre_mix"] += 4.0 * d.hc
+    return out
+
+
+def real_model_summary() -> dict:
+    """The real model's `model` block, from the vendored GGUF header dump (no weights needed)."""
+    import types
+    from ref.ds41 import selfcheck
+    from ref.ds41.config import Config, layer_modes
+    cfg = Config.from_gguf_metadata(selfcheck.load_gguf_metadata(), vocab_size=129280)
+    return TI.model_summary(types.SimpleNamespace(cfg=cfg, modes=layer_modes(cfg)))
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # the oracle
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -794,6 +845,28 @@ def _cmd_logits(a) -> int:
     return 0 if ok else 1
 
 
+def _cmd_cost(a) -> int:
+    if a.real:
+        summary = real_model_summary()
+    else:
+        import dataclasses
+        import make_mini_gguf as MM
+        from ref.ds41 import selfcheck  # noqa: F401
+        tr = TI.Trace(a.trace) if a.trace else None
+        if tr is None:
+            raise ValueError("cost: give --real, or --trace DIR (a trace of the model to size)")
+        summary = dict(tr.meta["model"], vocab_size=len(tr.get("logits", tr.positions()[0])))
+    cost = trace_cost(summary)
+    total = sum(cost.values())
+    check_only = {st for st in cost if TI.STAGE[st].role == "check"}
+    print(f"{'stage':14s} {'bytes / position':>18s}   role")
+    for st in sorted(cost, key=lambda n: STAGE_ORDER[n]):
+        print(f"{st:14s} {cost[st]:18,.0f}   {TI.STAGE[st].role}")
+    needed = total - sum(cost[st] for st in ("q",))
+    print(f"{'total':14s} {total:18,.0f}   = {total / 1e6:.2f} MB per token; {32 * total / 1e6:.0f} MB for 32 tokens; without q (never read by the replay): {needed / 1e6:.2f} MB per token")
+    return 0
+
+
 def _cmd_layers(a) -> int:
     import ds1_replay
     return ds1_replay.main_layers(a)
@@ -827,11 +900,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--positions", help="positions to check (default: the last position and the first)")
     common_oracle(p)
     p.add_argument("--cache-gib", type=float, default=4.0, help="oracle weight cache (GiB of decoded float32 tensors)")
+    p.add_argument("--expert-cache", type=int, default=48, help="routed experts kept decoded (142 MB each at the real size: 48 = 6.8 GB)")
     p.add_argument("--tol-scale", type=float, default=1.0)
     p.add_argument("--strict", action="store_true")
+    p.add_argument("--baseline", action="store_true", help="also replay with the oracle in the other float type and report the oracle's own noise floor on these inputs (2x the time)")
     p.add_argument("--no-force", action="store_true", help="do not re-run with the engine's selection when a selection differs (default: re-run)")
     p.add_argument("--json"); p.add_argument("--verbose", action="store_true")
     p.set_defaults(fn=_cmd_layers)
+
+    p = sub.add_parser("cost", help="bytes per token position of an engine trace (--real: the real model; --trace DIR: a model of that trace)")
+    p.add_argument("--real", action="store_true"); p.add_argument("--trace")
+    p.set_defaults(fn=_cmd_cost)
 
     p = sub.add_parser("oracle", help="run the oracle on tokens and write its trace directory")
     p.add_argument("--gguf", nargs="+", required=True)

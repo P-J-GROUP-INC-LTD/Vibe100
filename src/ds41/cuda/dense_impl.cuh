@@ -192,7 +192,7 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(kGemvThreads, DS41_DENSE_GEMV_MINB) void q8_int8_
         if (valid) {
             const uint8_t* rp = W + (size_t) row * row_bytes;
             for (int s = ls; s < nsb; s += p) {
-                const int nblk = (nb - 8 * s) < 8 ? (nb - 8 * s) : 8;
+                const int nblk = FAST ? 8 : ((nb - 8 * s) < 8 ? (nb - 8 * s) : 8);              // a fast-path row is whole super-blocks (k % 256 == 0)
                 uint32_t w[68];
                 load_sb<FAST>(rp + (size_t) s * 272, nblk, w);
                 sb_int8<NT>(w, nblk, smem + (size_t) s * kActSb, tok_bytes, acc);
@@ -255,7 +255,7 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(kGemvThreads, DS41_DENSE_GEMV_MINB) void q8_f32_k
         if (valid) {
             const uint8_t* rp = W + (size_t) row * row_bytes;
             for (int s = ls; s < nsb; s += p) {
-                const int nblk = (nb - 8 * s) < 8 ? (nb - 8 * s) : 8;
+                const int nblk = FAST ? 8 : ((nb - 8 * s) < 8 ? (nb - 8 * s) : 8);              // a fast-path row is whole super-blocks (k % 256 == 0)
                 uint32_t w[68];
                 load_sb<FAST>(rp + (size_t) s * 272, nblk, w);
                 sb_f32<NT>(w, nblk, smem + (size_t) s * kXSb, tok_bytes, acc);

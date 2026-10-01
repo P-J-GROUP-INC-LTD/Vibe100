@@ -344,17 +344,15 @@ def forced_router(r: RouterOut, idx: np.ndarray, cfg) -> RouterOut:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def replay_compare(model, eng: Trace, layers, positions, *, tol_scale: float = 1.0, strict: bool = False, force: bool = True, expert_cache: int = 16,
-                   progress=None, include_head: bool = False) -> C.Report:
-    """Layer-by-layer comparison of `eng` against the oracle `model` for the given layers and positions (mode "layer")."""
+def replay_all(model, eng: Trace, layers, positions, *, force: bool = True, expert_cache: int = 16, progress=None, include_head: bool = False) -> tuple:
+    """Replay every (layer, position) -> (DictSource of the oracle's stage values, keys in execution order, notes)."""
     rp = Replayer(model, eng, expert_cache=expert_cache, force=force)
     ref = C.DictSource()
     keys = []
     notes: list = []
-    missing: list = []
     t0 = time.time()
-    for p in positions:
-        for L in layers:
+    for L in layers:                                  # layer-major: a layer's weights are decoded once and serve every position (the cache holds a few layers)
+        for p in positions:
             try:
                 out = rp.replay(L, p)
             except ReplayError as e:
@@ -378,11 +376,31 @@ def replay_compare(model, eng: Trace, layers, positions, *, tol_scale: float = 1
         except ReplayError as e:
             notes.append(f"head: cannot replay: {e}")
     keys.sort(key=lambda k: C.exec_key(*k))
+    return ref, keys, notes
+
+
+def replay_compare(model, eng: Trace, layers, positions, *, tol_scale: float = 1.0, strict: bool = False, force: bool = True, expert_cache: int = 16,
+                   progress=None, include_head: bool = False) -> C.Report:
+    """Layer-by-layer comparison of `eng` against the oracle `model` for the given layers and positions (mode "layer")."""
+    ref, keys, notes = replay_all(model, eng, layers, positions, force=force, expert_cache=expert_cache, progress=progress, include_head=include_head)
     tols = C.Tolerances(C.Dims.from_summary(TI.model_summary(model)), model.quant, tol_scale)
     rep = C.compare_sources(eng, ref, keys, "layer", tols=tols, strict=strict,
                             title=f"engine {eng.path} vs oracle replay (layer-by-layer) {len(layers)} layer(s) x {len(positions)} position(s)")
     rep.notes += notes
     rep.errors += [n for n in notes if "cannot replay" in n]     # a (layer, position) that could not be checked is not a pass
+    return rep
+
+
+def baseline_report(model_a, model_b, eng: Trace, layers, positions, *, expert_cache: int = 16, progress=None, include_head: bool = False) -> C.Report:
+    """The oracle's own noise floor on THESE engine inputs: the replay by `model_a` (the oracle the engine is compared with) against the replay by `model_b`
+    (the same oracle in the other floating-point type), stage by stage.  Both compute every stage from the engine's values, so the differences are exactly
+    what two correct implementations disagree by here: float summation order and the odd int8 / fp8 / fp4 rounding flip.  An engine should look like this
+    report; where it is much worse than this, it is not rounding.  (DS1_VERIFY.md section 3.5)"""
+    a_src, keys, _ = replay_all(model_a, eng, layers, positions, force=False, expert_cache=expert_cache, progress=progress, include_head=include_head)
+    b_src, _, _ = replay_all(model_b, eng, layers, positions, force=False, expert_cache=expert_cache, progress=progress, include_head=include_head)
+    tols = C.Tolerances(C.Dims.from_summary(TI.model_summary(model_a)), model_a.quant)
+    rep = C.compare_sources(a_src, b_src, keys, "layer", tols=tols,
+                            title=f"baseline: oracle {model_a.dt} replay vs oracle {model_b.dt} replay on the same engine inputs (the noise floor)")
     return rep
 
 
@@ -407,9 +425,19 @@ def main_layers(a) -> int:
     if not positions or not layers and not include_head:
         print("ds1_compare layers: nothing to compare (no common positions / layers)", file=sys.stderr)
         return 2
-    rep = replay_compare(model, eng, layers, positions, tol_scale=a.tol_scale, strict=a.strict, force=not a.no_force,
+    rep = replay_compare(model, eng, layers, positions, tol_scale=a.tol_scale, strict=a.strict, force=not a.no_force, expert_cache=a.expert_cache,
                          progress=lambda s: print(s, file=sys.stderr), include_head=include_head)
     print(rep.text(verbose=a.verbose))
+    if a.baseline:
+        other = "float64" if a.dtype == "float32" else "float32"
+        model_b = C.load_oracle_model(a.gguf, quant, dtype=other, max_seq_len=max(n_tok + 8, 64), cache_bytes=int(a.cache_gib * (1 << 30)))
+        base = baseline_report(model, model_b, eng, layers, positions, expert_cache=a.expert_cache, progress=lambda s: print("baseline: " + s, file=sys.stderr),
+                               include_head=include_head)
+        print()
+        print(base.text(verbose=False))
+        fr = lambda r: sum(1 for s in r.samples if s.level != C.Level.OK) / max(len(r.samples), 1)       # noqa: E731
+        print(f"samples above the soft tolerance: engine {100 * fr(rep):.1f} %, oracle against itself {100 * fr(base):.1f} %  (the engine is held to its budget either way; "
+              "a much higher rate than the baseline's is the thing to look at)")
     if a.json:
         import json
         import pathlib

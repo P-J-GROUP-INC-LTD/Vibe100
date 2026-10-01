@@ -38,6 +38,18 @@
 //  * Weights are read ONCE from HBM for all T <= 8 (T tokens share one pass over the rows).  When T x k would not fit the 96 KB of shared memory the
 //    token tiles run as separate blocks over the same rows (adjacent in the grid, so the second tile hits L2): the numbers do not change.
 //
+// A DECODE STEP IN CALLS (T = 1; every call on the same stream; G = RealGeom):
+//     ds41_rmsnorm<G>(dev, h, attn_norm_w, 1, kHidden, xn, 1e-20f, s);                                    // x = attn_norm(hc_pre(stream))
+//     ds41_quantize_acts<G>(dev, xn, 1, kHidden, xq, xs, s, ActOrder::kNatural);                          // ONE quantisation, read by both GEMVs below
+//     ds41_gemv_q8_int8<G>(dev, wq_a, kQLora, kHidden, xq, xs, 1, qa, s);   ds41_gemv_q8_int8<G>(dev, wkv, kHeadDim, kHidden, xq, xs, 1, kv, s);
+//     ds41_rmsnorm<G>(dev, qa, q_norm_w, 1, kQLora, qa, eps, s);   ds41_quantize_acts<G>(dev, qa, 1, kQLora, qxq, qxs, s, ActOrder::kNatural);
+//     ds41_gemv_q8_int8<G>(dev, wq_b, kHeads * kHeadDim, kQLora, qxq, qxs, 1, q, s);   ds41_rope<G>(dev, q, q, 1, kHeads, kHeadDim, table, pos, false, s);
+//     ... attention (DS1-C) ... ds41_rope<G>(.., true ..);  ds41_wo_a<G>(dev, wo_a, o, 1, mid, s);  quantise mid; ds41_gemv_q8_int8<G>(dev, wo_b, kHidden, kOMid, ...);
+//     FFN: ds41_rmsnorm; router (DS-D); ds41_shared_expert<G>(dev, w, xn, 1, y_shared, scratch, true, 10.f, s); ... ds41_f32_add<G>(...);
+//     head: ds41_rmsnorm<G>(final hidden); ds41_head<G>(dev, output_bf16, xn, 1, logits, s); ds41_argmax<G>(dev, logits, 1, tok, val, s);
+//
+// NO OVERLAP: y (and any scratch) must not overlap an input of the same call (except where an op says `out may equal x`).
+//
 // ALIGNMENT (the emulator asserts it): FP32 activations and every FP32 / BF16 weight array 16 bytes; Q8_0 weights 2 bytes (16 when k % 256 == 0: the fast
 // path; any other alignment or k takes the generic path, bit-identical, slower); xq 16 bytes (k % 32 == 0); xs, y 4 bytes.
 #pragma once

@@ -5,7 +5,7 @@
 //                         by hand on the box; not registered with ctest.  The comparisons that are bit-exact in the emulator stay bit-exact on the card except the ones
 //                         that go through expf (SwiGLU's sigmoid), which compare within 4e-6 there (the device libm and the host's may differ in the last bit).
 //
-//   ds41_dense_emu_test [--quant] [--gemv] [--wide] [--norm] [--rope] [--shared] [--vocab] [--all] [--geom real|mini|both] [--seed N]
+//   ds41_dense_emu_test [--quant] [--gemv] [--wide] [--norm] [--rope] [--shared] [--vocab] [--args] [--all] [--geom real|mini|both] [--seed N]
 //                       [--order forward|reverse|shuffle[:SEED]] [--big]
 //   ds41_dense_parity   [the same suites, --geom is ignored: real] [--big] [--bench]
 //
@@ -21,7 +21,8 @@
 //   --rope    the host table (long double + the numpy oracle's golden values) and the kernel (forward, inverse, in place, nope channels copied), bit-exact
 //             against the separately rounded float formula;
 //   --shared  the shared expert in both modes against FP64 (stage by stage), the clamps with NaN / Inf, NaN propagation end to end;
-//   --vocab   argmax and top-k (ties to the lower index, NaN above everything, -0 == +0), the embedding rows, the elementwise helpers.
+//   --vocab   argmax and top-k (ties to the lower index, NaN above everything, -0 == +0), the embedding rows, the elementwise helpers;
+//   --args    what the entry points refuse (shapes, alignment, k limits, scratch) and accept at the limits.
 // --big adds the largest real shapes (wq_b 32768 x 1280, wo_a, the head's 5120-wide rows at more rows): minutes in the emulator.
 #include <algorithm>
 #include <chrono>
@@ -1470,6 +1471,86 @@ void run_vocab(Dev& dev, Report& rep, Rng& rng) {
 
 
 // =====================================================================================================================================================
+// --args (what the entry points refuse)
+// =====================================================================================================================================================
+template <class G>
+void run_args(Dev& dev, Report& rep, Rng& rng) {
+    const std::string g = G::kName;
+    (void) rng;
+    auto refused = [&](const char* what, const std::function<void()>& f) {
+        bool threw = false;
+        try {
+            f();
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        rep.line(threw, (g + " refuses: " + what).c_str(), "std::invalid_argument");
+    };
+    auto accepted = [&](const char* what, const std::function<void()>& f) {
+        bool threw = false;
+        try {
+            f();
+        } catch (const std::exception& e) {
+            threw = true;
+            std::printf("  unexpected: %s\n", e.what());
+        }
+        rep.line(!threw, (g + " accepts: " + what).c_str(), "no exception");
+    };
+    DevBuf<uint8_t> w(dev, 64 * 34 * 4 + 64);
+    DevBuf<float> x(dev, 8192), y(dev, 8192), z(dev, 8192);
+    DevBuf<int8_t> xq(dev, 8192);
+    DevBuf<float> xs(dev, 256);
+    DevBuf<uint16_t> wb(dev, 4096);
+    DevBuf<unsigned char> scratch(dev, 1 << 20);
+    DevBuf<float> lg(dev, (size_t) G::kVocab);                                       // one row of logits (zeros: DevBuf memory is 0xCD-filled, finite)
+    lg.zero();
+    DevBuf<int32_t> di(dev, 128);
+    DevBuf<float> dv(dev, 128);
+    accepted("a valid int8 GEMV", [&] { ds41_gemv_q8_int8<G>(dev, w.p, 64, 128, xq.p, xs.p, 2, y.p); });
+    refused("q8 int8: k not a multiple of 32", [&] { ds41_gemv_q8_int8<G>(dev, w.p, 64, 100, xq.p, xs.p, 1, y.p); });
+    refused("q8 int8: n = 0", [&] { ds41_gemv_q8_int8<G>(dev, w.p, 0, 128, xq.p, xs.p, 1, y.p); });
+    refused("q8 int8: T = 0", [&] { ds41_gemv_q8_int8<G>(dev, w.p, 64, 128, xq.p, xs.p, 0, y.p); });
+    refused("q8 int8: misaligned xq", [&] { ds41_gemv_q8_int8<G>(dev, w.p, 64, 128, xq.p + 1, xs.p, 1, y.p); });
+    refused("q8 int8: null weights", [&] { ds41_gemv_q8_int8<G>(dev, nullptr, 64, 128, xq.p, xs.p, 1, y.p); });
+    refused("q8 int8: odd weight pointer", [&] { ds41_gemv_q8_int8<G>(dev, w.p + 1, 64, 128, xq.p, xs.p, 1, y.p); });
+    accepted("q8 int8 weights at a 2-byte offset (the generic path)", [&] { ds41_gemv_q8_int8<G>(dev, w.p + 2, 64, 128, xq.p, xs.p, 1, y.p); });
+    refused("q8 f32: misaligned x", [&] { ds41_gemv_q8_f32<G>(dev, w.p, 64, 128, x.p + 1, 1, y.p); });
+    refused("grouped: groups = 0", [&] { ds41_gemv_q8_grouped_f32<G>(dev, w.p, 0, 8, 128, x.p, 1, y.p); });
+    accepted("a valid BF16 GEMV", [&] { ds41_gemv_bf16<G>(dev, wb.p, 16, 64, x.p, 1, y.p); });
+    refused("bf16: k % 8 != 0", [&] { ds41_gemv_bf16<G>(dev, wb.p, 16, 60, x.p, 1, y.p); });
+    refused("bf16: misaligned weights", [&] { ds41_gemv_bf16<G>(dev, wb.p + 1, 16, 64, x.p, 1, y.p); });
+    refused("f32: k % 4 != 0", [&] { ds41_gemv_f32<G>(dev, x.p, 16, 62, y.p, 1, z.p); });
+    refused("rmsnorm: width % 4 != 0", [&] { ds41_rmsnorm<G>(dev, x.p, nullptr, 2, 6, y.p); });
+    refused("rmsnorm: misaligned x", [&] { ds41_rmsnorm<G>(dev, x.p + 1, nullptr, 2, 8, y.p); });
+    std::vector<float> c, sn;
+    ds41_rope_table_host(G::kRopeDim, 8, RopeParams{}, c, sn);
+    DevBuf<float> dc(dev, c.size()), ds(dev, sn.size());
+    upload(dev, dc, c);
+    upload(dev, ds, sn);
+    const RopeTable tab{dc.p, ds.p, 8};
+    accepted("a valid RoPE", [&] { ds41_rope<G>(dev, x.p, y.p, 2, 1, G::kHeadDim, tab, 3, false); });
+    refused("rope: positions past the table", [&] { ds41_rope<G>(dev, x.p, y.p, 2, 1, G::kHeadDim, tab, 7, false); });
+    refused("rope: width < kRopeDim", [&] { ds41_rope<G>(dev, x.p, y.p, 1, 1, G::kRopeDim - 2, tab, 0, false); });
+    refused("rope: out partially overlaps x", [&] { ds41_rope<G>(dev, x.p, x.p + 2, 1, 1, G::kHeadDim, tab, 0, false); });
+    accepted("top-k at the limit (k = 64)", [&] { ds41_topk<G>(dev, lg.p, 1, 64, di.p, dv.p, scratch.p, topk_scratch_bytes<G>(1, 64)); });
+    refused("top-k: k = 65", [&] { ds41_topk<G>(dev, lg.p, 1, 65, di.p, dv.p, scratch.p, topk_scratch_bytes<G>(1, 65)); });
+    refused("top-k: k = 0", [&] { ds41_topk<G>(dev, lg.p, 1, 0, di.p, dv.p, scratch.p, 1 << 20); });
+    refused("top-k: scratch too small", [&] { ds41_topk<G>(dev, lg.p, 1, 8, di.p, dv.p, scratch.p, topk_scratch_bytes<G>(1, 8) - 1); });
+    refused("argmax: T = 0", [&] { ds41_argmax<G>(dev, lg.p, 0, di.p, dv.p); });
+    refused("f32 add: n % 4 != 0", [&] { ds41_f32_add<G>(dev, x.p, y.p, 6, z.p); });
+    SharedExpertWeights sw{w.p, w.p, w.p};
+    SharedExpertScratch sc;
+    refused("shared expert: T = 0", [&] { ds41_shared_expert<G>(dev, sw, x.p, 0, y.p, sc); });
+    // an out-of-range token id never reaches the device
+    refused("embedding: id out of range", [&] {
+        std::vector<uint16_t> table((size_t) 4 * 8, 0x3F80);
+        std::vector<float> out(8);
+        const int32_t ids[1] = {4};
+        ds41_embed_rows_host(table.data(), 4, 8, ids, 1, out.data());
+    });
+}
+
+// =====================================================================================================================================================
 // --bench (the card only): GB/s of weights per call, against the card's peak
 // =====================================================================================================================================================
 #if defined(DS41_DENSE_GPU)
@@ -1574,7 +1655,7 @@ void run_bench(Dev& dev, Report& rep, Rng& rng) {
 // main
 // =====================================================================================================================================================
 template <class G>
-void run_geom(Dev& dev, Report& rep, uint64_t seed, bool big, bool bench, bool quant, bool gemv, bool wide, bool norm, bool rope, bool shared, bool vocab) {
+void run_geom(Dev& dev, Report& rep, uint64_t seed, bool big, bool bench, bool quant, bool gemv, bool wide, bool norm, bool rope, bool shared, bool vocab, bool argsuite) {
     Rng rng(seed);
     const auto t0 = std::chrono::steady_clock::now();
     auto lap = [&](const char* what) {
@@ -1588,6 +1669,7 @@ void run_geom(Dev& dev, Report& rep, uint64_t seed, bool big, bool bench, bool q
     if (rope) run_rope<G>(dev, rep, rng), lap("rope");
     if (shared) run_shared<G>(dev, rep, rng, big), lap("shared");
     if (vocab) run_vocab<G>(dev, rep, rng), lap("vocab");
+    if (argsuite) run_args<G>(dev, rep, rng), lap("args");
 #if defined(DS41_DENSE_GPU)
     if (bench) run_bench<G>(dev, rep, rng), lap("bench");
 #else
@@ -1598,7 +1680,7 @@ void run_geom(Dev& dev, Report& rep, uint64_t seed, bool big, bool bench, bool q
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool quant = false, gemv = false, wide = false, norm = false, rope = false, shared = false, vocab = false, big = false, bench = false;
+    bool quant = false, gemv = false, wide = false, norm = false, rope = false, shared = false, vocab = false, big = false, bench = false, argsuite = false;
     std::string geom = "both";
     uint64_t seed = 1;
     for (int i = 1; i < argc; ++i) {
@@ -1610,7 +1692,8 @@ int main(int argc, char** argv) {
         else if (a == "--rope") rope = true;
         else if (a == "--shared") shared = true;
         else if (a == "--vocab") vocab = true;
-        else if (a == "--all") quant = gemv = wide = norm = rope = shared = vocab = true;
+        else if (a == "--args") argsuite = true;
+        else if (a == "--all") quant = gemv = wide = norm = rope = shared = vocab = argsuite = true;
         else if (a == "--big") big = true;
         else if (a == "--bench") bench = true;
         else if (a == "--geom" && i + 1 < argc) geom = argv[++i];
@@ -1626,7 +1709,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (!(quant || gemv || wide || norm || rope || shared || vocab || bench)) quant = gemv = wide = norm = rope = shared = vocab = true;
+    if (!(quant || gemv || wide || norm || rope || shared || vocab || bench || argsuite)) quant = gemv = wide = norm = rope = shared = vocab = argsuite = true;
     Report rep;
 #if defined(DS41_DENSE_GPU)
     CudaDev dev;
@@ -1635,12 +1718,12 @@ int main(int argc, char** argv) {
         Report::info("device: %s (cc %d.%d, %d SMs, %.1f GB)%s", prop.name, prop.major, prop.minor, prop.multiProcessorCount, (double) prop.totalGlobalMem / 1e9,
                      (prop.major == 7 && prop.minor == 0) ? "" : "  <-- NOT a Volta (sm_70) card: the numbers say nothing about the V100");
     Report::info("dense kernels on the card, geometry real, seed %llu", (unsigned long long) seed);
-    run_geom<RealGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab);          // the nvcc library instantiates RealGeom only
+    run_geom<RealGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab, argsuite);          // the nvcc library instantiates RealGeom only
 #else
     HostDev dev;
     Report::info("dense kernels, emulated, order %s, geometry %s, seed %llu", g_order.c_str(), geom.c_str(), (unsigned long long) seed);
-    if (geom == "mini" || geom == "both") run_geom<MiniGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab);
-    if (geom == "real" || geom == "both") run_geom<RealGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab);
+    if (geom == "mini" || geom == "both") run_geom<MiniGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab, argsuite);
+    if (geom == "real" || geom == "both") run_geom<RealGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab, argsuite);
 #endif
     return rep.summary();
 }

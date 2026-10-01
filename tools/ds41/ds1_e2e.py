@@ -176,16 +176,18 @@ def greedy_check(eng, ref, fx: dict, full_report, v: Verdict) -> None:
         v.add("greedy: continuation identical to the oracle's", len(toks) == len(oracle_tokens) or len(toks) < len(oracle_tokens),
               f"{len(toks) - n_prompt} generated tokens, oracle {len(oracle_tokens) - n_prompt}")
         return
-    # first difference at token index d, chosen from the logits of position d - 1
+    # first difference at token index d, chosen from the logits of position d - 1.  A swap of the argmax needs gap <= 2 x (the error of the logits); the error is
+    # taken from the documented tolerance of the logits stage, NOT from what was observed (an observed error always "explains" the swap it caused)
     explained = None
     ol = ref.get("logits", d - 1)
     if ol is not None:
+        import ds1_compare as C
         ol = np.asarray(ol, dtype=np.float64).reshape(-1)
         gap = float(ol[oracle_tokens[d]] - ol[toks[d]])
-        el = np.asarray(eng.get("logits", d - 1), dtype=np.float64).reshape(-1) if eng.has("logits", d - 1) else ol
-        err = float(np.max(np.abs(el - ol)))
-        if gap <= 10 * err + 1e-5 * float(np.max(np.abs(ol))):
-            explained = f"near-tie: the oracle's logits of tokens {oracle_tokens[d]} and {toks[d]} differ by {gap:.3g}, the engine's logits differ from the oracle's by up to {err:.3g}"
+        window = 2.0 * C.tolerances_of(eng, ref)["logits"].hard_max * float(np.max(np.abs(ol)))
+        if gap <= window:
+            explained = (f"near-tie: the oracle's logits of tokens {oracle_tokens[d]} and {toks[d]} differ by {gap:.3g}, within twice the logits tolerance ({window:.3g}) "
+                         "of each other")
     if explained is None and full_report is not None:
         early = [o for o in full_report.onsets if o[0] <= d - 1]
         if early:
