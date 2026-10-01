@@ -62,6 +62,10 @@ can run without a GPU, commit, push.
 Candidate Phase-3 kernel work, only if the profile shows it: Volta HMMA version of the QSA block-score select
 (currently FP32 warp kernel on sm_70), tile/occupancy retune of decode GEMVs for 80 SMs / 6 MB L2.
 
+Phase-3 placement work (not a kernel change, independent of Volta): the **usage ledger**
+(`docs/USAGE_LEDGER.md`) — long-term, persisted per-expert routing counts that seed the 32 GB expert cache from
+the user's own weeks of use, beside the existing short-term adaptive swaps.
+
 ### The target box's CPU side (from the user, 2026-10-01)
 
 Dell Precision 7920, 2x Xeon **Gold 6226** (Cascade Lake, 12 cores each), 24 DIMM slots, **384 GB DDR4-2666**

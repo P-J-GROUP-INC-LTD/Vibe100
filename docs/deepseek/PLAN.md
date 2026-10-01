@@ -122,7 +122,8 @@ like the Volta GEMM does).
 
 **DS-2 — usable.** Prefill (FP8 → fp16 dequant + cuBLAS HMMA, chunked; encoder-only prefill is an approximation —
 start with all 40 layers), Engram on SSD with token-driven prefetch, expert cache sized to VRAM, adaptive swaps,
-server integration. **Gate DS-2 (= the brief's Gate 3): measured hit rate**; below ~40 % the cache does not beat
+server integration, the **usage ledger** (`docs/USAGE_LEDGER.md`: weeks of the user's own routing decide the GPU
+core set; the short-term tier follows the current task). **Gate DS-2 (= the brief's Gate 3): measured hit rate**; below ~40 % the cache does not beat
 plain `--n-cpu-moe` style offload by much — stop and reassess.
 
 **DS-3 — fast.** Routing traces → profiles per workload (coding vs general sets overlap little), NUMA placement of
