@@ -134,6 +134,7 @@ struct Ds41Attention<G>::Impl {
     float *qa = nullptr, *qr = nullptr, *q = nullptr, *kvraw = nullptr, *ckv = nullptr, *csc = nullptr, *latent = nullptr, *ikraw = nullptr;
     float *iq = nullptr, *iw = nullptr, *o_rot = nullptr, *omid = nullptr, *score = nullptr, *bs = nullptr;
     bool latent_valid[KT] = {};
+    int score_n = 0, bs_n = 0, cand_nb[KT] = {};                          // lengths of the last scores / block scores / candidate flags (trace accessors)
     float wscale = 1.0f;
 
     Impl(Dev& d, AttnDenseOps& n) : dev(d), dense(n) {}
@@ -248,6 +249,7 @@ struct Ds41Attention<G>::Impl {
         const float* sinr = w.rope.sin + (size_t) p * half;
         float* qt = q + (size_t) t * Q;
         latent_valid[t] = false;
+        if (La.mode == AttnMode::kFull || La.mode == AttnMode::kReindex) score_n = 0;     // (set again below when this token is scored)
 
         K::q_rope(qt, cosr, sinr, s);
         K::swa_kv(kvraw + (size_t) t * D, w.kv_norm, eps, cosr, sinr, quant.window_kv, La.win + (size_t) (p % G::kWindow) * D, s);
@@ -296,9 +298,12 @@ struct Ds41Attention<G>::Impl {
                     const uint8_t* mask = roles.uses_candidates(l) ? cand + (size_t) t * cand_stride : nullptr;
                     K::index_q_finish(iq + (size_t) t * IQ, cosr, sinr, quant.index, s);
                     K::index_scores(iq + (size_t) t * IQ, iw + (size_t) t * G::kIdxHeads, wscale, O.idxk, compress_len, mask, G::kCandBlock, score, s);
+                    score_n = compress_len;
                     if (roles.is_candidate_source(l)) {
                         const int nb = (compress_len + G::kCandBlock - 1) / G::kCandBlock;
                         K::block_scores(score, compress_len, G::kCandBlock, bs, s);
+                        bs_n = nb;
+                        cand_nb[t] = nb;
                         K::topk_select(bs, nb, std::min(G::kCandTopBlocks, nb), nullptr, 0, cand + (size_t) t * cand_stride, s);
                     }
                     K::topk_select(score, compress_len, std::min(G::kIdxTopK, compress_len), tk, G::kIdxTopK, nullptr, s);
@@ -319,6 +324,7 @@ struct Ds41Attention<G>::Impl {
         if (pos0 != La.seen) throw std::invalid_argument("Ds41Attention::forward: layer " + std::to_string(l) + " has seen " + std::to_string(La.seen) + " tokens, not " + std::to_string(pos0));
         if (pos0 + T > max_context) throw std::invalid_argument("Ds41Attention::forward: position beyond max_context");
         s = stream_or_default(dev, s);
+        bs_n = 0;
         const AttnLayerWeights& w = La.w;
         const bool has_idx = La.mode == AttnMode::kFull || La.mode == AttnMode::kReindex;
         // ---- dense projections of the T rows (a row's result does not depend on T: DS1.md section 2) ----
@@ -385,6 +391,21 @@ const float* Ds41Attention<G>::trace_latent(int t) const {
 template <class G>
 const int32_t* Ds41Attention<G>::trace_topk(int t) const {
     return impl_->topk + (size_t) t * G::kIdxTopK;
+}
+template <class G>
+const float* Ds41Attention<G>::trace_scores(int* n) const {
+    if (n) *n = impl_->score_n;
+    return impl_->score_n > 0 ? impl_->score : nullptr;
+}
+template <class G>
+const float* Ds41Attention<G>::trace_block_scores(int* n) const {
+    if (n) *n = impl_->bs_n;
+    return impl_->bs_n > 0 ? impl_->bs : nullptr;
+}
+template <class G>
+const uint8_t* Ds41Attention<G>::trace_cand(int t, int* nb) const {
+    if (nb) *nb = impl_->cand_nb[t];
+    return impl_->cand_nb[t] > 0 ? impl_->cand + (size_t) t * impl_->cand_stride : nullptr;
 }
 template <class G>
 const float* Ds41Attention<G>::kv_win_row(int layer, int pos) const {

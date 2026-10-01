@@ -215,6 +215,11 @@ class Ds41Attention {
     const float* trace_o(int t) const;                          // fp32 [kHeads][kHeadDim], after the inverse RoPE (the input of wo_a)
     const float* trace_latent(int t) const;                     // fp32 [kHeadDim], the pre-RoPE normalised group latent; null if token t completed no group
     const int32_t* trace_topk(int t) const;                     // int32 [kIdxTopK], ascending, -1 padding (REUSE layers: the owner's)
+    /// The indexer's scores of the LAST token the last forward() scored (an index source: FULL / REINDEX layer): fp32 [*n] (after the candidate mask:
+    /// -inf = unreachable); null / *n = 0 if no layer scored.  Valid until the next forward().  With T > 1 only the last window row's.
+    const float* trace_scores(int* n) const;
+    const float* trace_block_scores(int* n) const;              // the candidate source's block scores of the last token (the newest block +inf), same rules
+    const uint8_t* trace_cand(int t, int* nb) const;            // the candidate pool flags (1 per kCandBlock positions) the candidate source left for window row t
     const float* kv_win_row(int layer, int pos) const;          // the ring row of position pos (valid while pos is within the last kWindow)
     const float* comp_kv_row(int layer, int index) const;       // null unless `layer` is a FULL layer
     const float* index_k_row(int layer, int index) const;       // null unless `layer` is a FULL layer
