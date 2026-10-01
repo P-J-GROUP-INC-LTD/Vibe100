@@ -6,6 +6,7 @@
 #include "ds41_router_impl.cuh"
 #include "ds41_split_impl.cuh"
 
+DS41_DEFINE_EXPERTS_COMMON()
 DS41_INSTANTIATE_ROUTER(::strata::ds41::RealGeom)
 DS41_INSTANTIATE_SPLIT(::strata::ds41::RealGeom)
 DS41_INSTANTIATE_EXPERTS(::strata::ds41::RealGeom)

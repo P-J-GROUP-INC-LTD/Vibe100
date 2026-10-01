@@ -42,6 +42,6 @@ int main(int argc, char** argv) {
         o.edge = false;
     }
     Report rep;
-    run_expert_parity(dev, o, rep);
+    run_expert_parity<strata::ds41::RealGeom>(dev, o, rep);
     return rep.summary();
 }

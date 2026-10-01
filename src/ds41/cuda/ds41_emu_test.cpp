@@ -1,7 +1,11 @@
 // src/ds41/cuda/ds41_emu_test.cpp - DS-D: runs the SAME kernels the V100 runs (src/ds41/cuda/*.cuh, compiled for the host with
 // -DDS41_EMU, see ds41_emu.hpp) through the parity drivers on the CPU.  No GPU needed.
 //
-//   ds41_cuda_emu_test [--router] [--split] [--experts] [--quant] [--emu] [--all] [--seed N] [--order forward|reverse|shuffle[:SEED]]
+//   ds41_cuda_emu_test [--router] [--split] [--experts] [--quant] [--emu] [--all] [--seed N] [--order forward|reverse|shuffle[:SEED]] [--geom real|mini|both]
+//
+// --geom picks the geometry the kernels are instantiated at (include/strata/ds41/geom.hpp): `real` (default; the V100 engine's, slow in emulation: one fiber
+// per CUDA thread), `mini` (the tiny model of tools/ds41/make_mini_gguf.py: hidden 256, 16 experts, top-2; every suite in seconds, with the full test sets)
+// or `both`.  The emulator's own checks (--emu) do not depend on the geometry and run once.
 //
 // --order selects the order in which the emulator schedules the fibers of a block and the blocks of a launch (also: the environment variable
 // DS41_EMU_ORDER, see ds41_emu.hpp): the suites are run in all three, because a kernel that is only right when thread 3 runs before thread 17
@@ -22,6 +26,10 @@
 #include <chrono>
 #include <map>
 
+#include <algorithm>
+#include <string>
+#include <type_traits>
+
 #include "ds41_emu.hpp"
 #include "ds41_parity_lib.hpp"
 #include "strata/ds41/cpu/mxfp4_expert.hpp"
@@ -29,63 +37,7 @@
 namespace {
 using namespace strata::ds41::cuda::parity;
 
-struct HostDev : Dev {
-    // every allocation sits between two 256-byte guard zones that are checked when it is released: a kernel that stores outside its
-    // buffer is a failure here (the V100 would silently corrupt a neighbour)
-    static constexpr size_t kGuard = 256;
-    std::map<void*, size_t> live;
-    void* alloc(size_t bytes) override {
-        if (bytes == 0) bytes = 16;
-        const size_t body = (bytes + 255) & ~(size_t) 255;
-        unsigned char* base = static_cast<unsigned char*>(std::aligned_alloc(256, body + 2 * kGuard));
-        std::memset(base, 0xAB, body + 2 * kGuard);
-        std::memset(base + kGuard, 0xCD, body);                        // fresh "device memory" is not zero
-        live[base + kGuard] = bytes;
-        return base + kGuard;
-    }
-    // "mapped host memory": plain memory here (zero-filled); the doorbell protocol is exercised, not the PCIe
-    std::map<void*, size_t> mapped;
-    void* alloc_mapped(size_t bytes) override {
-        if (bytes == 0) bytes = 16;
-        const size_t body = (bytes + 255) & ~(size_t) 255;
-        void* p = std::aligned_alloc(256, body);
-        std::memset(p, 0, body);
-        mapped[p] = body;
-        return p;
-    }
-    void release_mapped(void* p) override {
-        if (!p) return;
-        mapped.erase(p);
-        std::free(p);
-    }
-    void release(void* p) override {
-        if (!p) return;
-        const size_t bytes = live.at(p);
-        const size_t body = (bytes + 255) & ~(size_t) 255;
-        unsigned char* base = static_cast<unsigned char*>(p) - kGuard;
-        bool ok = true;
-        for (size_t i = 0; i < kGuard; ++i) ok = ok && base[i] == 0xAB;
-        for (size_t i = bytes; i < body; ++i) ok = ok && base[kGuard + i] == 0xCD;       // the padding of the last 256 bytes
-        for (size_t i = 0; i < kGuard; ++i) ok = ok && base[kGuard + body + i] == 0xAB;
-        if (!ok) {
-            std::printf("FAIL guard: a kernel or the test wrote outside a device buffer of %zu bytes\n", bytes);
-            std::exit(3);
-        }
-        live.erase(p);
-        std::free(base);
-    }
-    void h2d(void* dst, const void* src, size_t n) override { std::memcpy(dst, src, n); }
-    void d2h(void* dst, const void* src, size_t n) override { std::memcpy(dst, src, n); }
-    void fill(void* p, int byte, size_t n) override { std::memset(p, byte, n); }
-    void sync() override {}
-    void* stream() override { return nullptr; }
-    double time_us(const std::function<void()>& fn, int reps) override {
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < reps; ++i) fn();
-        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
-    }
-    bool is_emulation() const override { return true; }
-};
+using strata::ds41::cuda::HostDev;     // the shared emulation Dev (include/strata/ds41/cuda/ds41_dev.hpp): guard zones checked at release, 0xCD-filled
 // The emulator's promises, checked on tiny kernels (a regression here would silently weaken every other suite).
 void run_emu_selftest(Report& rep) {
     namespace E = ds41_emu;
@@ -148,13 +100,14 @@ void run_emu_selftest(Report& rep) {
 }
 
 // The emulated GPU quantiser against the CPU library: the same bytes on the contract's special blocks and on random bit patterns.
+template <class G>
 void run_quant_vs_cpu(Dev& dev, uint64_t seed, int reps, Report& rep) {
     using namespace strata::ds41;
-    using strata::ds41::cuda::quantize_acts;
     namespace cpu = strata::ds41::cpu;
+    constexpr int kHidden = G::kHidden, kActBlocks = cuda::ExpertDims<G>::kActBlocks;
     cuda::ref::Rng rng(seed);
     const auto edges = cuda::parity::quant_edge_blocks();
-    const int T = 2, nblocks = T * cuda::kActBlocks;
+    const int T = std::max(2, (int) ((edges.size() + kActBlocks - 1) / kActBlocks)), nblocks = T * kActBlocks;      // every special block fits (RealGeom: T = 2)
     for (int rep_i = 0; rep_i < reps; ++rep_i) {
         std::vector<float> x((size_t) T * kHidden);
         for (int b = 0; b < nblocks; ++b) {
@@ -178,11 +131,11 @@ void run_quant_vs_cpu(Dev& dev, uint64_t seed, int reps, Report& rep) {
                 xb[j] = v;
             }
         }
-        cuda::parity::DevBuf<float> d_x(dev, x.size());
+        cuda::DevBuf<float> d_x(dev, x.size());
         d_x.up(x);
-        cuda::parity::DevBuf<int8_t> d_xq(dev, x.size());
-        cuda::parity::DevBuf<float> d_xs(dev, (size_t) nblocks);
-        quantize_acts(d_x.p, T, d_xq.p, d_xs.p, dev.stream());
+        cuda::DevBuf<int8_t> d_xq(dev, x.size());
+        cuda::DevBuf<float> d_xs(dev, (size_t) nblocks);
+        cuda::ds41_quantize_acts<G>(dev, d_x.p, T, kHidden, d_xq.p, d_xs.p, dev.stream());
         dev.sync();
         const auto xq_perm = d_xq.down();
         const auto xs = d_xs.down();
@@ -197,18 +150,58 @@ void run_quant_vs_cpu(Dev& dev, uint64_t seed, int reps, Report& rep) {
                 cpu::quantize_act(&x[(size_t) t * kHidden], kHidden, a, isa);
                 cpu::act_unpack(a, kHidden, cq.data());
                 bad += std::memcmp(cq.data(), &gpu_nat[(size_t) t * kHidden], kHidden) != 0;
-                for (int b = 0; b < cuda::kActBlocks; ++b) bad += std::memcmp(&a.scale[b], &xs[(size_t) t * cuda::kActBlocks + b], 4) != 0;
+                for (int b = 0; b < kActBlocks; ++b) bad += std::memcmp(&a.scale[b], &xs[(size_t) t * kActBlocks + b], 4) != 0;
             }
             rep.line(bad == 0, ("quantize GPU kernel vs CPU " + std::string(cpu::isa_name(isa)) + " rep " + std::to_string(rep_i)).c_str(),
-                     "%d tokens x 5120 values (%s): int8 values and fp32 scales (as bits) identical: %s", T, rep_i == 0 ? "the special blocks first, then random bit patterns" : "random bit patterns",
+                     "%d tokens x %d values (%s): int8 values and fp32 scales (as bits) identical: %s", T, kHidden, rep_i == 0 ? "the special blocks first, then random bit patterns" : "random bit patterns",
                      bad == 0 ? "yes" : "NO");
         }
+    }
+}
+
+// One geometry's suites.  RealGeom: the reduced sets (--quick, the default) or the full ones (--all) as always.  MiniGeom: always the full sets (they are cheap).
+template <class G>
+void run_geometry(HostDev& dev, bool router, bool split, bool experts, bool quant, bool all, uint64_t seed, Report& rep) {
+    const bool full = all || !std::is_same_v<G, strata::ds41::RealGeom>;
+    std::printf("INFO geometry: %s (hidden %d, experts %d, top-%d, ff %d)\n", G::kName, G::kHidden, G::kExperts, G::kTopK, G::kFF);
+    if (router) {
+        RouterOpts o;
+        if (seed) o.seed = seed;
+        o.Ts = full ? std::vector<int>{1, 2, 3, 4, 5, 8, 17, 32, 33, 70} : std::vector<int>{1, 2, 3, 5, 33};
+        o.indep_Ts = full ? std::vector<int>{2, 3, 5, 8, 17, 32, 33, 40, 100} : std::vector<int>{8, 32, 33, 100};
+        o.indep_alone = full ? std::vector<int>{0, 1, 7, 8, 31, 32, 33, 99} : std::vector<int>{0, 7, 33, 99};
+        if (!full) o.indep_windows = {{37, 8}, {5, 4}};
+        o.timing_reps = 0;
+        run_router_parity<G>(dev, o, rep);
+    }
+    if (split) {
+        SplitOpts o;
+        if (seed) o.seed = seed;
+        o.Ts = full ? std::vector<int>{1, 2, 3, 5, 8, 9, 40, 1000} : std::vector<int>{1, 3, 8, 9, 40};
+        run_split_parity<G>(dev, o, rep);
+    }
+    if (experts) {
+        ExpertOpts o;
+        if (seed) o.seed = seed;
+        o.slots = !std::is_same_v<G, strata::ds41::RealGeom> ? 12 : (all ? 16 : 8);       // MiniGeom: every expert id of the resident pool (kExperts * 25 / 32 = 12)
+        o.Ts = full ? std::vector<int>{1, 2, 3, 4, 5, 8} : std::vector<int>{1, 3};
+        o.max_hits_checked = full ? 1000000 : 3;
+        o.timing_reps = 0;
+        run_expert_parity<G>(dev, o, rep);
+    }
+    if (quant) {
+        // the kernel on the contract's special blocks, then at other widths and in both byte orders, then against the CPU library (all ISAs this machine has)
+        strata::ds41::cuda::ref::Rng rng(seed ? seed : 7);
+        run_quant_edge<G>(dev, rng, rep);
+        run_quant_widths<G>(dev, rng, rep);
+        run_quant_vs_cpu<G>(dev, seed ? seed : 7, full ? 8 : 3, rep);
     }
 }
 }  // namespace
 
 int main(int argc, char** argv) {
     bool router = false, split = false, experts = false, quant = false, emu = false, all = false;
+    bool run_real = true, run_mini = false;
     uint64_t seed = 0;                                       // 0: each driver's own default seed
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
@@ -218,7 +211,16 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--quant")) quant = true;
         else if (!std::strcmp(argv[i], "--emu")) emu = true;
         else if (!std::strcmp(argv[i], "--all")) all = true;
-        else if (!std::strcmp(argv[i], "--order") && i + 1 < argc) {
+        else if (!std::strcmp(argv[i], "--geom") && i + 1 < argc) {
+            const std::string g = argv[++i];
+            if (g == "real") run_real = true, run_mini = false;
+            else if (g == "mini") run_real = false, run_mini = true;
+            else if (g == "both") run_real = run_mini = true;
+            else {
+                std::printf("FAIL: --geom wants real | mini | both\n");
+                return 2;
+            }
+        } else if (!std::strcmp(argv[i], "--order") && i + 1 < argc) {
             if (!ds41_emu::set_order_from_string(argv[++i])) {
                 std::printf("FAIL: --order wants forward | reverse | shuffle[:SEED]\n");
                 return 2;
@@ -230,38 +232,9 @@ int main(int argc, char** argv) {
     HostDev dev;
     Report rep;
     const auto t0 = std::chrono::steady_clock::now();
-    if (router) {
-        RouterOpts o;
-        if (seed) o.seed = seed;
-        o.Ts = all ? std::vector<int>{1, 2, 3, 4, 5, 8, 17, 32, 33, 70} : std::vector<int>{1, 2, 3, 5, 33};
-        o.indep_Ts = all ? std::vector<int>{2, 3, 5, 8, 17, 32, 33, 40, 100} : std::vector<int>{8, 32, 33, 100};
-        o.indep_alone = all ? std::vector<int>{0, 1, 7, 8, 31, 32, 33, 99} : std::vector<int>{0, 7, 33, 99};
-        if (!all) o.indep_windows = {{37, 8}, {5, 4}};
-        o.timing_reps = 0;
-        run_router_parity(dev, o, rep);
-    }
-    if (split) {
-        SplitOpts o;
-        if (seed) o.seed = seed;
-        o.Ts = all ? std::vector<int>{1, 2, 3, 5, 8, 9, 40, 1000} : std::vector<int>{1, 3, 8, 9, 40};
-        run_split_parity(dev, o, rep);
-    }
-    if (experts) {
-        ExpertOpts o;
-        if (seed) o.seed = seed;
-        o.slots = all ? 16 : 8;
-        o.Ts = all ? std::vector<int>{1, 2, 3, 4, 5, 8} : std::vector<int>{1, 3};
-        o.max_hits_checked = all ? 1000000 : 3;
-        o.timing_reps = 0;
-        run_expert_parity(dev, o, rep);
-    }
+    if (run_real) run_geometry<strata::ds41::RealGeom>(dev, router, split, experts, quant, all, seed, rep);
+    if (run_mini) run_geometry<strata::ds41::MiniGeom>(dev, router, split, experts, quant, all, seed, rep);
     if (emu) run_emu_selftest(rep);
-    if (quant) {
-        // the kernel on the contract's special blocks, then against the CPU library (all ISAs this machine has)
-        strata::ds41::cuda::ref::Rng rng(seed ? seed : 7);
-        run_quant_edge(dev, rng, rep);
-        run_quant_vs_cpu(dev, seed ? seed : 7, all ? 8 : 3, rep);
-    }
     std::printf("INFO emulation wall time %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     return rep.summary();
 }

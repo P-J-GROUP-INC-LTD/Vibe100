@@ -33,8 +33,9 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTR
                                                        HitEntry* DS41_RESTRICT hits, MissEntry* DS41_RESTRICT misses,
                                                        HitGroup* DS41_RESTRICT groups, SplitCounts* DS41_RESTRICT counts,
                                                        SplitHostRecord* DS41_RESTRICT host, uint32_t seq) {
-    constexpr int kExperts = G::kExperts, kTopK = G::kTopK;
-    constexpr int kSpMaxGroupedHits = kMaxExpertTokens * kTopK;            // 48: the hits of 8 tokens (a group's members, the leader table)
+    // Enumerators, NOT local `constexpr int` variables: a local constexpr variable perturbs nvcc's front end enough that ptxas allocates this kernel's
+    // registers differently (same instruction count, different order and register numbers: found by the SASS diff against the pre-template code).
+    enum : int { kExperts = G::kExperts, kTopK = G::kTopK, kSpMaxGroupedHits = kMaxExpertTokens * G::kTopK };   // 48: the hits of 8 tokens (a group's members, the leader table)
     static_assert(kSpMaxGroupedHits <= 64, "split: the grouping runs one thread per hit of a block of >= 64 threads (8 tokens x kTopK <= 64)");
     DS41_SHARED int s_wh[32];
     DS41_SHARED int s_wm[32];

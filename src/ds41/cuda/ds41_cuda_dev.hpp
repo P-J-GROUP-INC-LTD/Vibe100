@@ -1,5 +1,5 @@
-// src/ds41/cuda/ds41_cuda_dev.hpp - DS-D: the CUDA-runtime implementation of the parity `Dev` interface (cudaMalloc, events), plus
-// the little command-line helpers the three V100 parity programs share.  Host code only (compiled as C++, linked with cudart).
+// src/ds41/cuda/ds41_cuda_dev.hpp - DS-D / DS1-G: what the three V100 parity programs share: the shared CudaDev (ds41_cuda_runtime.hpp: cudaMalloc, mapped
+// pinned memory, streams, events), the device banner and the little command-line helpers.  Host code only (compiled as C++, linked with cudart).
 #pragma once
 
 #include <cuda_runtime.h>
@@ -11,73 +11,13 @@
 #include <vector>
 
 #include "ds41_parity_lib.hpp"
+#include "strata/ds41/cuda/ds41_cuda_runtime.hpp"
 
 namespace strata::ds41::cuda::parity {
 
-inline void cuda_check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "FAIL cuda: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(2);
-    }
-}
-
-struct CudaDev : Dev {
-    cudaStream_t s = nullptr;
-    CudaDev() {
-        cudaSetDeviceFlags(cudaDeviceMapHost);       // mapped pinned memory for the host records (a no-op under UVA; its error, if the device is already active, is not one)
-        (void) cudaGetLastError();
-        cuda_check(cudaSetDevice(0), "cudaSetDevice");
-        cuda_check(cudaStreamCreate(&s), "cudaStreamCreate");
-    }
-    ~CudaDev() override { cudaStreamDestroy(s); }
-    void* alloc(size_t bytes) override {
-        void* p = nullptr;
-        cuda_check(cudaMalloc(&p, bytes ? bytes : 16), "cudaMalloc");
-        return p;
-    }
-    void release(void* p) override { cudaFree(p); }
-    // mapped pinned host memory: the host reads it while the kernels run.  Under UVA (64-bit Linux / Windows with WDDM2 or TCC) the host pointer
-    // IS the device pointer; anything else cannot be used as a kernel argument here, so it is refused.
-    void* alloc_mapped(size_t bytes) override {
-        void* p = nullptr;
-        cuda_check(cudaHostAlloc(&p, bytes ? bytes : 16, cudaHostAllocMapped), "cudaHostAlloc(mapped)");
-        std::memset(p, 0, bytes ? bytes : 16);
-        void* dp = nullptr;
-        cuda_check(cudaHostGetDevicePointer(&dp, p, 0), "cudaHostGetDevicePointer");
-        if (dp != p) {
-            std::fprintf(stderr, "FAIL cuda: the device pointer of mapped host memory differs from the host pointer (no unified addressing): not supported by these programs\n");
-            std::exit(2);
-        }
-        return p;
-    }
-    void release_mapped(void* p) override { cudaFreeHost(p); }
-    void h2d(void* dst, const void* src, size_t n) override { cuda_check(cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, s), "h2d"); cuda_check(cudaStreamSynchronize(s), "h2d sync"); }
-    void d2h(void* dst, const void* src, size_t n) override { cuda_check(cudaMemcpyAsync(dst, src, n, cudaMemcpyDeviceToHost, s), "d2h"); cuda_check(cudaStreamSynchronize(s), "d2h sync"); }
-    void fill(void* p, int byte, size_t n) override { cuda_check(cudaMemsetAsync(p, byte, n, s), "memset"); }
-    void sync() override {
-        cuda_check(cudaStreamSynchronize(s), "stream sync (a kernel failed)");
-        cuda_check(cudaGetLastError(), "cudaGetLastError");
-    }
-    void* stream() override { return s; }
-    double time_us(const std::function<void()>& fn, int reps) override {
-        fn();
-        sync();
-        cudaEvent_t a, b;
-        cudaEventCreate(&a);
-        cudaEventCreate(&b);
-        cudaEventRecord(a, s);
-        for (int i = 0; i < reps; ++i) fn();
-        cudaEventRecord(b, s);
-        cudaEventSynchronize(b);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, a, b);
-        cudaEventDestroy(a);
-        cudaEventDestroy(b);
-        sync();
-        return 1000.0 * (double) ms / reps;
-    }
-    bool is_emulation() const override { return false; }
-};
+// The CUDA-runtime Dev (CudaDev, cuda_check) is the shared one: include/strata/ds41/cuda/ds41_cuda_runtime.hpp.
+using ::strata::ds41::cuda::CudaDev;
+using ::strata::ds41::cuda::cuda_check;
 
 /// "NVIDIA Tesla V100 (cc 7.0, 80 SMs, 31.7 GB)" and a warning when the card is not a Volta.
 inline void print_device() {

@@ -1,5 +1,6 @@
-// src/ds41/cuda/ds41_ref.hpp - DS-D: host references (FP64) and generators for the GPU router / split / expert parity programs.
-// Plain C++, no CUDA.  Shared by the V100 parity programs and by the CPU emulation test.
+// src/ds41/cuda/ds41_ref.hpp - DS-D / DS1-G: host references (FP64) and generators for the GPU router / split / expert parity programs, as
+// templates over the geometry G (include/strata/ds41/geom.hpp): every shape comes from G / ExpertDims<G>, never from a literal.
+// Plain C++, no CUDA.  Shared by the V100 parity programs and by the CPU emulation test (RealGeom and MiniGeom).
 //
 // Semantics are docs/deepseek/CONTRACTS.md; the MXFP4 decode is ggml's (dequantize_row_mxfp4: kvalues_fp4 * ggml_e8m0_to_fp32_half,
 // written out below including e = 0, 1 and 255).
@@ -112,8 +113,10 @@ struct BlobStyle {
     int down_e_lo = 118, down_e_hi = 122;       // down scale bytes
 };
 
-/// A random expert blob [gate][up][down] (kBlobBytes): every nibble uniform over the 16 codes, scale bytes per the style.
+/// A random expert blob [gate][up][down] (ExpertDims<G>::kBlobBytes): every nibble uniform over the 16 codes, scale bytes per the style.
+template <class G>
 inline void gen_blob(uint8_t* blob, Rng& rng, const BlobStyle& st = BlobStyle()) {
+    using D = ExpertDims<G>;
     auto fill = [&](uint8_t* base, int rows, int nblk, int elo, int ehi) {
         for (int r = 0; r < rows; ++r)
             for (int b = 0; b < nblk; ++b) {
@@ -122,9 +125,9 @@ inline void gen_blob(uint8_t* blob, Rng& rng, const BlobStyle& st = BlobStyle())
                 for (int j = 0; j < 16; ++j) blk[1 + j] = (uint8_t) rng.u32();
             }
     };
-    fill(blob + kBlobGate, kFF, kGateRowBlocks, st.gate_e_lo, st.gate_e_hi);
-    fill(blob + kBlobUp, kFF, kGateRowBlocks, st.gate_e_lo, st.gate_e_hi);
-    fill(blob + kBlobDown, kHidden, kDownRowBlocks, st.down_e_lo, st.down_e_hi);
+    fill(blob + D::kBlobGate, G::kFF, D::kActBlocks, st.gate_e_lo, st.gate_e_hi);
+    fill(blob + D::kBlobUp, G::kFF, D::kActBlocks, st.gate_e_lo, st.gate_e_hi);
+    fill(blob + D::kBlobDown, G::kHidden, D::kHBlocks, st.down_e_lo, st.down_e_hi);
 }
 
 /// Block `b` of a row with the 16 codes in order (0..15 in the low nibbles of bytes 0..7, 15..0 in bytes 8..15): used to make
@@ -174,36 +177,44 @@ inline double silu(double x) { return x / (1.0 + std::exp(-x)); }
 /// The clamps of CONTRACTS.md with NaN PROPAGATING (as torch.clamp does): g = g > 10 ? 10 : g, u = u > 10 ? 10 : (u < -10 ? -10 : u).
 inline double clamp_g(double g) { return g > (double) kSwigluLimit ? (double) kSwigluLimit : g; }
 inline double clamp_u(double u) { return u > (double) kSwigluLimit ? (double) kSwigluLimit : (u < -(double) kSwigluLimit ? -(double) kSwigluLimit : u); }
-/// h[r] = silu(min(g,10)) * clamp(u,-10,10) * w for the 2304 intermediate rows, from natural-order int8 activations.
+/// h[r] = silu(min(g,10)) * clamp(u,-10,10) * w for the G::kFF intermediate rows, from natural-order int8 activations.
+template <class G>
 inline void expert_h_q(const uint8_t* blob, const int8_t* xq, const float* xs, double w, std::vector<double>& h) {
-    h.assign(kFF, 0.0);
-    for (int r = 0; r < kFF; ++r) {
-        const double g = dot_q(blob + kBlobGate + (size_t) r * kGateRowBytes, kGateRowBlocks, xq, xs);
-        const double u = dot_q(blob + kBlobUp + (size_t) r * kGateRowBytes, kGateRowBlocks, xq, xs);
+    using D = ExpertDims<G>;
+    h.assign(G::kFF, 0.0);
+    for (int r = 0; r < G::kFF; ++r) {
+        const double g = dot_q(blob + D::kBlobGate + (size_t) r * D::kGateRowBytes, D::kActBlocks, xq, xs);
+        const double u = dot_q(blob + D::kBlobUp + (size_t) r * D::kGateRowBytes, D::kActBlocks, xq, xs);
         h[r] = silu(clamp_g(g)) * clamp_u(u) * w;
     }
 }
 /// the same with exact FP32 x.
+template <class G>
 inline void expert_h_f(const uint8_t* blob, const float* x, double w, std::vector<double>& h) {
-    h.assign(kFF, 0.0);
-    for (int r = 0; r < kFF; ++r) {
-        const double g = dot_f(blob + kBlobGate + (size_t) r * kGateRowBytes, kGateRowBlocks, x);
-        const double u = dot_f(blob + kBlobUp + (size_t) r * kGateRowBytes, kGateRowBlocks, x);
+    using D = ExpertDims<G>;
+    h.assign(G::kFF, 0.0);
+    for (int r = 0; r < G::kFF; ++r) {
+        const double g = dot_f(blob + D::kBlobGate + (size_t) r * D::kGateRowBytes, D::kActBlocks, x);
+        const double u = dot_f(blob + D::kBlobUp + (size_t) r * D::kGateRowBytes, D::kActBlocks, x);
         h[r] = silu(clamp_g(g)) * clamp_u(u) * w;
     }
 }
 /// y[row] = W2 . h, h given as natural-order int8 + scales; also the error-bound mass per row.
+template <class G>
 inline void expert_down_q(const uint8_t* blob, const int8_t* hq, const float* hs, std::vector<double>& y, std::vector<double>& mass) {
-    y.assign(kHidden, 0.0);
-    mass.assign(kHidden, 0.0);
-    for (int r = 0; r < kHidden; ++r) y[r] = dot_q(blob + kBlobDown + (size_t) r * kDownRowBytes, kDownRowBlocks, hq, hs, &mass[r]);
+    using D = ExpertDims<G>;
+    y.assign(G::kHidden, 0.0);
+    mass.assign(G::kHidden, 0.0);
+    for (int r = 0; r < G::kHidden; ++r) y[r] = dot_q(blob + D::kBlobDown + (size_t) r * D::kDownRowBytes, D::kHBlocks, hq, hs, &mass[r]);
 }
 /// y[row] = W2 . h with h in double (exact; the dot is accumulated in double from float-rounded h).
+template <class G>
 inline void expert_down_f(const uint8_t* blob, const std::vector<double>& h, std::vector<double>& y) {
-    y.assign(kHidden, 0.0);
-    std::vector<float> hf(kFF);
-    for (int i = 0; i < kFF; ++i) hf[i] = (float) h[i];
-    for (int r = 0; r < kHidden; ++r) y[r] = dot_f(blob + kBlobDown + (size_t) r * kDownRowBytes, kDownRowBlocks, hf.data());
+    using D = ExpertDims<G>;
+    y.assign(G::kHidden, 0.0);
+    std::vector<float> hf(G::kFF);
+    for (int i = 0; i < G::kFF; ++i) hf[i] = (float) h[i];
+    for (int r = 0; r < G::kHidden; ++r) y[r] = dot_f(blob + D::kBlobDown + (size_t) r * D::kDownRowBytes, D::kHBlocks, hf.data());
 }
 
 // ---- router ------------------------------------------------------------------------------------------------------------
@@ -211,13 +222,16 @@ inline double softplus_sqrt(double l) {
     const double sp = std::max(l, 0.0) + std::log1p(std::exp(-std::fabs(l)));
     return std::sqrt(sp);
 }
+template <class G>
 struct RouterRef {
-    std::vector<double> logits, mass;        // [384]
-    std::vector<double> s, v;                // [384] sqrt(softplus), s + bias
-    int ids[kTopK];                          // top-6, (value desc, index asc)
-    double w[kTopK];
+    std::vector<double> logits, mass;        // [kExperts]
+    std::vector<double> s, v;                // [kExperts] sqrt(softplus), s + bias
+    int ids[G::kTopK];                       // top-kTopK, (value desc, index asc)
+    double w[G::kTopK];
 };
-inline void router_ref(const float* x, const uint16_t* wg, const float* bias, RouterRef& r) {
+template <class G>
+inline void router_ref(const float* x, const uint16_t* wg, const float* bias, RouterRef<G>& r) {
+    constexpr int kExperts = G::kExperts, kHidden = G::kHidden, kTopK = G::kTopK;
     r.logits.assign(kExperts, 0.0);
     r.mass.assign(kExperts, 0.0);
     r.s.assign(kExperts, 0.0);

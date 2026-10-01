@@ -32,6 +32,6 @@ int main(int argc, char** argv) {
         o.tie_test = false;
         o.indep_Ts.clear();
     }
-    run_router_parity(dev, o, rep);
+    run_router_parity<strata::ds41::RealGeom>(dev, o, rep);
     return rep.summary();
 }

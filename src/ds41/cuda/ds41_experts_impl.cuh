@@ -640,12 +640,15 @@ ExpertKernelInfo expert_kernel_info(int NT, bool down) {
     }
 }
 
-void test_e8m0_table(float* out256, void* stream) {
-    dev::launch(dev::e8m0_table_kernel, dim3(1), dim3(256), 0, stream, out256);
-    dev::check_launch("test_e8m0_table");
-}
-
 }  // namespace strata::ds41::cuda
+
+/// The non-template entry points of the expert path (geometry independent): define them in exactly one translation unit of a program (the .cu; the
+/// emulator build's ds41_emu_impl.cpp), next to the DS41_INSTANTIATE_EXPERTS(G) lines.
+#define DS41_DEFINE_EXPERTS_COMMON()                                                                                                                    \
+    void ::strata::ds41::cuda::test_e8m0_table(float* out256, void* stream) {                                                                          \
+        ::strata::ds41::cuda::dev::launch(::strata::ds41::cuda::dev::e8m0_table_kernel, dim3(1), dim3(256), 0, stream, out256);                        \
+        ::strata::ds41::cuda::dev::check_launch("test_e8m0_table");                                                                                    \
+    }
 
 /// Explicit instantiation of the hot-expert host entry points for geometry G (the .cu: RealGeom; the emulator build: RealGeom and MiniGeom).
 #define DS41_INSTANTIATE_EXPERTS(G)                                                                                                                      \

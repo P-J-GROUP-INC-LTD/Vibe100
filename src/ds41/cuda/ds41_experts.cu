@@ -3,4 +3,5 @@
 // RealGeom, the engine's geometry.  `test_e8m0_table` (geometry independent) is defined there too.
 #include "ds41_experts_impl.cuh"
 
+DS41_DEFINE_EXPERTS_COMMON()
 DS41_INSTANTIATE_EXPERTS(::strata::ds41::RealGeom)

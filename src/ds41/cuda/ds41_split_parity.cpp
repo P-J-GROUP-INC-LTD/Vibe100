@@ -24,6 +24,6 @@ int main(int argc, char** argv) {
     o.Ts = a.list("--T", o.Ts);
     o.queued_layers = (int) a.num("--queued", o.queued_layers);
     Report rep;
-    run_split_parity(dev, o, rep);
+    run_split_parity<strata::ds41::RealGeom>(dev, o, rep);
     return rep.summary();
 }
