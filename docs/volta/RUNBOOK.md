@@ -26,6 +26,7 @@ comparison passes, **Gate 1** IQ3 decode reaches 40 tok/s.
 | 4 | `strata-device --selftest` | 5 min | |
 | 5 | `tools/volta/run_parity.sh` | 30-60 min (a full build) | Gate P |
 | 6 | `tools/volta/golden_compare.py` | 20-60 min per pack | Gate Q |
+| 6b | `tools/volta/logit_identity.sh` | 2-4 h, mostly unattended (builds are cached) | quality against llama.cpp |
 | 7 | `tools/volta/profile_decode.sh` | 15 min | |
 | 8 | A/B switches | an afternoon | Gate 1 |
 | 9 | DeepSeek: download, parity programs, CPU benchmark | download time + 30 min | |
@@ -258,6 +259,39 @@ tens of minutes.
 **Send back:** `~/golden/<pack>/report.json` and `report.txt`, and `cand.log` and `ref.log` from the same folder (they hold the engine's NUMA
 start-up lines and the batched-prefill speed of each run). Not the `*.bin` logits files (`--delete-logits` removes them).
 
+## 6b. Quality against llama.cpp (logit identity)
+
+Step 6 compares the engine with itself (fast paths on against off). The question the owner actually asked is the other one: *does the same input give the same output as llama.cpp, with no loss of
+model quality?* Bit-for-bit against llama.cpp is impossible (different kernels sum in different orders; llama.cpp's own CPU and CUDA builds differ from each other), so the test is: **how far is the engine
+from llama.cpp, compared with how far llama.cpp's CPU build is from its CUDA build** (the noise floor), measured the way llama.cpp measures quantisation quality (mean KL divergence, same top-1, PPL change). The
+same script also checks, bit for bit, what *should* be identical on this card: the port with its fast paths off against upstream Strata built for sm_70, the NUMA mirror on against off, the same command twice.
+What each row proves and how to read it: [LOGIT_IDENTITY.md](LOGIT_IDENTITY.md).
+
+It needs what `./setup.sh` left behind: `.venv`, `third_party/llama.cpp` (the pinned commit), the original GGUF in `Strata-data/models/` (the config's `--native`), `strata-iq3_xxs.json`, and CUDA 12.8. It builds llama.cpp twice
+(CUDA for sm_70, CPU only) and upstream Strata once, into `build-logit-identity/`, and runs the engine a dozen or so times; the first run of everything takes hours, a repeat with `--skip-build` much less. Disk: ~10 GB
+beyond the builds (a 4 GB reference file, one 2 GB dump at a time). **Stop the server first** (it holds the card and 40+ GB of page cache).
+
+```
+tools/volta/logit_identity.sh --dry-run                                   # prints every command, runs nothing
+tools/volta/logit_identity.sh --config strata-iq3_xxs.json --out ~/logit_identity/iq3_xxs 2>&1 | tee ~/logit_identity_iq3_xxs.txt
+```
+
+Useful variations: `--tier 1` (bit-exact rows only: builds upstream, five engine runs) or `--tier 2`; `--only 1c,1a`; `--skip-build` once the builds exist; `--llama-cuda-args "-ngl 99 --cpu-moe"` if llama.cpp's CUDA run
+runs out of memory (it keeps every expert on the CPU); `--ctx 8192 --chunks 3` for a second pass that also reaches the QSA sparse selection in the batched path; `--kv-fp16-row` to take the engine's int8 KV cache out of the comparison.
+For the canonical Q2_0 pack (`--config strata-q2_0.json`, full logits through `--dump-logits`) row 1a is SKIPPED (upstream cannot run that pack without AVX512-VBMI) and so is 1d.
+
+The last lines are one row per question, each PASS, FAIL, SKIP (with the reason) or INFO (a measurement, no pass mark). **Tier 2's pass rule is provisional**: it is "mean KL and top-1 mismatch no worse than max(2 x llama.cpp's own CPU-vs-CUDA floor, 5e-4 nats / 1 %), paired
+ln-PPL change within 2 standard errors of zero"; this first run is what confirms or moves it, so send the numbers even when every row passes.
+
+**Send back:** the whole terminal output (`~/logit_identity_iq3_xxs.txt`), and the results folder without the large files:
+
+```
+tar czf ~/logit-identity.tgz --exclude='*.kld' --exclude='*.bin' --exclude='*.logits' -C ~/logit_identity iq3_xxs
+ls -lh ~/logit-identity.tgz
+```
+
+(`summary.txt`, `results.tsv`, `env.txt`, every `report.txt` / `report.json`, the engine logs and llama.cpp's `tier2/llama_cpu_vs_cuda.log` stay in; the 4 GB reference `cuda.kld` and the logits dumps stay behind.)
+
 ## 7. `tools/volta/profile_decode.sh` (the Phase 3 profile)
 
 Where one decode step goes. It runs the engine, so it comes after the build and the checks of steps 4-6. It runs the engine exactly as the server does (`--stats`, 128 tokens, the config's arguments), then the
@@ -383,8 +417,8 @@ the node-local read bandwidth that `mlc_bandwidth_matrix.txt` shows once you hav
 
 ```
 cd ~
-tar czf ~/send-back.tgz --exclude='*.bin' --exclude='*.nsys-rep' --exclude='*.sqlite' \
-    nvidia-smi-q.txt parity-logs.tgz golden profile ab ds41.manifest.json Vibe100/engine/BUILD.json Vibe100/strata-*.log 2>/dev/null
+tar czf ~/send-back.tgz --exclude='*.bin' --exclude='*.nsys-rep' --exclude='*.sqlite' --exclude='*.kld' --exclude='*.logits' \
+    nvidia-smi-q.txt parity-logs.tgz golden profile ab logit_identity ds41.manifest.json Vibe100/engine/BUILD.json Vibe100/strata-*.log 2>/dev/null
 ls -lh ~/send-back.tgz
 ```
 

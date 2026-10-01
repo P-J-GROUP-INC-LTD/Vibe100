@@ -71,7 +71,9 @@ TWO MODES
              draft layer), so this source KEEPS the config's speculative-decoding flags for every pack (setup.py's config has
              them) and stops with a message when the engine arguments have none.  Metrics: top-1 agreement, perplexity of the
              target tokens, the paired NLL delta, max |dlogp|, NaN / inf in the log-probs; NOT KL or max |dlogit| (the logits
-             themselves are not written).
+             themselves are not written) - unless the engine has STRATA_LOGITS_DUMP (verify.cpp: the whole row of every logpos line, same
+             layout as --dump-logits), which `--exact` and `--ref-kld` switch on (`--logits-dump on` forces it): then the logits exist and
+             those two modes compare / score them in full.
     auto     dump for a non-native pack, logpos for a native one.
 
   Either way the scored rows depend on the batched prefill of the tokens before them - which is the point.
@@ -97,6 +99,37 @@ WHICH PROMPT.  Everything that matters on a long prompt is invisible on a short 
 this repository's own sources, concatenated) - well past 2,051 and past 4 chunks.  Use it for the gate; `chat` and `code`
 are for quick checks of the plumbing.
 
+BIT-EXACT: `--exact`.  The metrics above say "close"; `--exact` says "identical", for the cases where identical is the claim: the same
+engine twice (determinism), the port with its fast paths off against upstream built for sm_70, the NUMA mirror on against off.  It compares
+the two runs' logits BIT FOR BIT (the `dump` source, and the `logpos` source when both engines write STRATA_LOGITS_DUMP: float32 rows) or
+their log-probabilities (`logpos` without the dump: the file has them to 9 decimals, so that is "identical to 1e-9", not a statement about
+bits - the report says which it was).  Reported: identical or not, the first differing position (and vocabulary index), the number of rows
+and values that differ, the largest distance in float32 ULPs (the number of representable floats between the two values; 1 = adjacent),
+the largest absolute difference, and how many rows changed their top-1.  Exit status 0 only when everything is identical; 1 when not.
+Two references need more than the same binary twice: `--ref-exe` / `--cand-exe` give a side its own engine (upstream's), and
+`--reuse-ref DIR` takes the reference run from an earlier workdir instead of running it again (several candidates, one baseline).
+
+AGAINST LLAMA.CPP: `--ref-kld BASE`.  Bit-exact against llama.cpp is impossible - its CPU and CUDA builds do not match each other bit for
+bit, every kernel sums in its own order - so the claim is "no more different from llama.cpp than llama.cpp's own backends are from each
+other".  BASE is the file `llama-perplexity -m MODEL.gguf -f text -c 4096 --kl-divergence-base BASE` writes (format and scoring rule:
+tools/volta/kld_format.py, from perplexity.cpp).  It holds the tokens of the text split into independent n_ctx-token chunks and, for the
+second half of each chunk, llama.cpp's next-token distribution.  The harness runs the Strata engine on EXACTLY those chunk tokens - one engine
+launch per chunk, each an independent sequence from position 0 like llama.cpp's - with the first n_ctx/2 tokens through the batched prefill
+(where the Volta kernels live) and the rest through the decode path, scores the same positions, and prints llama.cpp's own statistics: mean
+KL divergence, same-top-1 fraction, PPL of both, the paired change of ln PPL with its standard error, change of the right token's probability.
+  * `dump` source (non-native packs: Q2_0): full logits -> everything above.
+  * `logpos` source (native IQ packs): through `strata --serve`; with an engine that has STRATA_LOGITS_DUMP (verify.cpp, this port) the
+    full logits rows are written too -> everything above.  Without it only the target token's log-probability and the top-1 id are known:
+    PPL, the paired NLL change, same-top-1 and the probability change - NOT the KL, which needs the whole row; the report says so.
+  * `--kld-floor LOG` is the stdout of `llama-perplexity --kl-divergence --kl-divergence-base BASE` run with a DIFFERENT llama.cpp backend
+    (CPU build against a CUDA-built BASE): the noise floor between two trusted implementations.  Then the verdict (PROVISIONAL, to be
+    confirmed by the first real run) is PASS when the mean KL and 1 - same-top-1 are no worse than max(2 x the floor's, a small absolute
+    floor: --kld-abs-kl, --kld-abs-top1) and the paired ln-PPL change is within 2 standard errors of zero (or within 2 x the floor's own).
+    Without `--kld-floor` the run is only MEASURED, unless --max-kl or --kld-min-top1 is given.
+The first n_ctx/2 tokens go through the batched path, so the QSA selection (2,051 cells per query) is only exercised past n_ctx = 4,102;
+a BASE made with -c 4096 does not reach it (Gate Q's 33,000-token prompt does), one made with -c 8192 does.
+Exit status 0 PASS / MEASURED, 1 FAIL, 2 the harness could not run.
+
 LOGITS FILE FORMAT (what `--dump-logits` writes, and what `--ref-logits` reads): little-endian
     int32 n_vocab, int32 n_rows, then rows of n_vocab float32.
 A `.npy` file of shape (rows, n_vocab) is accepted too (numpy.save of a float32 array).  The engine writes the rows of
@@ -121,6 +154,10 @@ config's `cwd`.  Paths INSIDE --engine-args or the config are the engine's own a
     .venv/bin/python tools/volta/golden_compare.py --engine-config strata-iq3_xxs.json --prompt-name long --mode greedy --max-new 256
     # compare two logits files made elsewhere:
     .venv/bin/python tools/volta/golden_compare.py --prompt-file text.txt --cand-logits v100.bin --ref-logits llamacpp.npy
+    # bit-exact: the same command twice (determinism), then the port against upstream's sm_70 build (--ref-exe) with fast paths off
+    .venv/bin/python tools/volta/golden_compare.py --engine-config strata-iq3_xxs.json --prompt-name long --tail 512 --exact --ref-env ""
+    # against llama.cpp on the same GGUF (BASE from llama-perplexity --kl-divergence-base), with llama.cpp's own CPU-vs-CUDA numbers as the floor
+    .venv/bin/python tools/volta/golden_compare.py --engine-config strata-iq3_xxs.json --ref-kld cuda.kld --kld-floor cpu_vs_cuda.log
 
 PYTHON.  Needs numpy, and `regex` to tokenize text (tools/strata_tokenizer.py): `./setup.sh` installs both into the repository's
 .venv, so run this with `.venv/bin/python`; with another interpreter `pip install numpy regex`.
@@ -137,6 +174,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -155,6 +193,9 @@ except ImportError:
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 PROMPT_DIR = HERE / "prompts"
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import kld_format as K  # noqa: E402  (llama.cpp's --kl-divergence-base file and the scoring rule)
 
 DEFAULT_REF_ENV = "STRATA_VOLTA_ATTN=0 STRATA_PREFILL_F16_GEMM=0"
 CHAT_WRAP = "<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"   # tools/calibrate.py:chat_ids
@@ -627,7 +668,8 @@ def choose_split(tokens: list[int], k0: int, search: int = 6000) -> tuple[int, i
                        "and --prefill-until, or use a prompt with more variety")
 
 
-def build_serve_args(base: list[str], plan: Plan, *, fixed_experts: bool, keep_spec: bool = True, extra: list[str] | None = None) -> list[str]:
+def build_serve_args(base: list[str], plan: Plan, *, fixed_experts: bool, keep_spec: bool = True, extra: list[str] | None = None,
+                     short_margin: int = 8, no_root: bool = False) -> list[str]:
     """`strata --serve ...` for the logpos source: the configured arguments, the split token and the window length.
 
     `strata --serve` refuses to start without `--spec T` (T >= 2), `--mtp DIR` and `--prefill CHUNK` > 0 (generate.cpp:3681-3685: a
@@ -654,7 +696,11 @@ def build_serve_args(base: list[str], plan: Plan, *, fixed_experts: bool, keep_s
         args = set_flag(args, "--pcie-frac", "0")
         args = set_flag(args, "--adapt-swaps", "0")
     rows = plan.n_tokens - 1 - plan.split_at
-    args += ["--max-context", str(plan.max_context), "--turn-token", str(plan.turn_token), "--short-read", str(rows + 8)]
+    if no_root:     # --ref-kld: no extra "system prompt" split at an earlier occurrence of the turn token (the chunks are plain text)
+        args = set_flag(args, "--prompt-cache-root", "0")
+    # `short_margin`: the tail may be this many tokens longer than the rows scored.  The first part (split_at tokens) must be LONGER than
+    # --short-read to go through the batched path, so --ref-kld, whose split is at n_ctx/2, needs 0 (split_at > rows)
+    args += ["--max-context", str(plan.max_context), "--turn-token", str(plan.turn_token), "--short-read", str(rows + short_margin)]
     return ["--serve"] + args + (extra or [])
 
 
@@ -763,14 +809,23 @@ def compare_logpos(ref: dict[int, dict], cand: dict[int, dict], bad_ref: int, ba
 
 
 def run_serve_teacher(label: str, exe: list[str], args: list[str], base_env: dict[str, str], env_extra: dict[str, str], cwd: str | None,
-                      workdir: Path, tokens: list[int], timeout: float | None) -> dict:
-    """Start `strata --serve`, send one `GEN 1 <ids>`, wait for DONE, QUIT.  STRATA_LOGPOS goes to <label>.logpos."""
-    short = "ref" if label == "reference" else "cand"
+                      workdir: Path, tokens: list[int], timeout: float | None, stem: str | None = None,
+                      logits: bool = False) -> dict:
+    """Start `strata --serve`, send one `GEN 1 <ids>`, wait for DONE, QUIT.  STRATA_LOGPOS goes to <stem>.logpos (stem: ref / cand by label).
+    `logits`: also set STRATA_LOGITS_DUMP=<stem>.logits - the full logits row of every logpos line, from an engine that has the hook
+    (verify.cpp); an engine without it simply writes no such file and the info has no "logits" key."""
+    short = stem or ("ref" if label == "reference" else "cand")
     logpos = workdir / f"{short}.logpos"
     logpos.unlink(missing_ok=True)
     env = dict(base_env)
     env.update(env_extra)
     env["STRATA_LOGPOS"] = str(logpos)
+    logits_path = workdir / f"{short}.logits"
+    logits_path.unlink(missing_ok=True)
+    if logits:
+        env["STRATA_LOGITS_DUMP"] = str(logits_path)
+    else:
+        env.pop("STRATA_LOGITS_DUMP", None)
     cmd = [*exe, *args]
     log = workdir / f"{short}.log"
     print(f"[{label}] {shlex.quote(cmd[0])} {' '.join(shlex.quote(a) for a in args[:5])} ... (serve; STRATA_LOGPOS={logpos.name})", flush=True)
@@ -803,8 +858,124 @@ def run_serve_teacher(label: str, exe: list[str], args: list[str], base_env: dic
         rc = sess.close()
         if info["returncode"] == 0 and rc not in (0, None):
             info["returncode"] = rc
+    if logits and logits_path.exists() and logits_path.stat().st_size > 8:
+        info["logits"] = str(logits_path)
     print(f"[{label}] exit {info['returncode']} in {info.get('seconds', 0):.0f} s", flush=True)
     return info
+
+
+# ====================================================================================================== --exact: bit for bit
+
+
+def ulp_key(x: np.ndarray) -> np.ndarray:
+    """float32 -> int64 that grows with the value, so |key(a) - key(b)| is the number of representable float32 values between a and b
+    (1 = neighbours).  -0.0 and +0.0 share key 0.  Meaningless for NaN (the callers screen it)."""
+    s = np.ascontiguousarray(x, dtype=np.float32).view("<i4").astype(np.int64)
+    return np.where(s >= 0, s, -(s & 0x7FFFFFFF))
+
+
+def exact_compare_rows(ref_rows, cand_rows, positions: list[int], chunk: int = 16) -> dict:
+    """Compare two sets of logits rows BIT FOR BIT.  `ref_rows(lo, hi)` / `cand_rows(lo, hi)` return rows lo..hi-1 of each side (float32,
+    same order as `positions`).  A value is different when its 32 bits differ (so a NaN payload, or +0.0 against -0.0, counts);
+    the ULP distance and the absolute difference are taken over the values that differ and are not NaN."""
+    n = len(positions)
+    if n == 0:
+        raise HarnessError("--exact: the two runs have no position in common")
+    out: dict = {"kind": "logits", "rows": n, "values_per_row": None, "rows_differing": 0, "values_differing": 0, "nan_values": 0,
+                 "first_diff_position": None, "first_diff_index": None, "first_diff_values": None, "max_ulp": 0, "max_abs_diff": 0.0,
+                 "top1_changed_rows": 0, "differing_positions": []}
+    for s0 in range(0, n, chunk):
+        r = np.ascontiguousarray(ref_rows(s0, s0 + chunk), dtype=np.float32)
+        c = np.ascontiguousarray(cand_rows(s0, s0 + chunk), dtype=np.float32)
+        if r.shape != c.shape:
+            raise HarnessError(f"--exact: the two runs' rows have different shapes ({r.shape} against {c.shape}): not the same vocabulary?")
+        out["values_per_row"] = int(r.shape[1])
+        diff = r.view("<u4") != c.view("<u4")
+        row_diff = diff.any(axis=1)
+        if not row_diff.any():
+            continue
+        out["rows_differing"] += int(row_diff.sum())
+        out["values_differing"] += int(diff.sum())
+        nan = np.isnan(r) | np.isnan(c)
+        out["nan_values"] += int((diff & nan).sum())
+        real = diff & ~nan
+        if real.any():
+            out["max_ulp"] = max(out["max_ulp"], int(np.abs(ulp_key(r) - ulp_key(c))[real].max()))
+            with np.errstate(invalid="ignore"):
+                d = np.abs(r.astype(np.float64) - c.astype(np.float64))
+            d = np.where(real & np.isfinite(d), d, 0.0)
+            out["max_abs_diff"] = max(out["max_abs_diff"], float(d.max()))
+        rows = np.nonzero(row_diff)[0]
+        out["top1_changed_rows"] += int((r[rows].argmax(axis=1) != c[rows].argmax(axis=1)).sum())
+        for i in rows:
+            if len(out["differing_positions"]) < 20:
+                out["differing_positions"].append(int(positions[s0 + int(i)]))
+        if out["first_diff_position"] is None:
+            i = int(rows[0])
+            j = int(np.argmax(diff[i]))
+            out["first_diff_position"], out["first_diff_index"] = int(positions[s0 + i]), j
+            out["first_diff_values"] = [float(r[i, j]), float(c[i, j])]
+    out["identical"] = out["rows_differing"] == 0
+    return out
+
+
+def exact_compare_logpos(ref: dict[int, dict], cand: dict[int, dict]) -> dict:
+    """The `logpos` source without full logits: the log-probability of the target, the top-1 id and its log-probability per position, as the
+    engine printed them (9 decimals).  Equal text = equal here; this is NOT a statement about the bits of the logits."""
+    common = sorted(set(ref) & set(cand))
+    same = lambda a, b: a == b or (isinstance(a, float) and math.isnan(a) and math.isnan(b))
+    out: dict = {"kind": "logpos", "rows": len(common), "only_reference": len(set(ref) - set(cand)), "only_candidate": len(set(cand) - set(ref)),
+                 "rows_differing": 0, "first_diff_position": None, "first_diff_values": None, "max_abs_diff": 0.0, "top1_changed_rows": 0,
+                 "differing_positions": []}
+    if not common:
+        raise HarnessError("--exact: the two runs have no position in common")
+    for p in common:
+        a, b = ref[p], cand[p]
+        if all(same(a[k], b[k]) for k in ("target", "logprob", "top", "top_logprob")):
+            continue
+        out["rows_differing"] += 1
+        if len(out["differing_positions"]) < 20:
+            out["differing_positions"].append(p)
+        if out["first_diff_position"] is None:
+            out["first_diff_position"], out["first_diff_values"] = p, [a["logprob"], b["logprob"]]
+        out["top1_changed_rows"] += int(a["top"] != b["top"])
+        for k in ("logprob", "top_logprob"):
+            if math.isfinite(a[k]) and math.isfinite(b[k]):
+                out["max_abs_diff"] = max(out["max_abs_diff"], abs(a[k] - b[k]))
+    out["identical"] = out["rows_differing"] == 0 and not out["only_reference"] and not out["only_candidate"]
+    return out
+
+
+def format_exact_report(rep: dict) -> str:
+    c, e = rep["config"], rep["exact"]
+    L = ["=" * 100, f"golden_compare --exact: mode {c['mode']}, {c['n_tokens']} prompt tokens; reference: {c.get('reference', '?')}"]
+    L += [f"  note: {x}" for x in rep["notes"]]
+    L += run_lines(rep)
+    L.append("-" * 100)
+    span = f" (positions {c['first_pos']}..{c['last_pos']})" if c.get("first_pos") is not None else ""
+    if e["kind"] == "logits":
+        L.append(f"  compared                 {e['rows']} rows of {e['values_per_row']} float32 logits{span}, bit for bit")
+        L.append(f"  rows differing           {e['rows_differing']} of {e['rows']}   values differing {e['values_differing']}"
+                 + (f"   (of which NaN involved: {e['nan_values']})" if e["nan_values"] else ""))
+        if not e["identical"]:
+            fv = e["first_diff_values"]
+            L.append(f"  first difference         position {e['first_diff_position']}, vocabulary index {e['first_diff_index']}: "
+                     f"reference {fv[0]!r} vs candidate {fv[1]!r}")
+            L.append(f"  largest distance         {e['max_ulp']} ULP (float32 neighbours = 1), |difference| {e['max_abs_diff']:.3e}")
+            L.append(f"  top-1 changed            {e['top1_changed_rows']} of {e['rows']} rows")
+            L.append(f"  first differing rows     positions {e['differing_positions']}")
+    else:
+        L.append(f"  compared                 {e['rows']} log-probability rows{span} as printed (9 decimals): equal text, "
+                 "NOT a bitwise statement about the logits (no STRATA_LOGITS_DUMP on one side)")
+        L.append(f"  rows differing           {e['rows_differing']} of {e['rows']}   only in the reference {e['only_reference']}, "
+                 f"only in the candidate {e['only_candidate']}")
+        if not e["identical"] and e["first_diff_position"] is not None:
+            fv = e["first_diff_values"]
+            L.append(f"  first difference         position {e['first_diff_position']}: log p(target) reference {fv[0]!r} vs candidate {fv[1]!r}")
+            L.append(f"  largest |d log p|        {e['max_abs_diff']:.3e} nats;  top-1 changed {e['top1_changed_rows']} rows")
+    L += ["=" * 100, "RESULT: " + ("IDENTICAL" if e["identical"] else "DIFFERENT")]
+    L += [f"  - {r}" for r in rep["reasons"]]
+    return "\n".join(L)
 
 
 # ====================================================================================================== the report
@@ -839,10 +1010,9 @@ def gate_q_status(rep: dict) -> tuple[str, list[str]]:
     return ("PASS" if not gaps else "not established"), gaps
 
 
-def format_report(rep: dict) -> str:
-    c, m, g, th = rep["config"], rep.get("metrics"), rep.get("greedy"), rep["thresholds"]
-    L = ["=" * 100, f"golden_compare: mode {c['mode']}, {c['n_tokens']} prompt tokens; reference: {c.get('reference', '?')}"]
-    L += [f"  note: {x}" for x in rep["notes"]]
+def run_lines(rep: dict) -> list[str]:
+    """One line per side of a two-run report: how long it took, how fast, and the environment it ran in."""
+    L = []
     for k in ("candidate", "reference"):
         r = rep["runs"].get(k)
         if not r:
@@ -855,9 +1025,18 @@ def format_report(rep: dict) -> str:
             if pp:
                 sp += f" (batched part {pp[0]['tok_s']:.0f} tok/s)"
             env = " ".join(f"{a}={b}" for a, b in r["env"].items()) or "(the base environment)"
-            L.append(f"  {k:<9} {r['seconds']:.0f} s, exit {r['returncode']}{sp}; env: {env}")
+            exe = f"; engine {r['exe']}" if r.get("exe") else ""
+            L.append(f"  {k:<9} {r['seconds']:.0f} s, exit {r['returncode']}{sp}; env: {env}{exe}")
         else:
             L.append(f"  {k:<9} logits file {r['path']}")
+    return L
+
+
+def format_report(rep: dict) -> str:
+    c, m, g, th = rep["config"], rep.get("metrics"), rep.get("greedy"), rep["thresholds"]
+    L = ["=" * 100, f"golden_compare: mode {c['mode']}, {c['n_tokens']} prompt tokens; reference: {c.get('reference', '?')}"]
+    L += [f"  note: {x}" for x in rep["notes"]]
+    L += run_lines(rep)
     if m:
         L.append("-" * 100)
         span = f"   (positions {c['first_pos']}..{c['last_pos']})" if c.get("first_pos") is not None else ""
@@ -897,8 +1076,13 @@ def format_report(rep: dict) -> str:
 
 
 def finish(a, workdir: Path, rep: dict) -> int:
-    text = format_report(rep) if rep.get("metrics") is not None else \
-        "golden_compare: " + ("; ".join(rep["reasons"]) or "no result") + "".join(f"\n  note: {x}" for x in rep["notes"])
+    if rep.get("exact") is not None:
+        text = format_exact_report(rep)
+    elif rep.get("kld") is not None:
+        text = format_kld_report(rep)
+    else:
+        text = format_report(rep) if rep.get("metrics") is not None else \
+            "golden_compare: " + ("; ".join(rep["reasons"]) or "no result") + "".join(f"\n  note: {x}" for x in rep["notes"])
     print(text)
     (workdir / "report.txt").write_text(text + "\n", encoding="utf-8")
     jp = a.json or str(workdir / "report.json")
@@ -983,16 +1167,449 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--max-ppl-rel", type=float, default=0.02, help="max |PPL_cand - PPL_ref| / PPL_ref")
     t.add_argument("--max-kl", type=float, default=None, help="optional: max mean KL (nats)")
     t.add_argument("--max-abs-dlogit", type=float, default=None, help="optional: max |dlogit|")
+    e = ap.add_argument_group("bit-exact comparison (--exact)")
+    e.add_argument("--exact", action="store_true",
+                   help="compare the two runs BIT FOR BIT (logits; or printed log-probabilities when a side has no STRATA_LOGITS_DUMP) and say "
+                        "identical / the first differing position / how many rows / the largest ULP distance; exit 0 only if identical")
+    e.add_argument("--ref-exe", help="the engine binary of the REFERENCE run only (e.g. upstream's sm_70 build); default: the candidate's")
+    e.add_argument("--cand-exe", help="the engine binary of the CANDIDATE run only; default: the reference's")
+    e.add_argument("--reuse-ref", metavar="DIR", help="take the reference run from the --workdir of an earlier run on the SAME prompt and plan "
+                   "(its ref.* files) instead of running it again: one baseline, several candidates")
+    e.add_argument("--logits-dump", choices=["auto", "on", "off"], default="auto",
+                   help="serve-mode (logpos) runs: ask the engine for STRATA_LOGITS_DUMP, the full logits rows.  auto: on for --exact and "
+                        "--ref-kld, off otherwise.  An engine without the hook just writes nothing and the comparison falls back")
+    k = ap.add_argument_group("against llama.cpp (--ref-kld)")
+    k.add_argument("--ref-kld", metavar="BASE", help="a llama.cpp `--kl-divergence-base` file: score the engine on its text, chunk by chunk, "
+                   "with llama.cpp's own statistics (KL, same top-1, PPL, paired ln PPL change, dp)")
+    k.add_argument("--kld-chunks", type=int, default=0, help="use only the first N chunks of the file (default: all)")
+    k.add_argument("--kld-bos", default="auto", metavar="auto|none|ID",
+                   help="what llama.cpp writes over the first token of every chunk: none, a BOS token id, or auto = read the GGUF "
+                        "(--kld-gguf, else the engine's --native) for add_bos_token / bos_token_id")
+    k.add_argument("--kld-gguf", help="the GGUF llama.cpp ran on (for --kld-bos auto; default: the engine arguments' --native)")
+    k.add_argument("--kld-trim-vocab", action="store_true",
+                   help="the engine's logits rows are longer than the file's n_vocab (padding rows): compare the first n_vocab columns")
+    k.add_argument("--kld-floor", metavar="LOG", help="stdout of `llama-perplexity --kl-divergence` on a DIFFERENT llama.cpp backend against the "
+                   "same BASE (the noise floor): turns the run into the provisional PASS / FAIL rule (see the header)")
+    k.add_argument("--kld-factor", type=float, default=2.0, help="the rule allows this many times the floor's KL and top-1 mismatch (default 2)")
+    k.add_argument("--kld-abs-kl", type=float, default=5e-4,
+                   help="... but never less than this mean KL in nats (default 5e-4: a different engine is not a different backend of the "
+                        "same one; below it a mean KL is rounding noise, a Q8_0 quantisation of a 7B model scores about that)")
+    k.add_argument("--kld-abs-top1", type=float, default=0.01,
+                   help="... and never less than this share of positions whose top-1 differs (default 0.01)")
+    k.add_argument("--kld-min-top1", type=float, default=None, help="no floor given: PASS needs same-top-1 >= this (default: no verdict)")
+    k.add_argument("--kld-search", type=int, default=256,
+                   help="logpos source: how far past n_ctx/2 to look for a token to split the chunk at (its last occurrence; default 256)")
+    k.add_argument("--keep-logits", action="store_true", help="keep the per-chunk logits files (about 2 GB per 4096-token chunk) after scoring")
+    ap.add_argument("--summarize-report", metavar="REPORT_JSON",
+                    help="print `STATUS<TAB>one line` for a report.json this tool wrote, and exit (for scripts)")
+    ap.add_argument("--print-config", action="store_true",
+                    help="print KEY=VALUE lines about the engine config (EXE, GGUF, PACK, NATIVE_PACK, ...) for scripts, and exit")
     ap.add_argument("--dry-run", action="store_true", help="print the plan and the two engine commands, run nothing (the runs take minutes each)")
     ap.add_argument("--json", help="write the full report as JSON (default <workdir>/report.json)")
     return ap
 
 
+# ================================================================================================ --ref-kld: against llama.cpp
+
+
+def pinned_gguf_urls(gguf: str) -> list[str]:
+    """Where setup.py got a Qwen3.8-Flash-Next GGUF shard from (HF_REVISIONS pins the commit): the URLs of its two shards, so a script can say how to
+    fetch the SAME file llama.cpp must load.  Only the original model's repository (the Coder and Swift releases have their own); [] when the
+    file name or setup.py is not of that shape."""
+    m = re.match(r"^Qwen3\.8-Flash-Next-GSQ-RCO-(?P<q>[A-Z0-9_]+)-0000\d-of-00002\.gguf$", Path(gguf).name)
+    try:
+        text = (ROOT / "setup.py").read_text(encoding="utf-8")
+    except OSError:
+        return []
+    rev = re.search(r'"ISTA-DASLab/Qwen3\.8-Flash-Next-GSQ-RCO-GGUF":\s*"([0-9a-f]{40})"', text)
+    if not m or not rev:
+        return []
+    q = m.group("q")
+    return [f"https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/{rev.group(1)}/{q}/Qwen3.8-Flash-Next-GSQ-RCO-{q}-0000{i}-of-00002.gguf"
+            for i in (1, 2)]
+
+
+def print_config(a) -> int:
+    """--print-config: what a script needs to know about an engine config, as KEY=VALUE lines (no quoting: none of the values has a newline)."""
+    ctx = engine_context(a, offline=True, make_workdir=False)
+    native_gguf = flag_value(ctx.base_args, "--native")
+    rows = {"EXE": ctx.cand_exe[-1] if ctx.cand_exe else "", "CWD": ctx.cwd or "", "PACK": str(ctx.pack_dir),
+            "NATIVE_PACK": "1" if ctx.native else "0", "GGUF": absolute(native_gguf, ctx.cwd) or "" if native_gguf else "",
+            "TOKENIZER": ctx.tok_dir or "", "SPEC": flag_value(ctx.base_args, "--spec") or "", "MTP": flag_value(ctx.base_args, "--mtp") or "",
+            "EXPERT_CACHE": flag_value(ctx.base_args, "--expert-cache") or "", "MAX_CONTEXT": flag_value(ctx.base_args, "--max-context") or "",
+            "KV": flag_value(ctx.base_args, "--kv") or ""}
+    rows["GGUF_URLS"] = " ".join(pinned_gguf_urls(rows["GGUF"])) if rows["GGUF"] else ""
+    for k, v in rows.items():
+        print(f"{k}={v}")
+    return 0
+
+
+def choose_turn_after(tokens: list[int], first: int, search: int = 256) -> tuple[int, int]:
+    """(position, token) to split a chunk at for the logpos source: the first position p >= first whose token has no later occurrence (the
+    engine splits at the LAST occurrence of --turn-token), preferring - within `search` positions - a token that occurs once in the
+    whole chunk.  The positions before p go through the batched path, p .. n-2 through the verify windows, whose log-probabilities are
+    written; llama.cpp scores first .. n-2, so p == first loses nothing and p > first loses the p - first positions before it."""
+    n = len(tokens)
+    count: dict[int, int] = {}
+    last: dict[int, int] = {}
+    for i, t in enumerate(tokens):
+        count[t] = count.get(t, 0) + 1
+        last[t] = i
+    hi = min(n - 2, first + search)
+    for p in range(first, hi + 1):
+        if count[tokens[p]] == 1:
+            return p, tokens[p]
+    for p in range(first, hi + 1):
+        if last[tokens[p]] == p:
+            return p, tokens[p]
+    raise HarnessError(f"no token between positions {first} and {hi} of this chunk has its last occurrence there, so the verify-window split "
+                       f"cannot be placed (--kld-search {search}); raise --kld-search")
+
+
+def resolve_bos(a, ctx: Ctx, kb, notes: list[str]) -> int | None:
+    v = str(a.kld_bos)
+    if v == "none":
+        bos = None
+    elif v != "auto":
+        if not v.lstrip("-").isdigit():
+            raise HarnessError(f"--kld-bos {v!r}: expected auto, none or a token id")
+        bos = int(v)
+    else:
+        gguf = a.kld_gguf or flag_value(ctx.base_args, "--native")
+        if not gguf:
+            raise HarnessError("--kld-bos auto reads the GGUF llama.cpp ran on: give --kld-gguf PATH (or an engine config with --native), or say "
+                               "--kld-bos none (a Qwen / GPT-2 vocabulary: llama.cpp adds no BOS) or --kld-bos ID")
+        gguf = absolute(gguf, ctx.cwd)
+        if not Path(gguf).exists():
+            raise HarnessError(f"--kld-bos auto: {gguf} does not exist; give the GGUF (--kld-gguf) or --kld-bos none|ID")
+        bos = K.bos_substitution(gguf)
+        notes.append(f"BOS: {gguf} says llama.cpp " + ("adds none" if bos is None else f"writes token {bos} over the first token of every chunk"))
+    if bos is not None and int(kb.tokens[0, 0]) != bos:
+        notes.append(f"the file's first token is {int(kb.tokens[0, 0])}, not the BOS {bos}: llama.cpp tokenised the text without it, but it still "
+                     "overwrites the first token of every chunk with BOS when it evaluates, and so does this run")
+    return bos
+
+
+def kld_verdict(s: dict, floor: dict | None, a) -> tuple[str, list[str], dict]:
+    """PASS / FAIL / MEASURED, the reasons, and the numbers the rule used.  PROVISIONAL: the first real run on the box confirms the rule."""
+    why: list[str] = []
+    info: dict = {"provisional": True}
+    if s.get("nonfinite"):
+        why.append(f"{s['nonfinite']} rows had a non-finite logit (NaN / inf)")
+    if not s.get("count"):
+        return "FAIL", why + ["no scored rows"], info
+    if floor is not None:
+        f_kld, f_top = floor["kld"][0], 1.0 - floor["same_top"][0] / 100.0
+        f_dn = floor["ln_ppl_ratio"][0]
+        kl_bar, top_bar = max(a.kld_factor * f_kld, a.kld_abs_kl), max(a.kld_factor * f_top, a.kld_abs_top1)
+        se = s["ln_ppl_ratio_unc"]
+        dn_bar = max(2.0 * se, a.kld_factor * abs(f_dn))
+        info.update({"floor_kld": f_kld, "floor_top1_mismatch": f_top, "floor_ln_ppl_ratio": f_dn, "kl_bar": kl_bar, "top1_bar": top_bar,
+                     "dnll_bar": dn_bar})
+        if s.get("has_kl"):
+            if s["kld_mean"] > kl_bar:
+                why.append(f"mean KLD {s['kld_mean']:.3e} > {kl_bar:.3e} (= max({a.kld_factor:g} x the floor's {f_kld:.3e}, {a.kld_abs_kl:g}))")
+        else:
+            info["partial"] = True
+        if s["top1_mismatch"] > top_bar:
+            why.append(f"top-1 differs at {100 * s['top1_mismatch']:.3f}% of positions > {100 * top_bar:.3f}% "
+                       f"(= max({a.kld_factor:g} x the floor's {100 * f_top:.3f}%, {100 * a.kld_abs_top1:.2f}%))")
+        if abs(s["dnll_mean"]) > dn_bar:
+            why.append(f"paired change of ln PPL {s['dnll_mean']:+.5f} is outside {dn_bar:.5f} (= max(2 standard errors {2 * se:.5f}, "
+                       f"{a.kld_factor:g} x the floor's |{f_dn:+.5f}|))")
+        return ("FAIL" if why else "PASS"), why, info
+    checks = []
+    if a.max_kl is not None and s.get("has_kl"):
+        checks.append(("mean KLD", s["kld_mean"], a.max_kl, False))
+    if a.kld_min_top1 is not None:
+        checks.append(("same top-1", s["same_top"], a.kld_min_top1, True))
+    if not checks:
+        return ("FAIL" if why else "MEASURED"), why, info
+    for name, got, bar, at_least in checks:
+        if (got < bar) if at_least else (got > bar):
+            why.append(f"{name} {got:.4g} {'<' if at_least else '>'} {bar:g}")
+    return ("FAIL" if why else "PASS"), why, info
+
+
+def format_kld_report(rep: dict) -> str:
+    c, k = rep["config"], rep["kld"]
+    L = ["=" * 100, f"golden_compare --ref-kld {c['ref_kld']}",
+         f"  llama.cpp base: n_ctx {c['n_ctx']}, vocabulary {c['n_vocab']}, {c['chunks']} chunks used; positions {c['first']}..{c['n_ctx'] - 2} of each "
+         f"are scored (the first {c['first']} are context); source {c['source']}"]
+    L += [f"  note: {x}" for x in rep["notes"]]
+    for name, r in rep["runs"].items():
+        if r.get("returncode", 0) != 0:
+            L.append(f"  {name}: FAILED, exit {r['returncode']} (see {r.get('log')})")
+            continue
+        sp = f", batched prefill {r['batched_prefill']['tok_s']:.0f} tok/s" if "batched_prefill" in r else ""
+        sp += f", prompt read in {r['serve']['prompt_ms'] / 1000:.0f} s" if "serve" in r else ""
+        full = "full logits" if r.get("rows_kind") == "logits" else "target log-probabilities only"
+        L.append(f"  {name}: {r.get('rows_scored', 0)} rows ({full}){', split at ' + str(r['split_at']) if 'split_at' in r else ''}; "
+                 f"{r.get('seconds', 0):.0f} s{sp}")
+    L.append("-" * 100)
+    L.append(K.format_summary(k["summary"]))
+    if k.get("floor"):
+        f, i = k["floor"], k["verdict_info"]
+        L += ["-" * 100, f"  noise floor, llama.cpp against itself ({c.get('kld_floor')}): mean KLD {f['kld'][0]:.3e}, same top p "
+                         f"{f['same_top'][0]:.3f}%, ln(PPL(Q)/PPL(base)) {f['ln_ppl_ratio'][0]:+.5f} +- {f['ln_ppl_ratio'][1]:.5f}"]
+        s = k["summary"]
+        if s.get("has_kl"):
+            ratio = f" = {s['kld_mean'] / f['kld'][0]:.2f} x the floor" if f["kld"][0] > 0 else ""
+            L.append(f"  this engine against llama.cpp: mean KLD {s['kld_mean']:.3e}{ratio} "
+                     f"(allowed {i['kl_bar']:.3e}); top-1 differs at {100 * s['top1_mismatch']:.3f}% (allowed {100 * i['top1_bar']:.3f}%); "
+                     f"ln PPL change {s['dnll_mean']:+.5f} +- {s['dnll_se'] or 0:.5f} (allowed +-{i['dnll_bar']:.5f})")
+        else:
+            L.append(f"  this engine against llama.cpp: top-1 differs at {100 * s['top1_mismatch']:.3f}% (allowed {100 * i['top1_bar']:.3f}%); "
+                     f"ln PPL change {s['dnll_mean']:+.5f} +- {s['dnll_se'] or 0:.5f} (allowed +-{i['dnll_bar']:.5f}); KL not checked: no full logits")
+    v = k["verdict"]
+    L += ["=" * 100, f"KLD VERDICT (provisional, to be confirmed by the first real run): {v}"
+          + (" (partial: KL not available, only the target log-probabilities were written)" if k.get("verdict_info", {}).get("partial") else "")]
+    if v == "MEASURED":
+        L.append("  no pass rule was given: --kld-floor LOG (llama.cpp's own CPU-vs-CUDA numbers), or --max-kl / --kld-min-top1")
+    L += [f"  - {r}" for r in rep["reasons"]]
+    L.append("RESULT: " + ("FAIL" if rep["exit"] else "PASS" if v == "PASS" else "MEASURED"))
+    return "\n".join(L)
+
+
+def run_kld(a) -> int:
+    for flag, name in ((a.ref_logits, "--ref-logits"), (a.cand_logits, "--cand-logits"), (a.exact, "--exact"), (a.reuse_ref, "--reuse-ref"),
+                       (a.mode == "greedy", "--mode greedy")):
+        if flag:
+            raise HarnessError(f"--ref-kld cannot be combined with {name}: it runs the engine once per chunk of the llama.cpp file and scores it")
+    ctx = engine_context(a)
+    kb = K.read_base(a.ref_kld)
+    n_chunks = min(kb.chunks_present, a.kld_chunks) if a.kld_chunks > 0 else kb.chunks_present
+    notes: list[str] = list(kb.notes)
+    bos = resolve_bos(a, ctx, kb, notes)
+    source = a.teacher_source if a.teacher_source != "auto" else ("logpos" if ctx.native else "dump")
+    if source == "dump" and ctx.native:
+        raise HarnessError("the pack is NATIVE (IQ): the engine's logits dump is empty for it; --teacher-source logpos (the default) scores it "
+                           "through `strata --serve`")
+    n_ctx, first = kb.n_ctx, kb.first
+    if first <= SPARSE_FROM:
+        notes.append(f"only the first {first} tokens of a chunk go through the batched path: up to {SPARSE_FROM} the QSA selection is the identity, "
+                     f"so the sparse top-k prompt attention is not exercised (llama-perplexity -c {2 * (SPARSE_FROM + 1) + 2} or more, i.e. 8192, "
+                     "does; Gate Q's long prompt does too)")
+    if source == "logpos":
+        notes.append("logpos source: one `strata --serve` launch per chunk (the turn token that splits the prompt is an engine argument and "
+                     "differs per chunk); the first n_ctx/2 tokens (up to the split) are read batched, the rest through the verify windows")
+    base_env = ctx.base_env
+    cand_env = parse_env_pairs(a.cand_env)
+    th = {"max_kl": a.max_kl, "kld_min_top1": a.kld_min_top1, "factor": a.kld_factor, "abs_kl": a.kld_abs_kl, "abs_top1": a.kld_abs_top1}
+
+    def chunk_tokens(c: int) -> list[int]:
+        toks = kb.chunk_tokens(c)
+        if bos is not None:
+            toks[0] = bos
+        return toks
+
+    def plan_of(c: int, toks: list[int]) -> Plan:
+        plan = Plan("teacher", n_ctx, 1, 1, first, ctx.native)
+        plan.source = source
+        if source == "logpos":
+            plan.split_at, plan.turn_token = choose_turn_after(toks, first, a.kld_search)
+        return plan
+
+    if a.dry_run:
+        toks = chunk_tokens(0)
+        plan = plan_of(0, toks)
+        print(f"golden_compare --ref-kld (dry run): {a.ref_kld}: n_ctx {n_ctx}, vocabulary {kb.n_vocab}, {n_chunks} chunk(s) of {kb.chunks_present}; "
+              f"BOS {'none' if bos is None else bos}; source {source}; workdir {ctx.workdir}")
+        print(f"  each chunk: the first {plan.split_at if source == 'logpos' else first} tokens batched, positions "
+              f"{plan.split_at if source == 'logpos' else first}..{n_ctx - 2} scored against tokens {first + 1}..{n_ctx - 1}")
+        for n in notes:
+            print(f"  note: {n}")
+        ids = ctx.workdir / "chunk0.ids"
+        env = dict(cand_env)
+        if source == "logpos":
+            args = build_serve_args(ctx.base_args, plan, fixed_experts=not a.no_fixed_experts, keep_spec=a.keep_spec,
+                                    extra=shlex.split(a.cand_args), short_margin=0, no_root=True)
+            env["STRATA_LOGPOS"] = str(ctx.workdir / "chunk0.logpos")
+            if want_logits(a):
+                env["STRATA_LOGITS_DUMP"] = str(ctx.workdir / "chunk0.logits")
+            print(f"  (chunk 0 split at position {plan.split_at}, turn token {plan.turn_token}; the other chunks have their own)")
+        else:
+            args = build_engine_args(ctx.base_args, plan, tokens_file=str(ids), dump=str(ctx.workdir / "chunk0.bin"),
+                                     fixed_experts=not a.no_fixed_experts, keep_spec=a.keep_spec, stats=a.stats, extra=shlex.split(a.cand_args))
+        print("\n[chunk 0] " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + (" " if env else "")
+              + " ".join(shlex.quote(c) for c in [*ctx.cand_exe, *args]))
+        return 0
+
+    scorer = K.KldScorer()
+    runs: dict = {}
+    splits: list[int] = []
+    cand_base = ctx.base_args
+    t_all = time.time()
+    for c in range(n_chunks):
+        toks = chunk_tokens(c)
+        plan = plan_of(c, toks)
+        stem = f"chunk{c}"
+        ids_file = ctx.workdir / f"{stem}.ids"
+        ids_file.write_text(" ".join(map(str, toks)), encoding="utf-8")
+        block = kb.block(c)
+        scale, mlp = kb.header_of(block)
+        targets = kb.targets(c)
+        V = kb.n_vocab
+        label = f"chunk {c + 1}/{n_chunks}"
+        run_info: dict
+        if source == "dump":
+            dump, log = ctx.workdir / f"{stem}.bin", ctx.workdir / f"{stem}.log"
+            args = build_engine_args(cand_base, plan, tokens_file=str(ids_file), dump=str(dump), fixed_experts=not a.no_fixed_experts,
+                                     keep_spec=a.keep_spec, stats=a.stats, extra=shlex.split(a.cand_args))
+            run_info = run_engine(label, ctx.cand_exe, args, base_env, cand_env, ctx.cwd, log, a.timeout or None)
+            runs[stem] = run_info
+            if run_info["returncode"] != 0:
+                return finish(a, ctx.workdir, kld_rep(a, ctx, kb, source, n_chunks, bos, notes, runs, th, None, None, 1,
+                                                      [f"the engine failed on chunk {c} (exit {run_info['returncode']}, see {log})"]))
+            lg = place_engine_logits(dump, plan)
+            if lg.n_rows < kb.n_scored:
+                raise HarnessError(f"{dump}: {lg.n_rows} rows, expected at least {kb.n_scored} (positions {first}..{n_ctx - 2})")
+            if lg.vocab != V:
+                if lg.vocab > V and a.kld_trim_vocab:
+                    notes.append(f"the engine's rows have {lg.vocab} columns, the file's vocabulary is {V}: the first {V} are compared")
+                else:
+                    raise HarnessError(f"the engine writes {lg.vocab} logits per position, the llama.cpp file has n_vocab {V}: not the same "
+                                       "vocabulary (--kld-trim-vocab compares the first n_vocab columns when the engine's are padding)")
+            scorer.add_logits(lg.rows[:kb.n_scored, :V], targets, scale, mlp, block[:, 4:4 + V])
+            run_info.update({"rows_scored": kb.n_scored, "rows_kind": "logits"})
+            if not a.keep_logits:
+                dump.unlink(missing_ok=True)
+        else:
+            args = build_serve_args(cand_base, plan, fixed_experts=not a.no_fixed_experts, keep_spec=a.keep_spec,
+                                    extra=shlex.split(a.cand_args), short_margin=0, no_root=True)
+            run_info = run_serve_teacher(label, ctx.cand_exe, args, base_env, cand_env, ctx.cwd, ctx.workdir, toks, a.timeout or None,
+                                         stem=stem, logits=want_logits(a))
+            run_info["batched_to"] = plan.split_at
+            run_info["split_at"] = plan.split_at
+            runs[stem] = run_info
+            splits.append(plan.split_at)
+            if run_info["returncode"] != 0:
+                return finish(a, ctx.workdir, kld_rep(a, ctx, kb, source, n_chunks, bos, notes, runs, th, None, None, 1,
+                                                      [f"the engine failed on chunk {c} (exit {run_info['returncode']}, see {ctx.workdir / (stem + '.log')})"]))
+            rows_d, bad = read_logpos(Path(run_info["logpos"]))
+            span = list(range(plan.split_at, n_ctx - 1))
+            if set(rows_d) != set(span):
+                got = sorted(rows_d)
+                raise HarnessError(f"chunk {c}: the engine wrote log-probabilities for {len(got)} positions"
+                                   + (f" ({got[0]}..{got[-1]})" if got else "") + f", expected {plan.split_at}..{n_ctx - 2}: did the tail go through the "
+                                   f"verify windows?  See {ctx.workdir / (stem + '.log')} (--short-read / --turn-token {plan.turn_token})")
+            wrong = [p for p in span if rows_d[p]["target"] != int(targets[p - first])]
+            if wrong:
+                raise HarnessError(f"chunk {c}: the engine's target token at position {wrong[0]} is {rows_d[wrong[0]]['target']}, the file's is "
+                                   f"{int(targets[wrong[0] - first])}: the two did not read the same tokens")
+            i0 = plan.split_at - first
+            sub_t, sub_s, sub_m = targets[i0:], scale[i0:], mlp[i0:]
+            order = list(rows_d)
+            if run_info.get("logits"):
+                lg = read_logits(run_info["logits"])
+                if lg.n_rows != len(order):
+                    raise HarnessError(f"{run_info['logits']}: {lg.n_rows} rows for {len(order)} log-probability lines")
+                if lg.vocab != V:
+                    if lg.vocab > V and a.kld_trim_vocab:
+                        notes.append(f"the engine's rows have {lg.vocab} columns, the file's vocabulary is {V}: the first {V} are compared")
+                    else:
+                        raise HarnessError(f"the engine writes {lg.vocab} logits per position, the llama.cpp file has n_vocab {V} (--kld-trim-vocab)")
+                rows = lg.rows if order == span else lg.rows[[order.index(p) for p in span]]
+                scorer.add_logits(rows[:, :V], sub_t, sub_s, sub_m, block[i0:, 4:4 + V])
+                run_info["rows_kind"] = "logits"
+                if not a.keep_logits:
+                    Path(run_info["logits"]).unlink(missing_ok=True)
+            else:
+                lp = np.array([rows_d[p]["logprob"] for p in span])
+                top = np.array([rows_d[p]["top"] for p in span])
+                scorer.add_target(lp, top, sub_t, sub_s, sub_m, lambda i, b=block, o=i0: np.asarray(b[o + i, 4:4 + V]))
+                run_info["rows_kind"] = "logprobs"
+                scorer.nonfinite += bad
+            run_info["rows_scored"] = len(span)
+        done = scorer.summary()
+        if done.get("count"):
+            kl = f"mean KLD {done['kld_mean']:.3e}, " if done.get("has_kl") else ""
+            print(f"[{label}] scored; so far {done['count']} rows: {kl}same top-1 {100 * done['same_top']:.2f}%, ln PPL change "
+                  f"{done['ln_ppl_ratio']:+.5f}", flush=True)
+        if c == 0 and not a.no_pin_expert_cache and flag_value(ctx.base_args, "--expert-cache") in ("auto", "-1"):
+            slots = expert_cache_slots(ctx.workdir / f"{stem}.log")
+            if slots:
+                cand_base = set_flag(ctx.base_args, "--expert-cache", str(slots))
+                notes.append(f"--expert-cache auto is pinned to chunk 0's {slots} slots for the other chunks, so every chunk runs with the same GPU "
+                             "expert set (--no-pin-expert-cache to disable)")
+    if source == "logpos" and any(sp > first for sp in splits):
+        lost = sum(sp - first for sp in splits)
+        notes.append(f"the split positions are {splits}: {lost} of {n_chunks * kb.n_scored} positions (those between n_ctx/2 and each split) went "
+                     "through the batched path and are not scored")
+    summary = scorer.summary()
+    if not summary.get("count"):
+        raise HarnessError("no row could be scored (every row had a non-finite logit?)")
+    if source == "logpos" and not summary["has_kl"]:
+        notes.append("KL divergence is NOT available: the engine wrote only the target token's log-probability (an engine without "
+                     "STRATA_LOGITS_DUMP, or --logits-dump off); PPL, the paired change, same-top-1 and dp are")
+    floor = K.parse_llama_log(Path(a.kld_floor).read_text(encoding="utf-8", errors="replace")) if a.kld_floor else None
+    verdict_s, why, vinfo = kld_verdict(summary, floor, a)
+    print(f"[done] {n_chunks} chunks in {time.time() - t_all:.0f} s", flush=True)
+    return finish(a, ctx.workdir, kld_rep(a, ctx, kb, source, n_chunks, bos, notes, runs, th, summary, (floor, verdict_s, vinfo),
+                                          1 if verdict_s == "FAIL" else 0, why))
+
+
+def kld_rep(a, ctx: Ctx, kb, source: str, n_chunks: int, bos, notes: list[str], runs: dict, th: dict, summary, floor_verdict, exit_code: int,
+            reasons: list[str]) -> dict:
+    floor, verdict_s, vinfo = floor_verdict if floor_verdict else (None, "FAIL", {})
+    return {"config": {"mode": "kld", "source": source, "ref_kld": str(a.ref_kld), "n_ctx": kb.n_ctx, "n_vocab": kb.n_vocab, "first": kb.first,
+                       "chunks": n_chunks, "bos": bos, "kld_floor": a.kld_floor, "n_tokens": kb.n_ctx, "native_pack": ctx.native},
+            "thresholds": th, "runs": runs, "metrics": None, "exact": None, "notes": notes, "reasons": reasons, "exit": exit_code,
+            "pass": exit_code == 0,
+            "kld": {"summary": summary or {"count": 0}, "floor": floor, "verdict": verdict_s, "verdict_info": vinfo}}
+
+
+def summarize_report(path: str) -> int:
+    """--summarize-report FILE: `STATUS<TAB>one line` for a report.json this tool wrote (scripts/logit_identity.sh print it per row).  STATUS is
+    IDENTICAL / DIFFERENT for --exact, PASS / FAIL / MEASURED for --ref-kld, PASS / FAIL for the two-run metrics."""
+    try:
+        rep = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"UNKNOWN\tno readable report: {e}")
+        return 0
+    e, k, m = rep.get("exact"), rep.get("kld"), rep.get("metrics")
+    if e is not None:
+        if e["identical"]:
+            what = (f"bitwise identical: {e['rows']} rows of {e['values_per_row']} float32 logits" if e["kind"] == "logits" else
+                    f"printed log-probabilities identical on {e['rows']} rows (9 decimals: NOT a bitwise statement, no STRATA_LOGITS_DUMP on a side)")
+            print(f"IDENTICAL\t{what}")
+        else:
+            bits = [f"{e['rows_differing']} of {e['rows']} rows differ"]
+            if e.get("first_diff_position") is not None:
+                bits.append(f"first at position {e['first_diff_position']}")
+            if e["kind"] == "logits":
+                bits.append(f"{e['values_differing']} values, largest {e['max_ulp']} ULP (|d| {e['max_abs_diff']:.2e})")
+                bits.append(f"top-1 changed in {e['top1_changed_rows']} rows")
+            else:
+                bits.append(f"largest |d log p| {e['max_abs_diff']:.2e}")
+            print("DIFFERENT\t" + "; ".join(bits))
+    elif k is not None:
+        s, i = k["summary"], k.get("verdict_info", {})
+        if not s.get("count"):
+            print("FAIL\t" + "; ".join(rep.get("reasons") or ["no scored rows"]))
+            return 0
+        kl = f"mean KLD {s['kld_mean']:.3e}" + (f" (floor {i['floor_kld']:.3e}, allowed {i['kl_bar']:.3e})" if "floor_kld" in i else "") if s.get("has_kl") else "KL n/a"
+        top = f"top-1 differs {100 * s['top1_mismatch']:.3f}%" + (f" (floor {100 * i['floor_top1_mismatch']:.3f}%, allowed {100 * i['top1_bar']:.3f}%)" if "top1_bar" in i else "")
+        dn = f"ln PPL {s['dnll_mean']:+.5f} +- {s.get('dnll_se') or 0:.5f}" + (f" (allowed +-{i['dnll_bar']:.5f})" if "dnll_bar" in i else "")
+        why = "; ".join(rep.get("reasons") or [])
+        print(f"{k['verdict']}\t{s['count']} rows: {kl}; {top}; {dn}" + (" [partial: no KL]" if i.get("partial") else "") + (f" -- {why}" if why else ""))
+    elif m is not None:
+        bits = [f"top-1 {100 * m['top1']:.2f}%"] if "top1" in m else []
+        if "ppl_rel" in m:
+            bits.append(f"|dPPL|/PPL {100 * m['ppl_rel']:.2f}%")
+        print(("PASS" if rep.get("pass") else "FAIL") + "\t" + ", ".join(bits + rep.get("reasons", [])))
+    else:
+        print("FAIL\t" + ("; ".join(rep.get("reasons") or []) or "no result in the report"))
+    return 0
+
+
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
+    if a.summarize_report:
+        return summarize_report(a.summarize_report)
     try:
-        return run(a)
-    except HarnessError as e:
+        return print_config(a) if a.print_config else run(a)
+    except (HarnessError, K.KldError) as e:
         print(f"golden_compare: {e}", file=sys.stderr)
         return 2
 
@@ -1052,18 +1669,108 @@ def make_plan(a, tokens: list[int], native: bool, notes: list[str], offline: boo
     return Plan("teacher", n, 1, max(1, a.stride), k, native)
 
 
+def want_logits(a) -> bool:
+    """Ask a serve-mode engine for STRATA_LOGITS_DUMP (the whole rows, ~1 MB per scored position): for --exact and --ref-kld, where the
+    bits / the KL need them; not for the Gate Q comparison, which has always been log-probabilities only."""
+    return a.logits_dump == "on" or (a.logits_dump == "auto" and bool(a.exact or a.ref_kld))
+
+
+def adopt_reference(a, plan: Plan, workdir: Path, tokens_file: Path, notes: list[str]) -> dict:
+    """--reuse-ref DIR: the reference run of an earlier workdir (same prompt, same plan) instead of running it again."""
+    src = Path(absolute(a.reuse_ref))
+    if not src.is_dir():
+        raise HarnessError(f"--reuse-ref {src}: not a directory (the --workdir of an earlier golden_compare run)")
+    old_tokens = src / "tokens.ids"
+    if not old_tokens.exists() or old_tokens.read_text(encoding="utf-8") != tokens_file.read_text(encoding="utf-8"):
+        raise HarnessError(f"--reuse-ref {src}: that run used a different prompt (its tokens.ids differs from this one's)")
+    meta = {}
+    if (src / "report.json").exists():
+        meta = json.loads((src / "report.json").read_text(encoding="utf-8"))
+        c = meta.get("config", {})
+        for k, v in (("mode", plan.mode), ("prefill_until", plan.prefill_until), ("source", plan.source if plan.mode == "teacher" else None),
+                     ("split_at", plan.split_at if plan.source == "logpos" else None)):
+            if v is not None and k in c and c[k] != v:
+                raise HarnessError(f"--reuse-ref {src}: its plan has {k} {c[k]!r}, this run's is {v!r}: not the same comparison")
+    logpos_src = plan.mode == "teacher" and plan.source == "logpos"
+    need = ["ref.log"] + (["ref.logpos"] if logpos_src else ["ref.bin"])
+    for nm in need + (["ref.logits"] if logpos_src else []):
+        f = src / nm
+        if not f.exists():
+            if nm == "ref.logits":
+                continue
+            raise HarnessError(f"--reuse-ref {src}: it has no {nm}")
+        dst = workdir / nm
+        if dst.resolve() == f.resolve():
+            continue
+        dst.unlink(missing_ok=True)
+        try:
+            os.link(f, dst)
+        except OSError:
+            shutil.copy2(f, dst)
+    log = workdir / "ref.log"
+    info = {"kind": "engine", **parse_engine_log(log.read_text(errors="replace")), "returncode": 0, "seconds": 0, "log": str(log),
+            "env": (meta.get("runs", {}).get("reference", {}) or {}).get("env", {}), "reused_from": str(src)}
+    if logpos_src:
+        info["logpos"] = str(workdir / "ref.logpos")
+        info["batched_to"] = plan.split_at
+        if (workdir / "ref.logits").exists():
+            info["logits"] = str(workdir / "ref.logits")
+    notes.append(f"the reference run is the one of {src} (--reuse-ref): not run again")
+    print(f"[reference] reusing the run of {src}", flush=True)
+    return info
+
+
+def exe_has_option(exe: list[str], option: str) -> bool:
+    """Whether the engine binary (the last path-like element of `exe`) contains the text of `option` - how setup.py tells an
+    engine compiled from this tree (it has --numa) from upstream's (it does not).  True when the binary cannot be read (a
+    wrapper script, a fake engine in the tests): then nothing is removed and the engine itself reports what it rejects."""
+    for part in reversed(exe):
+        path = Path(part)
+        if path.is_file() and path.stat().st_size > 1 << 20:
+            try:
+                return option.encode() in path.read_bytes()
+            except OSError:
+                return True
+    return True
+
+
+def drop_unsupported_numa(args: list[str], exe: list[str]) -> list[str]:
+    """`--numa X` taken out of the arguments for an engine that has no such option (upstream Strata, row 1a of
+    logit_identity.sh): it would refuse to start on the config's saved `--numa`, and it has one copy of the arena by first
+    touch anyway - the same as the port's `--numa off`."""
+    if not any(x == "--numa" or x.startswith("--numa=") for x in args) or exe_has_option(exe, "--numa"):
+        return args
+    out, skip = [], False
+    for x in args:
+        if skip:
+            skip = False
+            continue
+        if x == "--numa":
+            skip = True
+            continue
+        if not x.startswith("--numa="):
+            out.append(x)
+    print("[engine] this engine has no --numa option (upstream): the config's --numa is left out", flush=True)
+    return out
+
+
 def obtain_run(label: str, a, plan: Plan, tokens: list[int], base_args: list[str], exe: list[str], base_env: dict, cwd, workdir: Path,
                env_extra: dict, extra_args: str, tokens_file: Path) -> dict:
+    base_args = drop_unsupported_numa(list(base_args), exe)
+    extra_args = shlex.join(drop_unsupported_numa(shlex.split(extra_args), exe))
     if plan.mode == "teacher" and plan.source == "logpos":
         short = "ref" if label == "reference" else "cand"
         log = workdir / f"{short}.log"
         logpos = workdir / f"{short}.logpos"
         if a.reuse and logpos.exists() and log.exists():
             print(f"[{label}] reusing {logpos}", flush=True)
-            return {"kind": "engine", "returncode": 0, "seconds": 0, "env": env_extra, "log": str(log), "logpos": str(logpos)}
+            info = {"kind": "engine", "returncode": 0, "seconds": 0, "env": env_extra, "log": str(log), "logpos": str(logpos)}
+            if (workdir / f"{short}.logits").exists():
+                info["logits"] = str(workdir / f"{short}.logits")
+            return info
         args = build_serve_args(base_args, plan, fixed_experts=not a.no_fixed_experts, keep_spec=a.keep_spec,
                                 extra=shlex.split(extra_args))
-        info = run_serve_teacher(label, exe, args, base_env, env_extra, cwd, workdir, tokens, a.timeout or None)
+        info = run_serve_teacher(label, exe, args, base_env, env_extra, cwd, workdir, tokens, a.timeout or None, logits=want_logits(a))
         info["batched_to"] = plan.split_at
         return info
     dump = workdir / ("ref.bin" if label == "reference" else "cand.bin")
@@ -1122,19 +1829,41 @@ def absolute(path: str | Path | None, base: str | Path | None = None) -> str | N
     return str(p) if p.is_absolute() else os.path.normpath(str(Path(base or Path.cwd()) / p))
 
 
-def run(a) -> int:
+@dataclass
+class Ctx:
+    """What both flows (two runs / --ref-kld) need before they differ: the engine's arguments, where it runs, the workdir."""
+    cfg: dict
+    base_args: list[str]
+    cwd: str | None
+    exe: list[str]
+    ref_exe: list[str]
+    cand_exe: list[str]
+    workdir: Path
+    pack_dir: Path
+    tok_dir: str | None
+    native: bool
+    base_env: dict
+
+
+def engine_command(path: str | None) -> list[str]:
+    """An engine binary (or a .py stand-in, run with this interpreter) as a command prefix; absolute against where we were started."""
+    p = absolute(path)
+    return ([sys.executable, p] if p.endswith(".py") else [p]) if p else []
+
+
+def engine_context(a, offline: bool = False, make_workdir: bool = True) -> Ctx:
     cfg = load_engine_config(a.engine_config) if a.engine_config else {}
     base_args = list(cfg.get("args", [])) + shlex.split(a.engine_args)
     # The engine runs in `cwd` (the config's, normally the repository root), but every path WE hand to it - the tokens file, the logits
     # dumps, STRATA_LOGPOS, the engine binary, --pack - must name the same file wherever the harness was started: made absolute here.
     cwd = absolute(a.cwd) or cfg.get("cwd") or None
     exe_s = absolute(a.exe) if a.exe else (absolute(cfg["exe"], cwd) if cfg.get("exe") else None)
-    offline = bool(a.cand_logits and a.ref_logits)
-    if not exe_s and not offline:
+    if not exe_s and not offline and not (a.ref_exe and a.cand_exe):
         raise HarnessError("which engine?  --engine-config strata-*.json, or --exe PATH [--engine-args ...]")
-    exe = ([sys.executable, exe_s] if exe_s.endswith(".py") else [exe_s]) if exe_s else []
+    exe = engine_command(exe_s)
     workdir = Path(absolute(a.workdir) if a.workdir else Path.cwd() / "golden_out" / time.strftime("%Y%m%d-%H%M%S"))
-    workdir.mkdir(parents=True, exist_ok=True)
+    if make_workdir:
+        workdir.mkdir(parents=True, exist_ok=True)
 
     if a.pack:      # an explicit --pack is the engine's too (it was only used to detect a native pack before)
         base_args = set_flag(base_args, "--pack", absolute(a.pack))
@@ -1143,6 +1872,17 @@ def run(a) -> int:
     tok_dir = absolute(a.tokenizer) or cfg.get("tokenizer") or (str(pack_dir / "tokenizer") if (pack_dir / "tokenizer" / "vocab.json").exists() else None)
     if tok_dir:
         tok_dir = absolute(tok_dir, cwd)
+    native = a.native_pack == "yes" or (a.native_pack == "auto" and (pack_dir / "native_experts.txt").exists())
+    return Ctx(cfg, base_args, cwd, exe, engine_command(a.ref_exe) or exe, engine_command(a.cand_exe) or exe, workdir, pack_dir, tok_dir,
+               native, base_environment(cfg, a.gpu))
+
+
+def run(a) -> int:
+    if a.ref_kld:
+        return run_kld(a)
+    offline = bool(a.cand_logits and a.ref_logits)
+    ctx = engine_context(a, offline)
+    cfg, base_args, cwd, exe, workdir, tok_dir = ctx.cfg, ctx.base_args, ctx.cwd, ctx.exe, ctx.workdir, ctx.tok_dir
     tokens = get_tokens(a, tok_dir, workdir)
     n = len(tokens)
     if n < 2:
@@ -1151,28 +1891,37 @@ def run(a) -> int:
     tokens_file.write_text(" ".join(map(str, tokens)), encoding="utf-8")
 
     notes: list[str] = []
-    native = a.native_pack == "yes" or (a.native_pack == "auto" and (pack_dir / "native_experts.txt").exists())
+    native, base_env = ctx.native, ctx.base_env
     plan = make_plan(a, tokens, native, notes, offline)
     cand_env, ref_env = parse_env_pairs(a.cand_env), parse_env_pairs(a.ref_env)
-    base_env = base_environment(cfg, a.gpu)
+    if a.exact and plan.mode != "teacher":
+        raise HarnessError("--exact compares logits, which needs teacher mode (the default).  A native (IQ) pack runs teacher mode through "
+                           "--teacher-source logpos (the default for it).")
     if a.dry_run:
-        return dry_run(a, plan, tokens, base_args, exe, cand_env, ref_env, notes, tokens_file, workdir)
+        return dry_run(a, plan, tokens, base_args, exe, cand_env, ref_env, notes, tokens_file, workdir, ref_exe=ctx.ref_exe,
+                       cand_exe=ctx.cand_exe)
     runs: dict = {}
     th = {"min_top1": a.min_top1, "max_ppl_rel": a.max_ppl_rel, "max_kl": a.max_kl, "max_abs_dlogit": a.max_abs_dlogit}
-    ref_desc = f"logits file {a.ref_logits}" if a.ref_logits else f"the same engine with {a.ref_env or '(the candidate environment)'}"
+    ref_desc = (f"logits file {a.ref_logits}" if a.ref_logits else
+                (f"the run of {a.reuse_ref}" if a.reuse_ref else
+                 f"the same engine with {a.ref_env or '(the candidate environment)'}" if ctx.ref_exe == ctx.cand_exe else
+                 f"{ctx.ref_exe[-1]} with {a.ref_env or '(the base environment)'}"))
 
-    def rep(exit_code: int, reasons: list[str], metrics=None, greedy=None, cfg_extra=None) -> dict:
+    def rep(exit_code: int, reasons: list[str], metrics=None, greedy=None, cfg_extra=None, exact=None) -> dict:
         return {"config": {"mode": plan.mode, "n_tokens": n, "reference": ref_desc, "prefill_until": plan.prefill_until,
                            "tail": a.tail, "max_new": plan.max_new, "stride": plan.stride, "native_pack": native,
                            "pos_start": plan.pos_start, "tokens_file": str(tokens_file), **(cfg_extra or {})},
-                "thresholds": th, "runs": runs, "metrics": metrics, "greedy": greedy, "notes": notes, "reasons": reasons,
-                "pass": exit_code == 0, "exit": exit_code}
+                "thresholds": th, "runs": runs, "metrics": metrics, "greedy": greedy, "exact": exact, "notes": notes,
+                "reasons": reasons, "pass": exit_code == 0, "exit": exit_code}
 
     # ---- the two sides
     if a.ref_logits:
         runs["reference"] = {"kind": "file", "path": a.ref_logits}
+    elif a.reuse_ref:
+        runs["reference"] = adopt_reference(a, plan, workdir, tokens_file, notes)
     else:
-        runs["reference"] = obtain_run("reference", a, plan, tokens, base_args, exe, base_env, cwd, workdir, ref_env, a.ref_args, tokens_file)
+        runs["reference"] = obtain_run("reference", a, plan, tokens, base_args, ctx.ref_exe, base_env, cwd, workdir, ref_env, a.ref_args,
+                                       tokens_file)
         if runs["reference"]["returncode"] != 0:
             return finish(a, workdir, rep(2, ["the REFERENCE engine run failed: there is nothing to compare against"]))
     cand_base = base_args
@@ -1186,14 +1935,23 @@ def run(a) -> int:
     if a.cand_logits:
         runs["candidate"] = {"kind": "file", "path": a.cand_logits}
     else:
-        runs["candidate"] = obtain_run("candidate", a, plan, tokens, cand_base, exe, base_env, cwd, workdir, cand_env, a.cand_args, tokens_file)
+        runs["candidate"] = obtain_run("candidate", a, plan, tokens, cand_base, ctx.cand_exe, base_env, cwd, workdir, cand_env, a.cand_args,
+                                       tokens_file)
         if runs["candidate"]["returncode"] != 0:
             return finish(a, workdir, rep(1, [f"the CANDIDATE engine run failed (exit {runs['candidate']['returncode']}, see "
                                               f"{workdir / 'cand.log'}); a BPT.TRAP / launch failure on the V100 looks like this"]))
+    if ctx.ref_exe != ctx.cand_exe:       # two different binaries: say which (the report shows it; the determinism note below keys on it)
+        if runs["reference"]["kind"] == "engine":
+            runs["reference"]["exe"] = ctx.ref_exe[-1]
+        if runs["candidate"]["kind"] == "engine":
+            runs["candidate"]["exe"] = ctx.cand_exe[-1]
     reasons: list[str] = []
     greedy = None
     cfg_extra: dict = {}
     if plan.mode == "teacher" and plan.source == "logpos":
+        if a.exact:
+            exact, cfg_extra = exact_logpos_runs(a, plan, tokens, runs, notes)
+            return finish(a, workdir, rep(0 if exact["identical"] else 1, exact_reasons(exact), None, None, cfg_extra, exact))
         metrics, cfg_extra = compare_logpos_runs(a, plan, tokens, runs, notes, workdir)
         ok, why = verdict(metrics, min_top1=a.min_top1, max_ppl_rel=a.max_ppl_rel, max_kl=a.max_kl,
                           max_abs_dlogit=a.max_abs_dlogit)
@@ -1213,21 +1971,45 @@ def run(a) -> int:
         common = np.intersect1d(ref.positions, cand.positions)
         if len(common) == 0:
             raise HarnessError("the two logits files share no positions: wrong --ref-first-position / --cand-first-position?")
-        metrics = compare_rows(ref, cand, common, {int(p): tokens[int(p) + 1] for p in common if int(p) + 1 < n})
         cfg_extra = {"first_pos": int(common.min()), "last_pos": int(common.max())}
+        if a.exact:
+            ri, ci = [ref.row_of(int(q)) for q in common], [cand.row_of(int(q)) for q in common]
+            exact = exact_compare_rows(lambda lo, hi: ref.rows[ri[lo:hi]], lambda lo, hi: cand.rows[ci[lo:hi]], [int(q) for q in common])
+            if runs["reference"]["kind"] == runs["candidate"]["kind"] == "engine":
+                same_config(a, runs, notes)
+            return finish(a, workdir, rep(0 if exact["identical"] else 1, exact_reasons(exact), None, None, cfg_extra, exact))
+        metrics = compare_rows(ref, cand, common, {int(p): tokens[int(p) + 1] for p in common if int(p) + 1 < n})
     ok, why = verdict(metrics, min_top1=a.min_top1, max_ppl_rel=a.max_ppl_rel, max_kl=a.max_kl,
                       max_abs_dlogit=a.max_abs_dlogit, need_ppl=not metrics.get("tokens_only"))
     reasons += why
     if plan.mode == "teacher" and metrics.get("rows_scored", 0) < 100:
         notes.append(f"only {metrics.get('rows_scored', 0)} rows scored: the 99% top-1 gate says little below ~100 rows")
-    if (runs["reference"]["kind"] == runs["candidate"]["kind"] == "engine" and runs["reference"]["env"] == runs["candidate"]["env"]
-            and a.ref_args == a.cand_args):
-        notes.append("candidate and reference run the SAME configuration: this is a determinism check, not a Volta check")
+    if runs["reference"]["kind"] == runs["candidate"]["kind"] == "engine":
+        same_config(a, runs, notes)
     return finish(a, workdir, rep(0 if not reasons else 1, reasons, metrics, greedy, cfg_extra))
 
 
+def same_config(a, runs: dict, notes: list[str]) -> None:
+    """The note a determinism check deserves: both sides are the same binary in the same environment with the same extra arguments."""
+    if (runs["reference"]["env"] == runs["candidate"]["env"] and a.ref_args == a.cand_args
+            and runs["reference"].get("exe") == runs["candidate"].get("exe")):
+        notes.append("candidate and reference run the SAME configuration: this is a determinism check, not a Volta check")
+
+
+def exact_reasons(e: dict) -> list[str]:
+    if e["identical"]:
+        return []
+    why = [f"{e['rows_differing']} of {e['rows']} rows differ"
+           + (f"; first at position {e['first_diff_position']}" if e.get("first_diff_position") is not None else "")]
+    if e.get("max_ulp"):
+        why.append(f"the largest difference is {e['max_ulp']} ULP")
+    if e.get("only_reference") or e.get("only_candidate"):
+        why.append(f"positions only in the reference: {e['only_reference']}, only in the candidate: {e['only_candidate']}")
+    return why
+
+
 def dry_run(a, plan: Plan, tokens: list[int], base_args: list[str], exe: list[str], cand_env: dict, ref_env: dict, notes: list[str],
-            tokens_file: Path, workdir: Path) -> int:
+            tokens_file: Path, workdir: Path, ref_exe: list[str] | None = None, cand_exe: list[str] | None = None) -> int:
     print(f"golden_compare (dry run): mode {plan.mode}, {plan.n_tokens} prompt tokens, workdir {workdir}")
     if plan.mode == "teacher":
         what = (f"source logpos: the first {plan.split_at} tokens batched, split at token id {plan.turn_token}, "
@@ -1239,15 +2021,22 @@ def dry_run(a, plan: Plan, tokens: list[int], base_args: list[str], exe: list[st
     for n in notes:
         print(f"  note: {n}")
     for label, env, extra in (("reference", ref_env, a.ref_args), ("candidate", cand_env, a.cand_args)):
+        exe_side = (ref_exe if label == "reference" else cand_exe) or exe
+        if label == "reference" and a.reuse_ref:
+            print(f"\n[reference] (not run: --reuse-ref {a.reuse_ref})")
+            continue
         if plan.mode == "teacher" and plan.source == "logpos":
             args = build_serve_args(base_args, plan, fixed_experts=not a.no_fixed_experts, keep_spec=a.keep_spec, extra=shlex.split(extra))
-            env = dict(env, STRATA_LOGPOS=str(workdir / ("ref.logpos" if label == "reference" else "cand.logpos")))
+            stem = "ref" if label == "reference" else "cand"
+            env = dict(env, STRATA_LOGPOS=str(workdir / f"{stem}.logpos"))
+            if want_logits(a):
+                env["STRATA_LOGITS_DUMP"] = str(workdir / f"{stem}.logits")
         else:
             args = build_engine_args(base_args, plan, tokens_file=str(tokens_file),
                                      dump=str(workdir / ("ref.bin" if label == "reference" else "cand.bin")),
                                      fixed_experts=not a.no_fixed_experts, keep_spec=a.keep_spec, stats=a.stats, extra=shlex.split(extra))
         print(f"\n[{label}] " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + (" " if env else "")
-              + " ".join(shlex.quote(c) for c in [*exe, *args]))
+              + " ".join(shlex.quote(c) for c in [*exe_side, *args]))
     return 0
 
 
@@ -1272,11 +2061,54 @@ def compare_logpos_runs(a, plan: Plan, tokens: list[int], runs: dict, notes: lis
     m = compare_logpos(ref, cand, bad_r, bad_c)
     cfg_extra = {"first_pos": plan.split_at, "last_pos": n - 2, "split_at": plan.split_at, "turn_token": plan.turn_token,
                  "source": "logpos"}
-    if not (a.ref_logits or a.cand_logits) and runs["reference"].get("env") == runs["candidate"].get("env") and a.ref_args == a.cand_args:
+    if (not (a.ref_logits or a.cand_logits) and runs["reference"].get("env") == runs["candidate"].get("env") and a.ref_args == a.cand_args
+            and runs["reference"].get("exe") == runs["candidate"].get("exe")):
         notes.append("candidate and reference run the SAME configuration: this is a determinism check, not a Volta check")
     if m.get("rows_scored", 0) < 100:
         notes.append(f"only {m.get('rows_scored', 0)} rows scored: the 99% top-1 gate says little below ~100 rows")
     return m, cfg_extra
+
+
+def exact_logpos_runs(a, plan: Plan, tokens: list[int], runs: dict, notes: list[str]) -> tuple[dict, dict]:
+    """--exact on the logpos source: the logits rows bit for bit when BOTH engines wrote STRATA_LOGITS_DUMP, and always the printed
+    log-probabilities.  Rows of the dump belong to the logpos lines, one for one, in file order."""
+    if a.ref_logits or a.cand_logits:
+        raise HarnessError("--exact on the logpos source compares two engine runs: a logits file made elsewhere has no log-probability "
+                           "lines to match (use two --ref-logits / --cand-logits dump files, or two engine runs)")
+    n = len(tokens)
+    ref, bad_r = read_logpos(Path(runs["reference"]["logpos"]))
+    cand, bad_c = read_logpos(Path(runs["candidate"]["logpos"]))
+    for name, rows in (("reference", ref), ("candidate", cand)):
+        if not rows:
+            raise HarnessError(f"the {name} wrote no log-probability rows ({runs[name].get('logpos')}): see {runs[name].get('log')}")
+    lp = exact_compare_logpos(ref, cand)
+    out = dict(lp)
+    r_lg, c_lg = runs["reference"].get("logits"), runs["candidate"].get("logits")
+    if r_lg and c_lg:
+        rl, cl = read_logits(r_lg), read_logits(c_lg)
+        for name, lg, rows in (("reference", rl, ref), ("candidate", cl, cand)):
+            if lg.n_rows != len(rows):
+                raise HarnessError(f"the {name}'s STRATA_LOGITS_DUMP has {lg.n_rows} rows but its log-probability file has {len(rows)} lines")
+        pr, pc = list(ref), list(cand)
+        ir, ic = {p: i for i, p in enumerate(pr)}, {p: i for i, p in enumerate(pc)}
+        common = [p for p in pr if p in ic]
+        ri, ci = [ir[p] for p in common], [ic[p] for p in common]
+        if rl.vocab != cl.vocab:
+            raise HarnessError(f"the two runs' vocabularies differ ({rl.vocab} against {cl.vocab})")
+        out = exact_compare_rows(lambda lo, hi: rl.rows[ri[lo:hi]], lambda lo, hi: cl.rows[ci[lo:hi]], common)
+        out["logpos_rows_differing"] = lp["rows_differing"]
+        out["only_reference"], out["only_candidate"] = lp["only_reference"], lp["only_candidate"]
+        out["identical"] = out["identical"] and lp["identical"]
+    else:
+        missing = [s for s, v in (("reference", r_lg), ("candidate", c_lg)) if not v]
+        notes.append("no full logits from the " + " or ".join(missing) + " (an engine without STRATA_LOGITS_DUMP: verify.cpp of this port "
+                     "has it, upstream's has not - tools/volta/upstream_logits_dump.patch adds it): the comparison is of the printed "
+                     "log-probabilities (9 decimals), not of the bits of the logits")
+    span = sorted(set(ref) & set(cand))
+    cfg_extra = {"first_pos": span[0] if span else None, "last_pos": span[-1] if span else None, "split_at": plan.split_at,
+                 "turn_token": plan.turn_token, "source": "logpos"}
+    same_config(a, runs, notes)
+    return out, cfg_extra
 
 
 def compare_greedy(runs: dict, tokens: list[int], ref: Logits, cand: Logits, plan: Plan, notes: list[str], reasons: list[str]):

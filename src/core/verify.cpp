@@ -1255,10 +1255,28 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
         err = "window_logprobs: the head logits copy failed";
         return false;
     }
+    // STRATA_LOGITS_DUMP=<path> (measurement, off unless set; tools/volta/golden_compare.py --ref-kld): the WHOLE logits row of every
+    // position this call writes a line for, appended to <path> in the --dump-logits layout (int32 n_vocab, int32 n_rows, then float32
+    // rows, in the order of the STRATA_LOGPOS lines).  The row count of the header is INT32_MAX - "as many as follow", the file grows
+    // while the rows arrive; readers go by the file size, as for the dump after --prefill-until.  Delete the file before a run.
+    // (This function runs only when STRATA_LOGPOS is set: generate.cpp calls it from the prompt's verify windows, nowhere else.)
+    static std::FILE* const logits_dump = [this]() -> std::FILE* {
+        const char* p = std::getenv("STRATA_LOGITS_DUMP");
+        std::FILE* f = (p != nullptr && p[0] != '\0') ? std::fopen(p, "ab") : nullptr;
+        if (f != nullptr && std::fseek(f, 0, SEEK_END) == 0 && std::ftell(f) == 0) {
+            const int32_t hdr[2] = {(int32_t) n_vocab_, INT32_MAX};
+            std::fwrite(hdr, sizeof hdr, 1, f);
+        }
+        return f;
+    }();
     for (int t = 0; t < T; ++t) {
         const float* row = h.data() + (size_t) t * (size_t) n_vocab_;
         const int32_t tgt = targets[t];
         if (tgt < 0 || (int64_t) tgt >= n_vocab_) continue;
+        if (logits_dump != nullptr && std::fwrite(row, sizeof(float), (size_t) n_vocab_, logits_dump) != (size_t) n_vocab_) {
+            err = "window_logprobs: cannot write STRATA_LOGITS_DUMP";
+            return false;
+        }
         int64_t top = 0;
         for (int64_t v = 1; v < n_vocab_; ++v)
             if (row[v] > row[top]) top = v;
@@ -1278,6 +1296,7 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
                      (double) row[tgt] - lse, (long long) top, maxv - lse, (int) (top == (int64_t) tgt), extra,
                      without);
     }
+    if (logits_dump != nullptr) std::fflush(logits_dump);
     std::fflush(out);
     return true;
 }

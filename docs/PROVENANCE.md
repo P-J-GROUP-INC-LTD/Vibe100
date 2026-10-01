@@ -93,6 +93,7 @@ port's own.
 | `data/experimental-speed-projection/` | a 480 KB control vector (refusal-direction projection) made from Qwen3.8-Flash-Next activations, off by default | Qwen Community License 1.0 (its README) |
 | `data/expert-profile.bin`, `expert-profile-coder.bin`, `draft_vocab*.bin` | expert-usage profiles (from the upstream author's prompts, per `docs/USAGE_LEDGER.md`) and draft vocabularies (`tools/draft_vocab.py`) | upstream; covered by `LICENSE` |
 | `docs/paper/Strata-Paper.pdf`, `docs/media/*`, `bench/results/*` | upstream's paper, figures and benchmark data | upstream (MIT) |
+| `tools/volta/prompts/kld_text.txt` (added by the port) | the default text of the llama.cpp comparison: excerpts of *Alice's Adventures in Wonderland*, *A Tale of Two Cities*, *The Adventures of Sherlock Holmes* and *Moby Dick* (Project Gutenberg #11, #98, #1661, #2701, licence header and footer removed) mixed with four upstream source files and `docs/DETAILS.md` from `3906943`; `tools/volta/prompts/make_kld_text.py` rebuilds it byte for byte | the books: public domain; the rest: upstream (MIT) |
 
 ## 3. Models and data it runs
 

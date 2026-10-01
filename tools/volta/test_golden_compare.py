@@ -40,7 +40,8 @@ FAKE_ENGINE = textwrap.dedent('''
     V = 64
     VAL = {"--pack", "--native", "--ple-gguf", "--expert-profile", "--expert-cache", "--prefill", "--spec", "--spec-min-p",
            "--mtp", "--max-context", "--kv", "--tokens-file", "--tokens", "--max-new", "--dump-logits", "--logits-stride",
-           "--prefill-until", "--pcie-frac", "--adapt-swaps", "--suffix-draft", "--seed", "--turn-token", "--short-read"}
+           "--prefill-until", "--pcie-frac", "--adapt-swaps", "--suffix-draft", "--seed", "--turn-token", "--short-read",
+           "--prompt-cache-root", "--numa"}
     args = sys.argv[1:]
     SERVE = "--serve" in args
     if "--expert-cache" in args:
@@ -76,6 +77,10 @@ FAKE_ENGINE = textwrap.dedent('''
     if os.environ.get("FAKE_CRASH") and os.environ.get("STRATA_VOLTA_ATTN") != "0":
         print("CUDA error: unspecified launch failure", file=sys.stderr); sys.exit(1)
     noise = float(os.environ.get("FAKE_NOISE", "0")) if os.environ.get("STRATA_VOLTA_ATTN") != "0" else 0.0
+    if os.environ.get("STRATA_IQ512") == "1":       # the AVX-512 tier of the expert rows sums in another order than the AVX2 one
+        noise = float(os.environ.get("FAKE_NOISE_IQ512", "0")) or noise
+    if "--numa" in args and args[args.index("--numa") + 1] == "mirror" and os.environ.get("FAKE_MIRROR_LINE"):
+        print("strata generate: NUMA: expert arena MIRRORED: primary 1.00 GiB on node 1 + 1 replica", file=sys.stderr, flush=True)
     nan_at = int(os.environ.get("FAKE_NAN_AT", "-1")) if os.environ.get("STRATA_VOLTA_ATTN") != "0" else -1
     diverge_at = int(os.environ.get("FAKE_DIVERGE_AT", "-1")) if os.environ.get("STRATA_VOLTA_ATTN") != "0" else -1
 
@@ -111,6 +116,10 @@ FAKE_ENGINE = textwrap.dedent('''
             turn, short = int(opt.get("--turn-token", 248045)), int(opt.get("--short-read", 64))
             lp_path = os.environ.get("STRATA_LOGPOS")
             lpf = open(lp_path, "ab") if lp_path else None
+            dump_path = os.environ.get("STRATA_LOGITS_DUMP") if os.environ.get("FAKE_NO_DUMP_HOOK") is None else None
+            dumpf = open(dump_path, "ab") if dump_path else None
+            if dumpf is not None and dumpf.tell() == 0:
+                np.array([V, 2**31 - 1], dtype="<i4").tofile(dumpf)
             turn_at = -1
             for i in range(n - 1, 0, -1):
                 if ids[i] == turn:
@@ -133,6 +142,8 @@ FAKE_ENGINE = textwrap.dedent('''
                             lp = float(l[tgt]) if good else float("nan")
                             tl = float(l[top]) if good else float("nan")
                             row = "%d\\t%d\\t%.9f\\t%d\\t%.9f\\t%d\\t%.9f\\t%.9f\\n" % (p, tgt, lp, top, tl, int(top == tgt), -5.0, lp)
+                            if dumpf:
+                                z.astype("<f4").tofile(dumpf)
                             if lpf:
                                 lpf.write(row.encode())
                         if lpf:
@@ -142,6 +153,8 @@ FAKE_ENGINE = textwrap.dedent('''
                 at = to
             if lpf:
                 lpf.close()
+            if dumpf:
+                dumpf.close()
             ctx = list(ids)
             for j in range(mn):
                 z = logits(ctx)
