@@ -750,6 +750,7 @@ void test_cache() {
     expect_refusal("negative slots", [&] { GpuExpertCache c(dev, d, -1); }, {"-1 slots"});
     expect_refusal("more slots than experts", [&] { GpuExpertCache c(dev, d, 13); }, {"13 slots", "12 experts"});
     expect_refusal("an invalid shape", [&] { GpuExpertCache c(dev, ExpertDims{1, 1, 100, 256}, 1); }, {"not valid"});
+    expect_refusal("a blob that breaks the 256-byte slot alignment", [&] { GpuExpertCache c(dev, ExpertDims{1, 2, 160, 64}, 1); }, {"16320 bytes", "multiple of 256"});
     CHECK(dev.live.empty());
 }
 

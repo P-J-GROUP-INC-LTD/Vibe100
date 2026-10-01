@@ -190,6 +190,22 @@ ExpertArena ExpertArena::build(const ExpertDims& d, const std::vector<ExpertSlic
     for (std::thread& th : pool) th.join();
     if (first_error) std::rethrow_exception(first_error);
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    for (int h = 0; h < 2; ++h) {                        // where did the pages really land?  (move_pages in query mode: nothing moves)
+        Block& b = a.blk_[h];
+        if (b.node < 0) continue;
+        const platform::PlacementReport rep = platform::numa_sample_placement(b.data, bytes, 64, 4096);
+        if (!rep.ok) {
+            log("expert arena half " + std::to_string(h) + ": placement not checked (" + rep.note + ")");
+            continue;
+        }
+        const uint64_t here = rep.on_node(b.node);
+        log("expert arena half " + std::to_string(h) + ": " + rep.text());
+        if (b.bound && here + rep.not_present < rep.sampled) {
+            b.bound = false;
+            b.note += "; PLACEMENT WRONG: " + rep.text();
+            log("WARNING: expert arena half " + std::to_string(h) + " was bound to node " + std::to_string(b.node) + " but " + rep.text());
+        }
+    }
     char line[256];
     std::snprintf(line, sizeof line, "expert arena: %d layers x %d experts packed into halves with %d thread(s) in %.1f s (%.2f GiB per socket)", d.n_layer, d.n_expert, threads, sec,
                   (double) bytes / (1ull << 30));
@@ -268,6 +284,8 @@ std::vector<ExpertId> parse_expert_list(const std::string& spec, int n_layer, in
 GpuExpertCache::GpuExpertCache(ModelDev& dev, const ExpertDims& d, int n_slots) : dev_(&dev), d_(d), n_slots_(n_slots) {
     if (!d.valid()) throw ModelError("GpuExpertCache: the expert shape is not valid");
     if (n_slots < 0) throw ModelError("GpuExpertCache: " + std::to_string(n_slots) + " slots");
+    if (d.blob_bytes() % 256 != 0)
+        throw ModelError("GpuExpertCache: an expert blob is " + std::to_string(d.blob_bytes()) + " bytes, not a multiple of 256: the expert kernels read slot s at cache + s * blob size and need every slot 256-byte aligned");
     if ((int64_t) n_slots > (int64_t) d.n_layer * d.n_expert)
         throw ModelError("GpuExpertCache: " + std::to_string(n_slots) + " slots for " + std::to_string((int64_t) d.n_layer * d.n_expert) + " experts: a slot would never be used");
     if (n_slots > 0) slots_ = static_cast<uint8_t*>(dev.alloc((size_t) n_slots * d.blob_bytes()));

@@ -7,7 +7,10 @@
 //   m->weights.layer[l].eng_table      HostTensor: the Engram table, MMAPPED from the GGUF (MXFP4 rows of 136 B), 52 GB, never read whole
 //   m->weights.token_row(t)            token_embd is left in the mapped file (BF16 rows); the head and the output norm are on the device
 //   m->arena.half(h, l, e)             the CPU expert arena: socket h's half of (layer l, expert e), DS-C's layout (CONTRACTS.md), NUMA-bound
-//   m->cache.slot_ptr(s) / residency() the GPU expert cache: n_slots blobs [gate][up][down], and the int32 [layer][expert] residency table
+//   m->cache.slot_ptr(s) / residency() the GPU expert cache: n_slots blobs [gate][up][down] (256-byte aligned: `slots()` is the kernels' `cache_base`), and the
+//                                      int32 [layer][expert] residency table (-1 = not resident); fill_from_arena / fill_from_gguf / evict at run time
+//   DeviceRope(dev, cfg, n_pos)        cos / sin tables of both RoPE kinds on the device;  engram_constants_as<T>() / engram_table_view<V>(): DS1-D's inputs
+//   make_memory_plan(cfg, tally, in)   the memory budget printed at load (tools/ds41/memplan.py's arithmetic on the file's own byte tally)
 //
 // Everything is geometry-checked: `load` refuses a file whose metadata or tensors differ from `G` (config.hpp, tensors.hpp), with a message
 // that names what it found and what it expects.  Device memory is reached only through `ModelDev` = DS1-G's shared `Dev`

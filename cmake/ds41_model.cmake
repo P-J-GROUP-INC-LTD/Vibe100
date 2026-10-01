@@ -4,13 +4,16 @@
 # interface (include/strata/ds41/cuda/ds41_dev.hpp), whose `HostDev` runs everything here in the emulator build and the tests.
 #
 #   strata_ds41_model          static library (gguf / config / tensors / experts / plan / model .cpp).  Part of `all`.
+#   ds41_model_info            `ds41_model_info <any shard>`: config, layer roles, geometry match, tensor validation and the memory plan, from the headers alone.
 #   ds41_model_test            the loader on the mini GGUF (tools/ds41/make_mini_gguf.py, 3 shards): config values and layer roles, every tensor's
 #                              location against an independent read (tools/ds41/gguf_io.py), host dequantisation against the oracle's
 #                              (ref/ds41/weights.py), CPU halves against tools/ds41/expert_layout.py, a filled cache slot's bytes, the residency table,
 #                              the refusals (dims != G, a wrong type, a missing tensor, a truncated / missing shard), the device side under HostDev.
 #   ds41_model_real_plan_test  the REAL model's shapes from the saved headers (third_party/deepseek-v41-flash-reference/gguf-headers-mxxm-t-MXFP4.json.gz):
 #                              config, the 1,006 tensors, the byte tallies and the memory plan; no weights needed.
-#   ds41_model_halves_test     the half packer against DS-C's `pack_cpu_half` at RealGeom (one random expert).
+#   ds41_model_halves_test     the half packer against DS-C's `cpu::pack_cpu_half<G>` at RealGeom and MiniGeom (one random expert each).
+#   ds41_model_sparse_test     the loader at the REAL scale on 12 sparse shards (real metadata and offsets, 403 GB apparent, no data): header parse, the
+#                              RealGeom load on a recording device, the dense upload in pieces with one piece resident, the far ends of the mapped tables.
 #
 # The tests need Python 3 with NumPy for the fixtures (a fixture-setup test writes the mini GGUF and the golden data of the independent readers);
 # without it they are not registered.  Like the other DS-1 test programs they are part of `all` only with STRATA_BUILD_TESTS and always defined.
@@ -21,6 +24,10 @@ add_library(strata_ds41_model STATIC ${_ds41a_src}/gguf.cpp ${_ds41a_src}/config
             ${_ds41a_src}/plan.cpp ${_ds41a_src}/model.cpp)
 target_include_directories(strata_ds41_model PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(strata_ds41_model PUBLIC strata_numa Threads::Threads)
+
+# what the loader makes of a file, from the headers alone (no weights read): `ds41_model_info <any shard>`
+add_executable(ds41_model_info ${_ds41a_src}/model_info.cpp)
+target_link_libraries(ds41_model_info PRIVATE strata_ds41_model)
 
 set(_ds41a_all EXCLUDE_FROM_ALL)
 if(STRATA_BUILD_TESTS)
