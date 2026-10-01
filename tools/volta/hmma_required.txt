@@ -1,0 +1,10 @@
+# tools/volta/hmma_required.txt - kernels that MUST contain tensor-core (HMMA) instructions in the sm_70 SASS.
+#
+# Format (tools/volta/sass_audit.py): `regex<TAB>justification`, or `regex<TAB>MIN<TAB>justification` for a minimum
+# HMMA count other than 1.  The regex is searched in the demangled kernel name.  The gate FAILS when a matching
+# kernel has fewer HMMA than required, and ALSO when a pattern matches no kernel at all: a renamed or never-built
+# kernel must not let the gate pass.
+#
+# A kernel the port meant to run on the V100's tensor cores but that compiled to plain FMAs passes every parity test
+# and is simply ~8x slower; this list is what notices.
+prompt_attn_volta	WP-D: the Volta tensor-core prompt attention (qsa_prompt_attn.cu, nvcuda::wmma m16n16k16 fp16 in / fp32 accumulate); every instantiation (KV modes 0 / 1 / 3) must use HMMA

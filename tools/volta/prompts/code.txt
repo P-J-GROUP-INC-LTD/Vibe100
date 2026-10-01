@@ -1,0 +1,25 @@
+Below is a C function that merges two sorted arrays of 32-bit integers into a third array. It is correct, but it is slow on large inputs and a colleague says it has a latent bug. Review it, name the bug, explain why it only shows up sometimes, and then rewrite the function so that it is both correct and as fast as you can make it without using SIMD intrinsics. Include a short test program that checks the result against qsort on random data, including the empty-array and duplicate-heavy cases.
+
+```c
+#include <stddef.h>
+#include <stdint.h>
+
+/* a[0..na) and b[0..nb) are sorted ascending; out has room for na + nb elements */
+void merge_sorted(const int32_t *a, size_t na, const int32_t *b, size_t nb, int32_t *out)
+{
+    size_t i = 0, j = 0, k = 0;
+    while (i < na && j < nb) {
+        if (a[i] - b[j] <= 0) {
+            out[k++] = a[i++];
+        } else {
+            out[k++] = b[j++];
+        }
+    }
+    while (i < na) {
+        out[k++] = a[i++];
+    }
+    while (j < nb) {
+        out[k++] = b[j++];
+    }
+}
+```
