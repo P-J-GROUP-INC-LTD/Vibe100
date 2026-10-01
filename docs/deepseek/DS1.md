@@ -104,3 +104,16 @@ package got; each package's acceptance criteria are its section above plus the a
 integrator's session transcript). Then: review and finish each package, swap the local stand-ins of DS1-C/D for DS1-B/G's real APIs,
 write DS1-E (session, CPU expert pool, CLI, the MiniGeom end-to-end ctest against the oracle with DS1-F's checker), and run Gate DS-1 on
 the mini model; the real-model half of the gate needs the owner's box (runbook step 9 + DS1-F's layer-by-layer tool).
+
+### Integration notes (collected from the package reports; the session package DS1-E and the integrator act on them)
+
+- **DS1-G done** (84950b0): router / split / hot experts templated, RealGeom SASS byte-identical to 21f0236 (16 kernels, same
+  registers); shared helpers `ds41_dev.hpp` (Dev, DevBuf, MappedBuf, HostDev, `dev::launch`), `ds41_cuda_runtime.hpp` (CudaDev),
+  `ds41_quantize_acts<G>(..., ActOrder::kNatural | kInterleaved)` in `ds41_cuda.hpp`. Rule: inside kernels whose SASS must not move, use
+  enumerators, not function-local `constexpr int`, for G-derived constants.
+- **DS1-D done** (d4863a2): `mhc.hpp` per-sub-layer API with the one-block lag (`ds41_hc_begin`, `_attn_in`, `_attn_out`, `_ffn_in`,
+  `_ffn_out`, `_head_fold`; `rec.lag`'s first 4 floats per token = trace stage `pre_mix.L`); `engram.hpp` (`NgramHasher`, `EngramRunner<G>`,
+  `engram_wkv_q8<G>(dev, wkv_q8, xq, xs, gemv)` takes a Q8_0 GEMV callback - bind DS1-B's real GEMV there). GPU programs
+  `ds41_mhc_gpu_test` / `ds41_engram_gpu_test --golden <build>/ds1d_golden` (after `ctest -R ds1d_golden`) are not in ctest: add them to
+  `tools/volta/run_parity.sh` and runbook step 9c. Known benign difference: the combine's dot can give +0.0 where numpy gives -0.0 for an
+  all-zero key.
