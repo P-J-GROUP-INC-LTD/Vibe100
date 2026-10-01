@@ -170,6 +170,22 @@ class Fixture(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("FAIL  greedy: every generated token is the argmax of the engine's own logits", out)
 
+    def test_trace_json_without_quant_flags_fails(self):
+        d = self.engine_variant("e2e_noquant")
+        j = json.loads((d / "trace.json").read_text())
+        del j["quant"]
+        (d / "trace.json").write_text(json.dumps(j))
+        rc, out, _ = run(["check", "--fixture", str(self.dir), "--engine", str(d), "--no-layers", "--no-full"])
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL  trace: trace.json records the engine's quantisation flags", out)
+
+    def test_optional_stages_are_reported_not_required(self):
+        d = self.engine_variant("e2e_noopt", drop=[("attn_o", p, l) for p in range(N_PROMPT + MAX_NEW - 1) for l in range(8)])
+        rc, out, _ = run(["check", "--fixture", str(self.dir), "--engine", str(d), "-v"])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("optional stages written (info)", out)
+        self.assertNotIn("attn_o", out.split("optional stages written (info)")[1].splitlines()[0])
+
     def test_no_trace_is_a_failure_and_no_fixture_is_cannot_run(self):
         empty = T.root() / "e2e_empty"
         shutil.rmtree(empty, ignore_errors=True)

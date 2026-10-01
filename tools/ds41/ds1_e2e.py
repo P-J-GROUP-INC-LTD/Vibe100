@@ -218,6 +218,7 @@ def check(fixture, engine_dir, *, workdir=None, verbose: bool = False, do_layers
     v.add("trace: tokens start with the prompt", toks[:n_prompt] == fx["prompt"], f"engine {toks[:n_prompt]} vs fixture {fx['prompt']}")
     want_n = n_prompt + int(fx["max_new"])
     v.add("trace: the engine generated the requested number of tokens", len(toks) == want_n or (len(toks) < want_n and toks[-1] == 1), f"{len(toks)} tokens, expected {want_n}")
+    v.add("trace: trace.json records the engine's quantisation flags", "quant" in eng.meta, "(the oracle replays with the flags the engine ran with)")
     pos_need = _expected_positions(len(toks))
     have = set(eng.positions())
     missing_pos = [p for p in pos_need if p not in have]
@@ -225,6 +226,8 @@ def check(fixture, engine_dir, *, workdir=None, verbose: bool = False, do_layers
     if not eng.has("embed", 0) or not pos_need:
         return v
 
+    opt = sorted(st for st in eng.stages() if st in TI.STAGE and not TI.STAGE[st].required and TI.STAGE[st].role != "oracle")
+    v.add("trace: optional stages written (info)", True, ", ".join(opt) if opt else "none")
     q = eng.quant()
     shard1 = root / fx["gguf"]
     try:
