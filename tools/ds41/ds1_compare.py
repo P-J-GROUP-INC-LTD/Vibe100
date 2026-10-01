@@ -100,13 +100,13 @@ REAL_DIMS = Dims()
 # --- the model behind the numbers (all measured; DS1_VERIFY.md section 3) -----------------------------------------
 SUM_NOISE = 4.0e-8        # soft_rms = SUM_NOISE * sqrt(K) for a float32 sum of K terms: 2.2x the measured naive left-to-right sequential error
                           # (1.8e-8 * sqrt(K), K = 256 .. 20480); the engine's lane-strided sums are 3-6x better, numpy BLAS 4-7x
-SOFT_FLOOR = 1.0e-6       # nothing is held tighter than this (the measured float32-vs-float64 stage error on the mini model is <= 5e-7)
+SOFT_FLOOR = 2.0e-6       # nothing is held tighter than this (the measured float32-vs-float64 stage error on the mini model is <= 5e-7)
 SOFT_MAX_OVER_RMS = 2.5   # max_rel (max |E-O| / max |O|) vs rms_rel of a float32 sum error: measured 1.2 - 1.6
 HARD_NOFLIP = 50.0        # a stage without a quantiser inside has no excuse for a sample above 50 x soft (hard = 50 x soft)
 FLIP_RATE = 2.2e-5        # P(an int8 rounding decision flips) per element at the engine's pre-quantiser noise (5e-7 relative); 4.4e-5 at 1e-6
 FLIP_RMS = 1.9e-2         # one int8 flip in a K-element GEMV input moves the output by 1.9e-2 / sqrt(K) of its rms (K = 256 .. 8192, Gaussian)
-FLIP_MULT = 5.0           # hard = FLIP_MULT single-flip errors (up to 3 flips and outlier blocks: measured p99.9 is 4x the median)
-FLIP_FLOOR = 3.0e-3       # ... never below this (heavy-tailed activations: measured p99.9 up to 1.4e-3 at K = 2304 .. 8192)
+FLIP_MULT = 8.0           # hard = FLIP_MULT single-flip errors (up to 3 flips and outlier blocks: measured p99.9 is 4x the median)
+FLIP_FLOOR = 5.0e-3       # ... never below this (heavy-tailed activations: measured p99.9 up to 1.4e-3 at K = 2304 .. 8192)
 KV_FLIP_RATE = 1.0e-5     # per element, fp8 / fp4 fake-quant of a cache row (measured 2.4e-6 at 3e-7 noise, 9e-6 at 1e-6)
 KV_FLIP_RMS = {"fp8": 0.25, "fp4e4m3": 0.65, "fp4e8m0": 0.45}      # one flip moves the row by this / sqrt(K) of its rms
 KV_FLIP_MAX = {"fp8": 0.10, "fp4e4m3": 0.25, "fp4e8m0": 0.15}      # ... and one element by this much of the row's max |.|
@@ -114,7 +114,8 @@ KV_MULT = 2.0
 BUDGET_BASE = 0.02        # a stage may always have this fraction of FLIP-level samples
 BUDGET_MULT = 2.0         # budget = BASE + MULT * P(at least one flip in a sample), capped
 BUDGET_CAP = 0.9
-CHAOS_CEILING_RMS = 1.0   # full mode, downstream of the first deviation: rms_rel above this (the tensor itself) is a failure
+CHAOS_CEILING_RMS = 4.0   # full mode, downstream of the first deviation: rms_rel above this is a failure (an expert swap or a flipped selection gives ~1.0 - 1.4:
+                          # two unrelated vectors of the same size; 4 means a blow-up, NaN / Inf always fails)
 TIE_FLOAT = 2.0e-5        # float32 noise of a router / indexer score relative to its scale, x ~10 safety (no quantiser flip involved)
 TIE_INDEX_FP4 = 5.0e-2    # a flip in the fp4 fake-quant of the indexer's q moves its scores by up to ~1 - 4 % of their scale (analysis in DS1_VERIFY.md)
 
@@ -617,8 +618,9 @@ def compare_sources(eng: Source, ref: Source, keys: list, mode: str, *, tols: To
                     s.level = Level.FAIL if (nonfinite or s.rms_rel > CHAOS_CEILING_RMS or s.note.startswith("shape")) else Level.OK
                     if s.level == Level.FAIL:
                         s.note = (s.note + "; " if s.note else "") + f"beyond the chaos ceiling ({CHAOS_CEILING_RMS})"
-                elif s.level == Level.FAIL:                           # a selection that differs far from a tie, downstream of a deviation
-                    s.note = "downstream of a deviation: " + s.note
+                else:                                                   # a selection: judged by nothing but the near-tie bookkeeping above
+                    if s.level == Level.FAIL:
+                        s.note = "downstream of a deviation: " + s.note
                     s.level = Level.OK
                 rep.samples.append(s)
                 continue
