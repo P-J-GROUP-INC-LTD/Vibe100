@@ -307,7 +307,7 @@ def build_summary(stats: dict, floor: dict, kern: dict | None, mem: dict | None,
         row("expert cache hit rate (GPU tier)", f"{100 * stats['serve_hit']:.1f}%", "from the server log")
     # the CPU's share
     row("CPU expert kernels", stats.get("cpu_kernels", "AVX-512 (no 'no AVX-512' notice in the log)"),
-        "the engine's own startup line: its AVX-512 kernels need VBMI (Ice Lake / Zen 4); Cascade Lake runs AVX-2 / ggml-cpu"
+        "the engine's own startup line: its AVX-512 kernels need F/BW/VL/DQ + VNNI (Cascade Lake, Ice Lake, Zen 4 and newer); without them it runs AVX-2 / ggml-cpu"
         if stats.get("cpu_kernels") else "")
     pm = stats.get("pool_multi")
     ct = stats.get("cpu_pool_token")

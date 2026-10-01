@@ -13,6 +13,9 @@
 //      mode the park protocol exists to prevent, so `run()` is called many times in a row.
 //   4. A BATCH BIGGER AND SMALLER THAN THE WORKER COUNT, because `n < workers` leaves most workers claiming
 //      nothing and `n > workers` is the real case (10 experts, 5 workers).
+//
+// `--synthetic` uses ten random experts instead of reading them from the pack (the checks are about the pool, not
+// the weights), which is how it runs on a machine without the 66 GB file.
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 
@@ -52,18 +55,21 @@ double now_ms() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool selftest = false;
+    bool selftest = false, synthetic = false;
     const char* path = "pack/full/experts.bin";
     long long layer = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
+        else if (a == "--synthetic") synthetic = true;
         else if (a == "--file" && i + 1 < argc) path = argv[++i];
         else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
-        else { std::fprintf(stderr, "usage: pool_test [--selftest] [--file P] [--layer N]\n"); return 2; }
+        else { std::fprintf(stderr, "usage: pool_test [--selftest] [--synthetic] [--file P] [--layer N]\n"); return 2; }
     }
 
     const cpu::CpuFeatures feat = cpu::cpu_features();
+    if (feat.usable())
+        std::printf("  %-44s %s\n", "Q2_0 kernel build under test", cpu::expert_isa_name(cpu::cpu_q2_expert_isa()));
     if (!feat.usable()) {
         std::printf("  CPU lacks %s - the VNNI path cannot run here; pool test SKIPPED, not passed.\n",
                     feat.reason());
@@ -76,8 +82,17 @@ int main(int argc, char** argv) {
     // ---- ten experts off one layer, which is exactly what a token uses
     const int NEXP = 10;
     std::vector<std::vector<uint8_t>> blobs((size_t) NEXP);
+    std::mt19937 blob_rng(31337);
     for (int e = 0; e < NEXP; ++e)
-        if (!read_blob(path, layer * 512 + e, blobs[(size_t) e])) {
+        if (synthetic) {
+            auto& b = blobs[(size_t) e];
+            b.assign(cpu::BLOB, 0);
+            for (size_t i = 0; i < cpu::O_GU_SCALES; ++i) b[i] = (uint8_t) blob_rng();
+            for (size_t i = cpu::O_GU_SCALES; i < cpu::BLOB; i += 2) {
+                const uint16_t h = (uint16_t) (0x1C00 + blob_rng() % 0x0800);
+                std::memcpy(b.data() + i, &h, 2);
+            }
+        } else if (!read_blob(path, layer * 512 + e, blobs[(size_t) e])) {
             std::fprintf(stderr, "cannot read expert %d of layer %lld from %s\n", e, layer, path);
             return 2;
         }

@@ -51,8 +51,9 @@ TWO MODES
   NATIVE (IQ) PACKS HAVE NO LOGITS DUMP, and a Cascade Lake box can only run those.  `--dump-logits` is written only by the
   engine's token loop, and a pack with native_experts.txt (IQ2_XS / IQ3_XXS / IQ3_S / IQ1_M) runs verify windows only: the
   token loop is skipped (generate.cpp: `if (native_pack) { spec_pos = pos; break; }`), so the dump has a header and no rows.
-  (The canonical Q2_0 pack does write rows, but its CPU kernels need AVX-512 VBMI - Ice Lake / Zen 4 - and the engine refuses it
-  on Cascade Lake: generate.cpp `cpu_require_expert_support`.)  So teacher mode has two SOURCES, `--teacher-source`:
+  (The canonical Q2_0 pack does write rows; its CPU kernels need AVX-512 F/BW/VL/DQ + VNNI, which Cascade Lake has - since the
+  Vibe100 no-VBMI build the engine no longer refuses it there; on a CPU without VNNI generate.cpp `cpu_require_expert_support`
+  still does.)  So teacher mode has two SOURCES, `--teacher-source`:
 
     dump     the standalone engine and `--dump-logits` / `--prefill-until K`: FULL logits per position -> top-1, max |dlogit|,
              KL, perplexity.  Non-native packs only.

@@ -3,14 +3,25 @@
 // The body is the validated kernel, moved rather than rewritten: it carries the P0.T2 parity result
 // (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
 // include/strata/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
+//
+// ---- TWO BUILDS OF THIS FILE (Vibe100: Cascade Lake has AVX512-VNNI but no AVX512-VBMI) ----
+//
+// This file is compiled TWICE and nothing else in it differs between the two builds:
+//
+//   expert.cpp          with -mavx512vbmi         namespace `vbmi`    2-bit unpack by `vpmultishiftqb` (upstream's)
+//   expert_novbmi.cpp   without it, and it defines STRATA_EXPERT_NO_VBMI before including this file
+//                                                 namespace `novbmi`  2-bit unpack by shuffle / shift / mask
+//
+// The two unpack helpers (`unpack_q2_0`, `unpack64_q2_0`) are the only code the macro selects.  Everything the
+// kernels do with the unpacked codes - the VNNI dot, the scale products, the float accumulation order - is the
+// same source, so the same instructions, and the two builds are bit-identical as long as the two unpacks produce the
+// same bytes, which `expert_variant_test` checks (exhaustively over every possible input dword) and the comments at
+// the helpers prove lane by lane.  The public entry points of expert.hpp are NOT defined here: they are the
+// dispatchers in expert_dispatch.cpp, which pick a build once, at run time, from the CPU's feature bits.
 #include "strata/kernels/cpu/expert.hpp"
+#include "expert_variant.hpp"
 
 #include <immintrin.h>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
-#include <cpuid.h>
-#endif
 
 #include <cmath>
 #include <atomic>
@@ -18,10 +29,23 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(STRATA_EXPERT_NO_VBMI)
+#define STRATA_EXPERT_NS novbmi
+#define STRATA_EXPERT_KERNELS expert_kernels_novbmi
+#define STRATA_EXPERT_NAME "AVX-512 VNNI (no VBMI)"
+#else
+#define STRATA_EXPERT_NS vbmi
+#define STRATA_EXPERT_KERNELS expert_kernels_vbmi
+#define STRATA_EXPERT_NAME "AVX-512 VNNI + VBMI"
+#endif
+
 namespace strata::kernels::cpu {
+namespace STRATA_EXPERT_NS {
 namespace {
 
-std::atomic<bool> oracle_q8_0{false};
+// The flag itself lives in expert_dispatch.cpp (one copy for both builds); the name is kept so the kernels below read
+// as they always did.
+std::atomic<bool>& oracle_q8_0 = g_oracle_q8_0;
 
 /// fp16 -> fp32, written out rather than using `_cvtsh_ss`, because the F16C intrinsic's behaviour on
 /// subnormals is the one place the two can differ and the scales in this artifact are small.
@@ -122,12 +146,41 @@ void quantize_oracle_q8_0(const float* x, int n, ActQ& a) {
 ///
 /// The result is the 32 codes of ONE ACTIVATION CHUNK (4 qword lanes), which is the unit the Q8_1 scale is
 /// defined on - not the 64-weight block.
+#if !defined(STRATA_EXPERT_NO_VBMI)
 inline __m256i unpack_q2_0(const uint8_t* codes) {
     const __m128i packed = _mm_loadl_epi64((const __m128i*) codes);   // 8 bytes -> 4 u16 in the low half
     const __m256i lanes = _mm256_cvtepu16_epi64(packed);              // 4 qwords, 8 codes each
     const __m256i ctrl = _mm256_set1_epi64x((long long) 0x0E0C0A0806040200ULL);
     return _mm256_and_si256(_mm256_multishift_epi64_epi8(ctrl, lanes), _mm256_set1_epi8(3));
 }
+#else
+// The same 32 codes without VBMI (AVX2 instructions only; the 256-bit kernels are the debug / oracle path).
+//
+// The output is two 128-bit lanes of 16 codes.  Lane L holds codes 16L..16L+15, which come from the four bytes
+// codes[4L .. 4L+3] - ONE DWORD of the packed input - and nothing else, so each lane is an independent 4x4 problem:
+//     out[L][4*m + k] = (codes[4L + m] >> 2k) & 3        m = byte of the dword, k = code within the byte.
+// Four steps, each a single instruction:
+//   1. broadcast the 8 input bytes into both lanes (a memory-operand `vpbroadcastq`);
+//   2. `vpshufb`: lane L's four dwords all become input dword L.  Control byte (4t + u) = 4L + u, so dword t of the lane is
+//      [codes[4L], codes[4L+1], codes[4L+2], codes[4L+3]] for every t.  vpshufb indexes inside its own 128-bit lane
+//      and 4L + u <= 7 < 16, which the broadcast made valid in both lanes;
+//   3. `vpsrlvd` by (0, 2, 4, 6) for dwords t = 0..3, then AND 0x03 per byte: byte u of dword t becomes
+//      (codes[4L + u] >> 2t) & 3, because bit (8u + 2t) of the dword is bit 2t of byte u and the bits that cross in
+//      from byte u+1 land at positions 8 - 2t .. 7 >= 2, above the mask (2t <= 6);
+//   4. `vpshufb` with control byte (4m + k) = 4k + m: the 4x4 byte transpose that puts dword-major (t = k, u = m) data
+//      into value order out[4m + k].
+// Each output byte is therefore exactly `(codes[j / 4] >> (2 * (j % 4))) & 3` for j = 16L + 4m + k, which is what
+// `vpmultishiftqb` + AND 3 gives in the VBMI build (below, and in the byte-for-byte comment on unpack64_q2_0).
+inline __m256i unpack_q2_0(const uint8_t* codes) {
+    const __m256i src = _mm256_broadcastq_epi64(_mm_loadl_epi64((const __m128i*) codes));
+    const __m256i rep = _mm256_shuffle_epi8(src, _mm256_setr_epi32(0x03020100, 0x03020100, 0x03020100, 0x03020100,
+                                                                   0x07060504, 0x07060504, 0x07060504, 0x07060504));
+    const __m256i sh = _mm256_srlv_epi32(rep, _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6));
+    const __m256i plane = _mm256_and_si256(sh, _mm256_set1_epi8(3));
+    return _mm256_shuffle_epi8(plane, _mm256_setr_epi32(0x0C080400, 0x0D090501, 0x0E0A0602, 0x0F0B0703,
+                                                        0x0C080400, 0x0D090501, 0x0E0A0602, 0x0F0B0703));
+}
+#endif
 
 /// 32 codes against 32 int8 activations. Codes 0 contribute nothing to `sum(c*xhat)`, so the zero lanes the
 /// narrow load leaves behind are harmless.
@@ -152,12 +205,48 @@ inline float hsum_ps(__m256 v) {
 // use this kernel, so speculative decode still reproduces plain decode exactly.
 static const bool kZmm = std::getenv("STRATA_CPU_YMM") == nullptr;
 
+#if !defined(STRATA_EXPERT_NO_VBMI)
 inline __m512i unpack64_q2_0(const uint8_t* codes) {
     const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes
     const __m512i lanes = _mm512_cvtepu16_epi64(packed);                    // 8 qwords, 8 codes each
     const __m512i ctrl = _mm512_set1_epi64((long long) 0x0E0C0A0806040200ULL);
     return _mm512_and_si512(_mm512_multishift_epi64_epi8(ctrl, lanes), _mm512_set1_epi8(3));
 }
+#else
+// The same 64 codes without VBMI: the 256-bit scheme above, four lanes wide.
+//
+// THE SPECIFICATION BOTH BUILDS MEET: output byte j (0..63) is `(codes[j / 4] >> (2 * (j % 4))) & 3`.
+//   VBMI build:   qword i of `lanes` is the u16 codes[2i..2i+1] (zero-extended); control byte c of the multishift
+//                 selects the 8 bits starting at bit 2c, i.e. byte c of the qword is (u16 >> 2c) & 0xFF for c <= 7
+//                 (no wrap-around: 2c + 8 <= 22 < 64); AND 3 keeps the two low bits.  Output byte 8i + c is then
+//                 (u16_i >> 2c) & 3 = code number 8i + c of the stream (code n lives in byte n/4 at bit 2(n%4), and
+//                 u16_i holds bytes 2i and 2i+1, so its 2c-bit offset covers codes 8i..8i+7 in order).
+//   this build:   lane L (0..3) holds output bytes 16L..16L+15 and reads only input bytes 4L..4L+3 (one dword):
+//                   1. `vbroadcasti32x4` puts all 16 input bytes in every lane (a pure load, no ALU uop);
+//                   2. `vpshufb`, control byte (4t + u) of lane L = 4L + u: dword t of lane L becomes input dword L
+//                      for t = 0..3 (the index stays inside the lane: 4L + u <= 15);
+//                   3. `vpsrlvd` by 2t on dword t (counts 0,2,4,6), AND 0x03 per byte: byte u of dword t
+//                      = (codes[4L + u] >> 2t) & 3.  Bits shifted in from byte u+1 land at positions 8 - 2t .. 7, all
+//                      >= 2, so the mask removes them; and for u = 3 the shift brings in zeros;
+//                   4. `vpshufb`, control byte (4m + k) = 4k + m: output byte 16L + 4m + k takes the byte at lane
+//                      position 4k + m, i.e. dword t = k, byte u = m: (codes[4L + m] >> 2k) & 3
+//                      = (codes[(16L + 4m + k) / 4] >> 2((16L + 4m + k) % 4)) & 3.   QED for every j.
+// Four ALU uops (vpshufb p5, vpsrlvd p0, vpand p05, vpshufb p5) against the VBMI build's three (vpmovzxwq p5,
+// vpmultishiftqb p0, vpand p05), all single-uop on Skylake-X / Cascade Lake.
+inline __m512i unpack64_q2_0(const uint8_t* codes) {
+    const __m512i src = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*) codes));
+    const __m512i rep = _mm512_shuffle_epi8(src, _mm512_setr_epi32(0x03020100, 0x03020100, 0x03020100, 0x03020100,
+                                                                   0x07060504, 0x07060504, 0x07060504, 0x07060504,
+                                                                   0x0B0A0908, 0x0B0A0908, 0x0B0A0908, 0x0B0A0908,
+                                                                   0x0F0E0D0C, 0x0F0E0D0C, 0x0F0E0D0C, 0x0F0E0D0C));
+    const __m512i sh = _mm512_srlv_epi32(rep, _mm512_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6, 0, 2, 4, 6));
+    const __m512i plane = _mm512_and_si512(sh, _mm512_set1_epi8(3));
+    return _mm512_shuffle_epi8(plane, _mm512_setr_epi32(0x0C080400, 0x0D090501, 0x0E0A0602, 0x0F0B0703,
+                                                        0x0C080400, 0x0D090501, 0x0E0A0602, 0x0F0B0703,
+                                                        0x0C080400, 0x0D090501, 0x0E0A0602, 0x0F0B0703,
+                                                        0x0C080400, 0x0D090501, 0x0E0A0602, 0x0F0B0703));
+}
+#endif
 
 // For blocks [b0, b0+nb) (nb <= 8): p[2i+h] = d_{b0+i} * xscale[2(b0+i)+h], dd[2i+h] = d_{b0+i}.
 inline void scales8(const uint8_t* wscales, const ActQ& a, int b0, int nb, __m512& p, __m512& dd) {
@@ -338,52 +427,11 @@ void expert_oracle_q8_0(const uint8_t* blob, const ActQ& a1, float* out, ExpertS
 
 }  // namespace
 
-const char* CpuFeatures::reason() const {
-    if (usable()) return "ok";
-    // Named individually: "AVX-512 not supported" sends a user looking for a new CPU when the machine may have
-    // AVX-512F and be missing only VNNI, which is a much narrower and more explicable gap.
-    static char buf[160];
-    std::snprintf(buf, sizeof buf, "missing %s%s%s%s%s", avx512f ? "" : "AVX512F ",
-                  avx512bw ? "" : "AVX512BW ", avx512vl ? "" : "AVX512VL ",
-                  avx512_vnni ? "" : "AVX512-VNNI ", avx512_vbmi ? "" : "AVX512-VBMI");
-    return buf;
-}
-
-CpuFeatures cpu_features() {
-    CpuFeatures f;
-    int reg[4] = {0, 0, 0, 0};
-#if defined(_MSC_VER)
-    __cpuid(reg, 0);
-    if (reg[0] < 7) return f;
-    __cpuidex(reg, 7, 0);
-#else
-    unsigned r[4] = {0, 0, 0, 0};
-    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
-    if (r[0] < 7) return f;
-    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
-    for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
-#endif
-    const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
-    f.avx512f = (ebx >> 16) & 1u;
-    f.avx512bw = (ebx >> 30) & 1u;
-    f.avx512vl = (ebx >> 31) & 1u;
-    f.avx512_vnni = (ecx >> 11) & 1u;
-    f.avx512_vbmi = (ecx >> 1) & 1u;
-    return f;
-}
-
-void cpu_require_expert_support() {
-    const CpuFeatures f = cpu_features();
-    if (f.usable()) return;
-    std::fprintf(stderr,
-                 "strata: this CPU cannot run the expert kernel: %s.\n"
-                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
-                 "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
-                 f.reason());
-    std::exit(1);
-}
-
-void act_quant_q8_1(const float* x, int n, ActQ& a) {
+// ---- the entry points (kernel side).  `act_quant_q8_1`, `s2_expert_vnni_q`, ... of expert.hpp are the dispatchers in
+// expert_dispatch.cpp; they reach these through the table at the end of this file.  The `k_` prefix is not decoration:
+// with the same name and signature as the public functions, argument-dependent lookup would find both and the calls
+// below would be ambiguous.
+void k_act_quant_q8_1(const float* x, int n, ActQ& a) {
     if (oracle_q8_0.load(std::memory_order_relaxed)) {
         quantize_oracle_q8_0(x, n, a);
         return;
@@ -450,16 +498,7 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
     }
 }
 
-void expert_set_oracle_q8_0(bool enabled) {
-    oracle_q8_0.store(enabled, std::memory_order_relaxed);
-}
-
-void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScratch& ws) {
-    act_quant_q8_1(x, H, ws.a1);
-    s2_expert_vnni_q(blob, ws.a1, out, ws);
-}
-
-void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws) {
+void k_s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws) {
     if (oracle_q8_0.load(std::memory_order_relaxed)) {
         expert_oracle_q8_0(blob, a1, out, ws);
         return;
@@ -479,9 +518,7 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
                          blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, SC_D);
 }
 
-bool expert_oracle_q8_0_enabled() { return oracle_q8_0.load(std::memory_order_relaxed); }
-
-void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
+void k_s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
         const float g = row_dot(blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU,
                                 blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2, a1, SC_GU);
@@ -491,7 +528,7 @@ void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, i
     }
 }
 
-void s2_expert_down_rows(const uint8_t* blob, const ActQ& a2, float* out, int r0, int r1) {
+void k_s2_expert_down_rows(const uint8_t* blob, const ActQ& a2, float* out, int r0, int r1) {
     for (int r = r0; r < r1; ++r)
         out[r] = row_dot(blob + O_D_CODES + (size_t) r * ROW_D, blob + O_D_SCALES + (size_t) r * SC_D * 2, a2, SC_D);
 }
@@ -519,8 +556,8 @@ void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* o
 }
 }  // namespace
 
-void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* ff, int r0,
-                             int r1) {
+void k_s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* ff, int r0,
+                               int r1) {
     switch (n_tokens) {
         case 1: gu_rows_multi<1>(blob, a1, ff, r0, r1); break;
         case 2: gu_rows_multi<2>(blob, a1, ff, r0, r1); break;
@@ -533,8 +570,8 @@ void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_t
     }
 }
 
-void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n_tokens, float* const* out, int r0,
-                               int r1) {
+void k_s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n_tokens, float* const* out, int r0,
+                                 int r1) {
     switch (n_tokens) {
         case 1: down_rows_multi<1>(blob, a2, out, r0, r1); break;
         case 2: down_rows_multi<2>(blob, a2, out, r0, r1); break;
@@ -594,8 +631,8 @@ void q2g_rows(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const
 }
 }  // namespace
 
-void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
-                          float* const* out, int r0, int r1) {
+void k_q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                            float* const* out, int r0, int r1) {
     switch (nt) {
         case 1: q2g_rows<1>(w, row_bytes, nblocks, a, out, r0, r1); break;
         case 2: q2g_rows<2>(w, row_bytes, nblocks, a, out, r0, r1); break;
@@ -608,10 +645,10 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
     }
 }
 
-void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
-                          ExpertScratchMulti& ws) {
+void k_s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
+                            ExpertScratchMulti& ws) {
     if (oracle_q8_0.load(std::memory_order_relaxed) || n_tokens < 1 || n_tokens > MAXT) {
-        for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
+        for (int t = 0; t < n_tokens; ++t) k_s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
         return;
     }
     switch (n_tokens) {
@@ -626,58 +663,24 @@ void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_toke
     }
 }
 
-void s2_expert_scalar(const uint8_t* blob, const float* x_in, float* out, bool quant_acts) {
-    // BOTH STAGES, which is what `quant_acts` promises and what `bench/micro/cpu_s2.cpp` does NOT do.
-    //
-    // The original's comment says the oracle "consume[s] the SAME INT8 activation values the VNNI path uses,
-    // at both stages", but its code quantizes only the INTERMEDIATE - the gate/up projections still see raw
-    // f32 `x`.  Feeding it an already-quantized input (which is what the engine does) makes the two coincide
-    // and hides the discrepancy entirely; feeding it a raw f32 input makes the comparison one between two
-    // DIFFERENT computations, and the gap measured here was 1.19e-02 - three times P2.S3's tolerance, and
-    // read as a kernel bug when it was a fixture bug.
-    float xq[H];
-    const float* x = x_in;
-    if (quant_acts) {
-        ActQ a1;
-        act_quant_q8_1(x_in, H, a1);
-        for (int i = 0; i < H; ++i) xq[i] = a1.scale[i / QKA] * (float) a1.q[i];
-        x = xq;
-    }
-    float ff[FF];
-    for (int r = 0; r < FF; ++r) {
-        const uint8_t* gc = blob + O_GU_CODES + (size_t) (2 * r) * ROW_GU;
-        const uint8_t* gs = blob + O_GU_SCALES + (size_t) (2 * r) * SC_GU * 2;
-        const uint8_t* uc = blob + O_GU_CODES + (size_t) (2 * r + 1) * ROW_GU;
-        const uint8_t* us = blob + O_GU_SCALES + (size_t) (2 * r + 1) * SC_GU * 2;
-        float sg = 0.f, su = 0.f;
-        for (int b = 0; b < SC_GU; ++b) {
-            const float dg = h2f(gs + 2 * b), du = h2f(us + 2 * b);
-            for (int j = 0; j < QK; ++j) {
-                const int o = b * QK + j;
-                sg += (float) (((gc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * dg * x[o];
-                su += (float) (((uc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * du * x[o];
-            }
-        }
-        ff[r] = (sg / (1.f + std::exp(-sg))) * su;
-    }
-    if (quant_acts) {
-        // Replace the exact intermediate with the INT8 values the VNNI path actually sees, so the two differ
-        // only by FP32 evaluation order.
-        ActQ a2;
-        act_quant_q8_1(ff, FF, a2);
-        for (int i = 0; i < FF; ++i) ff[i] = a2.scale[i / QKA] * (float) a2.q[i];
-    }
-    for (int r = 0; r < H; ++r) {
-        const uint8_t* dc = blob + O_D_CODES + (size_t) r * ROW_D;
-        const uint8_t* ds = blob + O_D_SCALES + (size_t) r * SC_D * 2;
-        float acc = 0.f;
-        for (int b = 0; b < SC_D; ++b) {
-            const float d = h2f(ds + 2 * b);
-            for (int j = 0; j < QK; ++j)
-                acc += (float) (((dc[b * 16 + (j >> 2)] >> (2 * (j & 3))) & 3) - 1) * d * ff[b * QK + j];
-        }
-        out[r] = acc;
-    }
+void k_unpack64(const uint8_t* codes16, uint8_t* out64) { _mm512_storeu_si512((void*) out64, unpack64_q2_0(codes16)); }
+void k_unpack32(const uint8_t* codes8, uint8_t* out32) { _mm256_storeu_si256((__m256i*) out32, unpack_q2_0(codes8)); }
+
+}  // namespace STRATA_EXPERT_NS
+
+const ExpertKernels& STRATA_EXPERT_KERNELS() {
+    static const ExpertKernels k = {STRATA_EXPERT_NAME,
+                                    &STRATA_EXPERT_NS::k_act_quant_q8_1,
+                                    &STRATA_EXPERT_NS::k_s2_expert_vnni_q,
+                                    &STRATA_EXPERT_NS::k_s2_expert_gu_rows,
+                                    &STRATA_EXPERT_NS::k_s2_expert_down_rows,
+                                    &STRATA_EXPERT_NS::k_s2_expert_gu_rows_multi,
+                                    &STRATA_EXPERT_NS::k_s2_expert_down_rows_multi,
+                                    &STRATA_EXPERT_NS::k_s2_expert_vnni_multi,
+                                    &STRATA_EXPERT_NS::k_q2_0_gguf_rows_multi,
+                                    &STRATA_EXPERT_NS::k_unpack64,
+                                    &STRATA_EXPERT_NS::k_unpack32};
+    return k;
 }
 
 }  // namespace strata::kernels::cpu

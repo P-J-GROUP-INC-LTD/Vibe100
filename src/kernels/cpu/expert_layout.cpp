@@ -21,23 +21,36 @@ ExpertLayout g_layout;
 
 const ExpertLayout& expert_layout() { return g_layout; }
 
-bool cpu_avx512_ok() {
-    static const bool ok = [] {
-        if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
-        unsigned r[4] = {0, 0, 0, 0};
-        auto cpuid = [&](unsigned leaf, unsigned sub) {
+namespace {
+
+bool env_is_1(const char* name) {
+    const char* f = std::getenv(name);
+    return f != nullptr && f[0] == '1';
+}
+
+/// CPUID leaf 7 and the OS's register-state mask, probed once.  This file is compiled without AVX-512 flags, so it can
+/// run on any x86-64.
+CpuFeatures probe_features() {
+    CpuFeatures f;
+    unsigned r[4] = {0, 0, 0, 0};
+    auto cpuid = [&](unsigned leaf, unsigned sub) {
 #if defined(_MSC_VER)
-            int x[4];
-            __cpuidex(x, (int) leaf, (int) sub);
-            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+        int x[4];
+        __cpuidex(x, (int) leaf, (int) sub);
+        for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
 #else
-            __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+        __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
 #endif
-        };
-        cpuid(0, 0);
-        if (r[0] < 7) return false;
-        cpuid(1, 0);
-        if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE
+    };
+    cpuid(0, 0);
+    if (r[0] < 7) {
+        f.os_avx512 = false;
+        return f;
+    }
+    cpuid(1, 0);
+    const bool osxsave = (r[2] >> 27) & 1u;
+    f.os_avx512 = false;
+    if (osxsave) {
 #if defined(_MSC_VER)
         const unsigned long long xcr0 = _xgetbv(0);
 #else
@@ -45,13 +58,80 @@ bool cpu_avx512_ok() {
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
 #endif
-        if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
-        cpuid(7, 0);
-        const unsigned ebx = r[1], ecx = r[2];
-        return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u);
-    }();
-    return ok;
+        f.os_avx512 = (xcr0 & 0xE6) == 0xE6;                // the OS saves XMM, YMM, the opmasks and the ZMM state
+    }
+    cpuid(7, 0);
+    const unsigned ebx = r[1], ecx = r[2];
+    f.avx512f = (ebx >> 16) & 1u;
+    f.avx512dq = (ebx >> 17) & 1u;
+    f.avx512bw = (ebx >> 30) & 1u;
+    f.avx512vl = (ebx >> 31) & 1u;
+    f.avx512_vnni = (ecx >> 11) & 1u;
+    f.avx512_vbmi = (ecx >> 1) & 1u;
+    return f;
 }
+
+}  // namespace
+
+CpuFeatures cpu_features() {
+    static const CpuFeatures f = probe_features();
+    return f;
+}
+
+const char* CpuFeatures::reason() const {
+    if (usable()) return "ok";
+    // Named individually: "AVX-512 not supported" sends a user looking for a new CPU when the machine may have
+    // AVX-512F and be missing only VNNI, which is a much narrower and more explicable gap.
+    if (avx512f && avx512bw && avx512vl && avx512dq && avx512_vnni && !os_avx512)
+        return "the operating system does not save the AVX-512 register state";
+    static char buf[160];
+    std::snprintf(buf, sizeof buf, "missing %s%s%s%s%s", avx512f ? "" : "AVX512F ", avx512bw ? "" : "AVX512BW ",
+                  avx512vl ? "" : "AVX512VL ", avx512dq ? "" : "AVX512DQ ", avx512_vnni ? "" : "AVX512-VNNI");
+    for (size_t n = std::strlen(buf); n > 0 && buf[n - 1] == ' '; --n) buf[n - 1] = '\0';
+    return buf;
+}
+
+void cpu_require_expert_support() {
+    const CpuFeatures f = cpu_features();
+    if (f.usable()) return;
+    std::fprintf(stderr,
+                 "strata: this CPU cannot run the expert kernel: %s.\n"
+                 "        The canonical Q2_0 pack needs AVX-512 with F, BW, VL, DQ and VNNI: Intel Cascade Lake, Ice Lake\n"
+                 "        or newer, AMD Zen 4 or newer (VBMI is used where the CPU has it, and is not required).\n"
+                 "        The i-quant models (IQ2_XS, IQ3_XXS, IQ3_S) also run on AVX2 CPUs.\n"
+                 "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
+                 f.reason());
+    std::exit(1);
+}
+
+ExpertIsa cpu_q2_expert_isa() {
+    static const ExpertIsa isa = [] {
+        const CpuFeatures f = cpu_features();
+        if (!f.usable()) return ExpertIsa::Avx2;
+        // STRATA_FORCE_AVX512_NOVBMI=1 (debug): the Cascade Lake build on a CPU that has VBMI, to compare the two.
+        if (f.vbmi() && !env_is_1("STRATA_FORCE_AVX512_NOVBMI")) return ExpertIsa::Avx512Vbmi;
+        return ExpertIsa::Avx512Vnni;
+    }();
+    return isa;
+}
+
+ExpertIsa cpu_expert_isa() {
+    static const ExpertIsa isa = env_is_1("STRATA_FORCE_AVX2") ? ExpertIsa::Avx2 : cpu_q2_expert_isa();
+    return isa;
+}
+
+const char* expert_isa_name(ExpertIsa isa) {
+    switch (isa) {
+        case ExpertIsa::Avx512Vbmi: return "AVX-512 VNNI + VBMI";
+        case ExpertIsa::Avx512Vnni: return "AVX-512 VNNI (no VBMI)";
+        default: return "AVX2";
+    }
+}
+
+/// Whether the AVX-512 kernels run: every AVX-512 tier (VNNI, with or without VBMI).  The kernels that call this -
+/// the GGUF-layout Q2_0 rows, the i-quant rows - are compiled once for all of them (the i-quant file uses no VBMI at
+/// all; the Q2_0 rows go through the two-build dispatch in expert_dispatch.cpp), so this stays a yes / no question.
+bool cpu_avx512_ok() { return cpu_expert_isa() != ExpertIsa::Avx2; }
 
 bool cpu_avx2_ok() {
     static const bool ok = [] {

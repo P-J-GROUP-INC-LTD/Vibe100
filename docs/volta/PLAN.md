@@ -74,11 +74,12 @@ reads crossing the UPI link; Phase 0 runs `mlc --bandwidth_matrix` and `nvidia-s
 remote bandwidth and which socket the V100 hangs off). Two facts
 from the source that matter on this box, both CPU-side and independent of the GPU port:
 
-1. **Strata's own AVX-512 expert kernels are off on Cascade Lake.** `cpu_avx512_ok()` requires AVX512-VBMI
-   (`vpmultishiftqb` unpacks the 2-bit codes), which arrived with Ice Lake; Cascade Lake has AVX512-VNNI but not
-   VBMI. The engine falls back to its AVX2 kernels (and ggml's for the i-quant packs), and setup never offers the
-   canonical Q2_0 pack (AVX-512-only — the fastest model). Candidate: an AVX512-VNNI kernel variant that unpacks
-   with shifts and masks instead of `vpmultishiftqb`. Measure the AVX2 path in Phase 0 first.
+1. **Strata's own AVX-512 expert kernels were off on Cascade Lake** (`cpu_avx512_ok()` required AVX512-VBMI for one
+   instruction, `vpmultishiftqb`). **Fixed by WP-E:** `expert.cpp` is compiled a second time without VBMI (a
+   shuffle / shift / mask unpack proven bit-identical over all 2^32 inputs) and picked at run time; setup now offers
+   the canonical Q2_0 pack on Cascade Lake. Measured on a Cascade-Lake-class VM: canonical Q2_0 kernel 5.8-6.2 GB/s
+   per thread (AVX2 rows: 3.3). The i-quant packs keep AVX2 by default on this tier except IQ2_S (AVX-512 measured
+   slower there); `STRATA_IQ512=1` A/Bs it on the real Xeon.
 2. **The CPU expert pool is not NUMA-aware.** Workers are pinned to cores (`kernels/cpu/pool.cpp`) but the expert
    arena is placed by first touch, so half the workers read it across UPI. Quick fix for Phase 0:
    `numactl --interleave=all` (or BIOS node interleaving). Real fix for Qwen: **mirror the expert arena on both

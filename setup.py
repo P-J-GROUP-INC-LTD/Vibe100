@@ -258,9 +258,29 @@ def page_file_gb():
     return max(0.0, (m.ullTotalPageFile - m.ullTotalPhys) / 2**30)
 
 
+# What Strata's own AVX-512 expert kernels need: AVX-512 F, BW, VL, DQ and VNNI - the engine's test
+# (CpuFeatures::usable / cpu_avx512_ok in src/kernels/cpu).  AVX-512 VBMI is NOT on the list: Intel Cascade Lake
+# (Xeon Gold 62xx, Silver 42xx, ...) has VNNI but no VBMI and runs the kernels' second build (shuffle / shift / mask unpack
+# instead of vpmultishiftqb, bit-identical results); Ice Lake / Zen 4 and newer run the VBMI build.  Without VNNI
+# (Skylake-X, Zen 2/3, Core 12th-14th gen) the engine uses its AVX2 kernels and the canonical Q2_0 pack is not offered.
+AVX512_FLAGS = frozenset({"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512_vnni"})   # /proc/cpuinfo's spelling
+CPUID7_EBX_NEED = (1 << 16) | (1 << 17) | (1 << 30) | (1 << 31)   # F, DQ, BW, VL
+CPUID7_ECX_NEED = 1 << 11                                          # VNNI
+
+
+def avx512_from_flags(flags) -> bool:
+    """True when /proc/cpuinfo's `flags` have everything the AVX-512 kernels use (VBMI is not needed)."""
+    return AVX512_FLAGS <= set(flags)
+
+
+def avx512_from_cpuid7(ebx: int, ecx: int) -> bool:
+    """The same test on CPUID leaf 7 (EBX, ECX), for Windows, which has no feature bit for VNNI."""
+    return (ebx & CPUID7_EBX_NEED) == CPUID7_EBX_NEED and (ecx & CPUID7_ECX_NEED) == CPUID7_ECX_NEED
+
+
 def cpu_info():
-    """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
-    the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
+    """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, DQ, VNNI - VBMI is
+    optional, it only picks the faster build), the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
     if WIN:
         pf = ctypes.windll.kernel32.IsProcessorFeaturePresent
@@ -273,7 +293,7 @@ def cpu_info():
             txt = open("/proc/cpuinfo").read()
             flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
             avx2 = "avx2" in flags
-            avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi"} <= flags
+            avx512 = avx512_from_flags(flags)
             m = re.search(r"^model name\s*:\s*(.*)$", txt, re.M)
             name = m.group(1) if m else name
         except OSError:
@@ -282,7 +302,7 @@ def cpu_info():
 
 
 def _cpuid_avx512_full() -> bool:
-    """Windows has no feature bit for VNNI / VBMI: ask the CPU (CPUID leaf 7) through a tiny machine-code stub."""
+    """Windows has no feature bit for VNNI: ask the CPU (CPUID leaf 7) through a tiny machine-code stub."""
     try:
         code = bytes([0x53, 0x49, 0x89, 0xC8, 0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2,   # push rbx; r8=rcx; cpuid(7,0)
                       0x41, 0x89, 0x18, 0x41, 0x89, 0x48, 0x04, 0x5B, 0xC3])                   # [r8]=ebx,[r8+4]=ecx; pop rbx
@@ -295,9 +315,7 @@ def _cpuid_avx512_full() -> bool:
         regs = (ctypes.c_uint32 * 2)()
         ctypes.CFUNCTYPE(None, ctypes.c_void_p)(buf)(ctypes.addressof(regs))
         ebx, ecx = regs[0], regs[1]
-        need_ebx = (1 << 16) | (1 << 30) | (1 << 31)                   # F, BW, VL
-        need_ecx = (1 << 1) | (1 << 11)                                # VBMI, VNNI
-        return (ebx & need_ebx) == need_ebx and (ecx & need_ecx) == need_ecx
+        return avx512_from_cpuid7(ebx, ecx)                            # F, DQ, BW, VL and VNNI; VBMI is optional
     except Exception:
         return False
 

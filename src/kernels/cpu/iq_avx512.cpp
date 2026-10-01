@@ -8,6 +8,12 @@
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu (no shipped
 // model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
+//
+// Vibe100: nothing here needs more than AVX512-BW (maddubs, madd, permutexvar_epi16, the 64-bit byte masks) - no VNNI, no
+// VBMI - and CMakeLists.txt compiles this file WITHOUT -mavx512vbmi, so the compiler cannot add a VBMI instruction and a
+// Cascade Lake CPU can run it (objdump of the object: zero vpermb / vpermi2b / vpermt2b / vpmultishiftqb; the
+// `expert_novbmi_no_vbmi` test checks).  Which CPUs use it by default is native_expert.cpp's decision: on Cascade Lake the
+// AVX-2 rows are faster for most formats.
 #include "strata/kernels/cpu/iq_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP

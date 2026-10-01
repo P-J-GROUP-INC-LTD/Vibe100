@@ -34,9 +34,8 @@ trees, read at audit time).  **No BUG was found in a file nobody owns**, so this
 Two findings that are not arch dispatch but shape how the port can be checked on the target box (a dual Cascade Lake Xeon, per the plan):
 
 * **Native (IQ) packs write no `--dump-logits` rows** (`generate.cpp:5410`: `if (native_pack) { spec_pos = pos; break; }` skips the token loop, the only
-  writer of the dump), and **Cascade Lake cannot run the Q2_0 pack** (`cpu_avx512_ok()`, `src/kernels/cpu/expert_layout.cpp:24-54`, needs AVX-512
-  F/BW/VL/VNNI **and VBMI**; `generate.cpp:1628` `cpu_require_expert_support()` exits for a non-native pack on a CPU without them).  So the only packs the
-  box runs have no logits dump.  `golden_compare.py` therefore has a second teacher source that works for them: `strata --serve` with
+  writer of the dump), and upstream's Cascade Lake could not run the Q2_0 pack (its kernels required AVX-512 VBMI; WP-E removed that
+  requirement - the canonical pack now runs there and DOES write the dump).  The native packs remain the common choice and have no logits dump.  `golden_compare.py` therefore has a second teacher source that works for them: `strata --serve` with
   `STRATA_LOGPOS` (`generate.cpp:4757-4765`, `Verifier::window_logprobs`), which writes per-position log-probabilities for a prompt part read through the
   verify windows - see its docstring.
 * A native pack generates only through the verify-window loop (the token loop is skipped); `setup.py` always passes `--spec 4 --mtp ...` for it, so the profile
@@ -125,8 +124,8 @@ true across llama.cpp pin bumps (a new trap, or a table row that disappears, sho
 
 | file:line | condition | Cascade Lake (AVX2, AVX-512 F/BW/VL/VNNI, **no VBMI**) gets | verdict |
 |---|---|---|---|
-| `src/kernels/cpu/expert_layout.cpp:24-54` `cpu_avx512_ok()` | CPUID: AVX-512 F, BW, VL, VNNI **and VBMI**, OS saves the AVX-512 state; `STRATA_FORCE_AVX2=1` forces false | false | OK (a CPU, not a Volta, question; the plan lists it as a Phase-3 candidate) |
-| `src/program/generate.cpp:1628-1632` | non-native pack: `cpu_require_expert_support()` (`expert.cpp:375`) exits unless AVX-512 VNNI + VBMI; native pack: AVX-512 -> else a notice and the AVX-2 kernels | the Q2_0 pack is **refused**; IQ packs run on AVX-2 (`strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2`) | OK |
+| `src/kernels/cpu/expert_layout.cpp:24-54` `cpu_avx512_ok()` | CPUID: AVX-512 F, BW, VL, DQ, VNNI (VBMI optional since WP-E: it selects the VBMI build), OS saves the AVX-512 state; `STRATA_FORCE_AVX2=1` forces false | true (no-VBMI build) | OK (WP-E) |
+| `src/program/generate.cpp:1628-1632` | non-native pack: `cpu_require_expert_support()` (`expert.cpp:375`) exits unless AVX-512 F/BW/VL/DQ + VNNI; native pack: AVX-512 -> else a notice and the AVX-2 kernels | WP-E: the Q2_0 pack runs on the no-VBMI build (`CPU expert kernels: AVX-512 VNNI (no VBMI)`); IQ packs: AVX2 rows by default except IQ2_S (`STRATA_IQ512=1` forces AVX-512) | OK |
 | `src/program/generate.cpp:5410` | `if (native_pack) { spec_pos = pos; break; }` | a native pack never runs the token loop, so `--dump-logits` writes a header and no rows | OK, but it removes the engine's own logits oracle for every pack this box can run: `golden_compare.py --teacher-source logpos` |
 
 ## Warp-synchronous code and independent thread scheduling

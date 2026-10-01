@@ -41,8 +41,10 @@ struct ExpertLayout {
     }
 };
 
-/// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI).  Probed in a
+/// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, DQ, VNNI - VBMI is NOT needed:
+/// Cascade Lake runs the AVX-512 kernels through their no-VBMI build, see expert.hpp "TWO BUILDS").  Probed in a
 /// file compiled without AVX-512, so asking is safe everywhere; STRATA_FORCE_AVX2=1 answers no (for tests).
+/// `cpu_expert_isa()` (expert.hpp) says which AVX-512 tier it is.
 bool cpu_avx512_ok();
 /// Whether this CPU (and its OS) runs the AVX2 kernels (AVX, AVX2, FMA, F16C): the floor of every expert kernel
 /// (q2_avx2.cpp, iq_avx2.cpp, and ggml-cpu in the portable build).  STRATA_FORCE_AVX2 does not change it.

@@ -145,11 +145,13 @@ check_gpu() {
 }
 
 # ------------------------------------------------------------------------------------------- 2a. the CPU's vector units
-# The engine's own AVX-512 expert kernels need F, BW, VL, VNNI *and VBMI* (src/kernels/cpu/expert_layout.cpp: cpu_avx512_ok):
-# Ice Lake / Zen 4 and newer.  Cascade Lake has VNNI but not VBMI, so it runs the AVX-2 kernels (ggml-cpu for the i-quants) and
-# the canonical Q2_0 pack is refused.  Said here so the Phase-0 numbers are read for what they are.
+# The engine's own AVX-512 expert kernels need F, BW, VL, DQ and VNNI (src/kernels/cpu/expert_layout.cpp: cpu_avx512_ok);
+# VBMI is optional.  Ice Lake / Zen 4 and newer have it and run the VBMI build; Cascade Lake has VNNI but not VBMI and runs
+# the no-VBMI build of the same kernels (bit-identical results).  Without VNNI (Skylake-X, Zen 2/3) the engine runs its AVX-2
+# kernels (ggml-cpu for the i-quants) and the canonical Q2_0 pack is refused.  Said here so the Phase-0 numbers are read for
+# what they are.
 cpu_report() {
-  local flags need=(avx2 fma f16c avx512f avx512bw avx512vl avx512_vnni avx512_vbmi) f line="" missing=()
+  local flags need=(avx2 fma f16c avx512f avx512bw avx512vl avx512dq avx512_vnni avx512_vbmi) f line="" missing=()
   flags=" $(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | cut -d: -f2) "
   for f in "${need[@]}"; do
     if [[ "$flags" == *" $f "* ]]; then line+=" $f=yes"; else line+=" $f=NO"; missing+=("$f"); fi
@@ -158,11 +160,17 @@ cpu_report() {
     echo "== CPU vector features (what the engine's kernel selection looks at) =="
     echo "$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//')"
     echo "$line"
-    if [[ " ${missing[*]-} " == *" avx512_vbmi "* || " ${missing[*]-} " == *" avx512f "* ]]; then
-      echo "  -> no AVX-512 VBMI: the engine runs its AVX-2 expert kernels (the log says 'this CPU has no AVX-512: the expert kernels"
+    local need512=" avx512f avx512bw avx512vl avx512dq avx512_vnni " m512=0
+    for f in ${missing[@]+"${missing[@]}"}; do [[ "$need512" == *" $f "* ]] && m512=1; done
+    if [[ $m512 == 1 ]]; then
+      echo "  -> no AVX-512 with VNNI: the engine runs its AVX-2 expert kernels (the log says 'this CPU has no AVX-512: the expert kernels"
       echo "     run on AVX-2'); the canonical Q2_0 pack is refused, the i-quant (native) packs run.  STRATA_FORCE_AVX2=1 forces this on any CPU."
+    elif [[ " ${missing[*]-} " == *" avx512_vbmi "* ]]; then
+      echo "  -> AVX-512 + VNNI, no VBMI (Cascade Lake): the AVX-512 expert kernels run in their no-VBMI build (the log says"
+      echo "     'CPU expert kernels: AVX-512 VNNI (no VBMI)').  STRATA_FORCE_AVX2=1 forces the AVX-2 kernels."
     else
-      echo "  -> AVX-512 + VBMI present: the AVX-512 expert kernels are used."
+      echo "  -> AVX-512 + VNNI + VBMI present: the AVX-512 expert kernels run in their VBMI build.  STRATA_FORCE_AVX512_NOVBMI=1 forces"
+      echo "     the Cascade Lake build for an A/B test; STRATA_FORCE_AVX2=1 forces the AVX-2 kernels."
     fi
   } | tee -a "$OUTDIR/numa.txt"
 }

@@ -83,7 +83,17 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
     // AVX-2 kernel, STRATA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
+    //
+    // VIBE100, CASCADE LAKE (AVX-512 VNNI, no VBMI; iq_avx512.cpp runs there as it is - it needs only AVX512-BW): the
+    // AVX-512 rows were measured SLOWER than the AVX-2 ones on that core - at 2-3 tokens, one thread, cache-resident,
+    // best of six windows (iq_avx512_test --bench 1 --experts 2): IQ2_XXS 1.8 vs 2.2 GB/s, IQ2_XS 1.7-2.0 vs 2.2-2.3, IQ3_XXS
+    // 1.7-2.1 vs 2.0-2.7 (AVX-512 vs AVX-2; the weights streamed from RAM showed the same order), IQ3_S level, and faster only
+    // for IQ2_S (2.0-2.3 vs 1.7-2.0).  The Skylake-derived cores pay for the 512-bit license and the 64-bit table-lookup
+    // inserts where Zen 4 does not.  So the VNNI tier takes the AVX-512 rows for IQ2_S only, and everything else stays on
+    // AVX-2; from VBMI up (Ice Lake / Zen 4, where upstream measured the AVX-512 rows faster) every format uses them.
+    // STRATA_IQ512=1 forces them on every format on any AVX-512 CPU, which is the A/B switch for a Cascade Lake box.
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
+    static const bool avx512_all = cpu_expert_isa() == ExpertIsa::Avx512Vbmi || std::getenv("STRATA_IQ512") != nullptr;
     static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output
@@ -99,7 +109,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         return;
     }
     if (nt >= mt_min && iq512_supported(f.gu_type)) {
-        if (avx512) {
+        if (avx512 && (avx512_all || f.gu_type == 22)) {   // 22 = IQ2_S, the one format the VNNI tier takes (above)
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
         }

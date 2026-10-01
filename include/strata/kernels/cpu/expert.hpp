@@ -14,7 +14,9 @@
 //     9.89 GB/s on one core; VNNI is the reason the 6-core figure is 42.55 GB/s.
 //   * `vpmultishiftqb` (AVX512-VBMI) unpacks the 2-bit codes eight at a time.  Its ARGUMENT ORDER is
 //     (control, data) and was determined empirically - the Intel guide states the opposite, and following the
-//     guide produced 43 of 64 wrong codes.
+//     guide produced 43 of 64 wrong codes.  (Cascade Lake has VNNI but no VBMI: the same file is compiled a
+//     second time with a shuffle / variable-shift / mask unpack that yields the identical 64 bytes - see
+//     "TWO BUILDS" below.)
 //   * The row accumulator stays a FLOAT VECTOR and is reduced ONCE at the end of the row.  Reducing per
 //     64-weight block cost more than the dot products themselves: it made the kernel compute-bound at
 //     21 GB/s instead of DRAM-bound at 32.
@@ -77,20 +79,49 @@ struct ExpertScratch {
     alignas(64) float ff[FF];
 };
 
-/// Runtime CPU feature check.  The kernel uses AVX512-VNNI + AVX512-VBMI + AVX512VL, and code compiled with
-/// `/arch:AVX512` can emit AVX-512 anywhere in its translation unit, so a machine without them must be
-/// REFUSED rather than silently run.  `s2_expert_scalar` is the fallback and exists for tests.
+/// Runtime CPU feature check.  The kernels use AVX512-F/BW/VL/DQ + AVX512-VNNI, and VBMI where the CPU has it, and
+/// code compiled with `/arch:AVX512` can emit AVX-512 anywhere in its translation unit, so a machine without them
+/// must be REFUSED rather than silently run.  `s2_expert_scalar` is the fallback and exists for tests.
+///
+/// TWO BUILDS OF THE Q2_0 KERNELS.  `expert.cpp` is compiled twice: once with `-mavx512vbmi` (the 2-bit codes are
+/// unpacked by `vpmultishiftqb`: Intel Ice Lake / Tiger Lake / Sapphire Rapids and newer, AMD Zen 4 and newer) and
+/// once WITHOUT it, as `expert_novbmi.cpp` (the codes are unpacked by `vpshufb` + `vpsrlvd` + mask + `vpshufb`:
+/// Intel Skylake-X derivatives with VNNI, i.e. Cascade Lake and Cooper Lake).  The second build is also the
+/// only one that can be proved free of VBMI instructions: the first may let the compiler use them anywhere.  Both
+/// produce the same 64 code bytes for the same input, so every output is bit-identical; which one runs is decided once,
+/// at the first call (`cpu_expert_isa()` below).  `STRATA_FORCE_AVX512_NOVBMI=1` picks the second on a CPU that
+/// has VBMI, to compare the two on one machine.
 struct CpuFeatures {
     bool avx512f = false;
     bool avx512bw = false;
     bool avx512vl = false;
+    bool avx512dq = false;
     bool avx512_vnni = false;
     bool avx512_vbmi = false;
-    bool usable() const { return avx512f && avx512bw && avx512vl && avx512_vnni && avx512_vbmi; }
+    bool os_avx512 = true;   ///< the OS saves the ZMM / opmask state (XCR0); false makes every AVX-512 bit above moot
+    /// An AVX-512 Q2_0 expert kernel can run: F, BW, VL, DQ, VNNI.  VBMI is NOT required (it picks the faster build).
+    bool usable() const { return os_avx512 && avx512f && avx512bw && avx512vl && avx512dq && avx512_vnni; }
+    /// The VBMI build can run too (Ice Lake / Zen 4 and newer).
+    bool vbmi() const { return usable() && avx512_vbmi; }
     /// A one-line description of what is missing, or "ok".
     const char* reason() const;
 };
 CpuFeatures cpu_features();
+
+/// Which kernel set the CPU expert path uses.  Ordered: each tier runs everything the one below it does.
+enum class ExpertIsa {
+    Avx2 = 0,         ///< no AVX-512 kernel (CPU without F/BW/VL/DQ/VNNI, or STRATA_FORCE_AVX2=1 for the i-quant / GGUF rows)
+    Avx512Vnni = 1,   ///< Cascade Lake: AVX-512 F/BW/VL/DQ + VNNI, no VBMI (or STRATA_FORCE_AVX512_NOVBMI=1)
+    Avx512Vbmi = 2,   ///< Ice Lake / Zen 4 and newer: the same plus VBMI
+};
+/// The tier for the code that has an AVX2 alternative (the GGUF-layout Q2_0 rows, the i-quant rows):
+/// STRATA_FORCE_AVX2=1 answers Avx2, STRATA_FORCE_AVX512_NOVBMI=1 caps it at Avx512Vnni.
+ExpertIsa cpu_expert_isa();
+/// The tier of the canonical Q2_0 pack's kernels, which have no AVX2 alternative: STRATA_FORCE_AVX2 does not apply
+/// (as before), STRATA_FORCE_AVX512_NOVBMI=1 caps it at Avx512Vnni.  Avx2 here means "no kernel can run".
+ExpertIsa cpu_q2_expert_isa();
+/// "AVX-512 VNNI + VBMI", "AVX-512 VNNI (no VBMI)" or "AVX2", for messages.
+const char* expert_isa_name(ExpertIsa isa);
 
 /// Exits with a clear message if the CPU cannot run `s2_expert_vnni`.  Called once at startup, so a user on an
 /// older CPU learns why at second zero instead of seeing an illegal instruction at token 4000.

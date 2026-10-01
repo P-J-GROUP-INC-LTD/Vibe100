@@ -1543,9 +1543,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI + VBMI) and its translation unit is
-    // compiled `/arch:AVX512`, so on a CPU without those features it does not fail - it executes an illegal
-    // instruction at some unpredictable token.  Refusing at second zero is the whole point of P2.S3's check.
+    // **BEFORE ANYTHING ELSE.**  The CPU expert kernel is AVX-512 (VNNI; VBMI where the CPU has it - Cascade Lake runs
+    // the build without it) and its translation unit is compiled `/arch:AVX512`, so on a CPU without those features it
+    // does not fail - it executes an illegal instruction at some unpredictable token.  Refusing at second zero is the
+    // whole point of P2.S3's check.
     strata::kernels::cpu::expert_set_oracle_q8_0(o.cpu_oracle_q8_0);
     // ... and nothing runs on a CPU without AVX2: every CPU expert kernel is AVX2 at least (the AVX-512 ones are
     // chosen above it), and so is ggml-cpu in the release build, which the native pack's layout load initializes
@@ -1624,12 +1625,19 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
-    // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
+    // the canonical Q2_0 pack's CPU kernels are AVX-512 only (VNNI, VBMI not needed); a native pack runs on AVX2 CPUs
+    // as well.  "No AVX-512" below means no usable AVX-512 kernel set: F/BW/VL/DQ + VNNI, or STRATA_FORCE_AVX2=1.
     if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
     else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
                      std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+    {   // which AVX-512 build runs (Cascade Lake: "AVX-512 VNNI (no VBMI)"), so a log shows what the CPU got
+        using strata::kernels::cpu::ExpertIsa;
+        const ExpertIsa isa = native_pack ? strata::kernels::cpu::cpu_expert_isa() : strata::kernels::cpu::cpu_q2_expert_isa();
+        if (isa != ExpertIsa::Avx2)
+            std::fprintf(stderr, "strata generate: CPU expert kernels: %s\n", strata::kernels::cpu::expert_isa_name(isa));
+    }
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,

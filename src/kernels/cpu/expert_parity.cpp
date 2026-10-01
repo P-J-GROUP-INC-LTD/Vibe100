@@ -12,6 +12,13 @@
 // The activation contract is asserted OBSERVABLE between the two: if rounding the activation to Q8_1 made no
 // difference, then one of the two paths is not doing what it claims and check 1 would be vacuous.
 //
+// `--synthetic` runs the same checks on a random expert instead of one read from the pack (no 66 GB file needed): the
+// kernel check (1) is about the arithmetic, not the data, and this is what runs on a machine without the model.  The
+// structural checks about the file (a next expert that differs) are skipped there, as they have nothing to look at.
+//
+// WHICH BUILD IS CHECKED: the one the CPU uses (`cpu_q2_expert_isa()`: the VBMI build on Ice Lake / Zen 4, the no-VBMI
+// build on Cascade Lake).  STRATA_FORCE_AVX512_NOVBMI=1 checks the no-VBMI build on a CPU that has VBMI.
+//
 // A SELF-CONSISTENT TEST CANNOT CATCH A WRONG FILE OFFSET.  Both sides read the same blob, so pointing at the
 // wrong expert would still agree perfectly.  What is checked instead is structural: the blob must decode to
 // finite, non-zero scales, and the blob at a DIFFERENT layer must be different data - which is what a wrong
@@ -55,6 +62,17 @@ bool read_blob(const char* path, long long index, std::vector<uint8_t>& out) {
     return got == out.size();
 }
 
+/// A random expert: random codes, fp16 scales of about 0.004 - 0.016 (the artifact's range).
+void make_synthetic_blob(std::vector<uint8_t>& b) {
+    std::mt19937 rng(31337);
+    b.assign(cpu::BLOB, 0);
+    for (size_t i = 0; i < cpu::O_GU_SCALES; ++i) b[i] = (uint8_t) rng();
+    for (size_t i = cpu::O_GU_SCALES; i < cpu::BLOB; i += 2) {
+        const uint16_t h = (uint16_t) (0x1C00 + rng() % 0x0800);
+        std::memcpy(b.data() + i, &h, 2);
+    }
+}
+
 /// The fp16 scale at a byte offset, decoded by the SAME rule the kernel uses.  Used only for the structural
 /// sanity check, so it is deliberately a second, independent transcription of the three lines in question.
 float f16_at(const std::vector<uint8_t>& b, size_t off) {
@@ -79,16 +97,17 @@ float f16_at(const std::vector<uint8_t>& b, size_t off) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool selftest = false;
+    bool selftest = false, synthetic = false;
     const char* path = "pack/full/experts.bin";
     long long layer = 0, expert = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
+        else if (a == "--synthetic") synthetic = true;
         else if (a == "--file" && i + 1 < argc) path = argv[++i];
         else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
         else if (a == "--expert" && i + 1 < argc) expert = std::atoll(argv[++i]);
-        else { std::fprintf(stderr, "usage: expert_parity [--selftest] [--file P] [--layer N] [--expert N]\n");
+        else { std::fprintf(stderr, "usage: expert_parity [--selftest] [--synthetic] [--file P] [--layer N] [--expert N]\n");
                return 2; }
     }
 
@@ -96,8 +115,10 @@ int main(int argc, char** argv) {
 
     // ---- the CPU must be able to run the kernel, and the report must say WHICH feature is missing
     const cpu::CpuFeatures feat = cpu::cpu_features();
-    std::printf("  %-44s %s\n", "AVX512 F/BW/VL/VNNI/VBMI",
+    std::printf("  %-44s %s\n", "AVX512 F/BW/VL/DQ/VNNI (VBMI optional)",
                 feat.usable() ? "all present" : feat.reason());
+    if (feat.usable())
+        std::printf("  %-44s %s\n", "Q2_0 kernel build under test", cpu::expert_isa_name(cpu::cpu_q2_expert_isa()));
     if (!feat.usable()) {
         std::printf("      the VNNI path cannot run here; only the scalar oracle can be exercised.\n");
         std::printf("      P2.S3's kernel check is SKIPPED, not passed.\n");
@@ -108,7 +129,10 @@ int main(int argc, char** argv) {
     // ---- a real blob out of the pack: layer stride is 512 experts
     const long long idx = layer * 512 + expert;
     std::vector<uint8_t> blob;
-    if (!read_blob(path, idx, blob)) {
+    if (synthetic) {
+        make_synthetic_blob(blob);
+        std::printf("  %-44s %s\n", "expert", "synthetic (random codes, fp16 scales 0.004-0.016)");
+    } else if (!read_blob(path, idx, blob)) {
         std::fprintf(stderr, "cannot read expert %lld (layer %lld) from %s\n", expert, layer, path);
         return 2;
     }
@@ -132,7 +156,7 @@ int main(int argc, char** argv) {
     }
     {
         std::vector<uint8_t> other;
-        if (read_blob(path, (layer * 512 + expert) + 1, other)) {
+        if (!synthetic && read_blob(path, (layer * 512 + expert) + 1, other)) {
             long long diff = 0;
             for (size_t i = 0; i < blob.size(); ++i) if (blob[i] != other[i]) ++diff;
             const double frac = (double) diff / (double) blob.size();
@@ -177,7 +201,8 @@ int main(int argc, char** argv) {
     std::printf("  %-44s rel %.3e   (the cost of the contract, REPORTED)\n",
                 "VNNI vs scalar (FP32 acts)", rel_contract);
 
-    std::printf("\nexpert_parity: %d failures (layer %lld expert %lld of %s)\n", bad, layer, expert, path);
+    if (synthetic) std::printf("\nexpert_parity: %d failures (synthetic expert)\n", bad);
+    else std::printf("\nexpert_parity: %d failures (layer %lld expert %lld of %s)\n", bad, layer, expert, path);
     if (bad) return 1;
     if (selftest) std::printf("expert_parity OK\n");
     return 0;

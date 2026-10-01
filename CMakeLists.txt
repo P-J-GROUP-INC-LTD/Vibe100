@@ -777,8 +777,9 @@ endif()
 # A SEPARATE LIBRARY from `strata_kernels`, and `/arch:AVX512` is set on the SOURCE rather than on the target
 # so that the flag applies only to the TU that needs it.  Both parts matter:
 #
-#   * the CPU expert kernel uses `_mm256_dpbusd_epi32` (AVX512-VNNI) and `_mm256_multishift_epi64_epi8`
-#     (AVX512-VBMI); without the flag MSVC reports undeclared intrinsics and never mentions AVX-512;
+#   * the CPU expert kernel uses `_mm256_dpbusd_epi32` (AVX512-VNNI) and, in the VBMI build,
+#     `_mm256_multishift_epi64_epi8` (AVX512-VBMI); without the flag MSVC reports undeclared intrinsics and never
+#     mentions AVX-512;
 #   * a TU compiled WITH `/arch:AVX512` may use AVX-512 in ANY of its code, so the scalar fallback and the
 #     test drivers must NOT be in it - otherwise the fallback is not a fallback, it is the same bet with
 #     worse opt-out.  `cpu_require_expert_support()` therefore refuses at startup on a CPU without the
@@ -812,18 +813,29 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
 endif()
 
-add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+# Vibe100: expert.cpp (the AVX-512 Q2_0 kernels) is compiled TWICE - expert.cpp with VBMI (Ice Lake / Zen 4 and newer:
+# `vpmultishiftqb` unpacks the 2-bit codes) and expert_novbmi.cpp WITHOUT it (Cascade Lake: shuffle / shift / mask
+# unpack, same results bit for bit) - and expert_dispatch.cpp, compiled with no AVX flag at all, holds the public entry
+# points and picks one build at run time.  Nothing but the unpack differs between the two builds.
+add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/expert_novbmi.cpp
+            src/kernels/cpu/expert_dispatch.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
-# Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
-# and the engine picks the kernels at run time (cpu_avx512_ok).
+# Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool, the probe and the dispatch run on any
+# x86-64, and the engine picks the kernels at run time (cpu_avx512_ok, cpu_expert_isa).
 if(MSVC)
-  set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+  # MSVC has no VBMI switch to leave out: /arch:AVX512 is the Skylake-X set (F/CD/BW/DQ/VL) and the compiler does not
+  # emit VBMI by itself, so the two builds share the flag and differ only by the macro in expert_novbmi.cpp.
+  set_source_files_properties(src/kernels/cpu/expert.cpp src/kernels/cpu/expert_novbmi.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 else()
-  # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
+  # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.  The
+  # VBMI build gets it; the no-VBMI build must NOT, so the compiler cannot emit a VBMI instruction anywhere in it
+  # (`expert_novbmi_no_vbmi` below greps the object).
   set_source_files_properties(src/kernels/cpu/expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+  set_source_files_properties(src/kernels/cpu/expert_novbmi.cpp
+                              PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
 find_package(Threads REQUIRED)
@@ -880,8 +892,10 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
   else()
+    # No -mavx512vbmi: the i-quant rows use only F/BW (maddubs, madd, permutexvar_epi16, masks), so they run on
+    # Cascade Lake too, and without the flag the compiler cannot add a VBMI instruction behind our back.
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
+                                "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mf16c;-mfma")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   endif()
@@ -994,12 +1008,58 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)
   # The pack is a REQUIRED input, not an optional one: this test compares against a real expert blob, and a
   # missing file would otherwise be reported as a pass by a test that skipped everything.
-  add_test(NAME expert_parity COMMAND expert_parity --selftest
-           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  # (Vibe100: registered only when the pack is there.  Before the no-VBMI build, a CPU without VBMI skipped this test and
+  # reported a pass; now every AVX-512+VNNI CPU runs it, so on a machine without the 66 GB pack it would fail for want of
+  # the file.  The `_synthetic` twins below run the same kernel check on a random expert and need no file.)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/pack/full/experts.bin")
+    add_test(NAME expert_parity COMMAND expert_parity --selftest
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
+  # Vibe100: the same kernel check on a random expert, so it runs without the pack.  The `_novbmi` twins force the
+  # Cascade Lake build (STRATA_FORCE_AVX512_NOVBMI=1): on a CPU without VBMI they are the same run as the plain ones; on
+  # Ice Lake / Zen 4 they exercise the no-VBMI kernels through the engine's real entry points.
+  add_test(NAME expert_parity_synthetic COMMAND expert_parity --selftest --synthetic)
+  add_test(NAME expert_parity_synthetic_novbmi COMMAND expert_parity --selftest --synthetic)
+  set_tests_properties(expert_parity_synthetic_novbmi PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX512_NOVBMI=1")
+  add_test(NAME expert_multi_test_novbmi COMMAND expert_multi_test)
+  set_tests_properties(expert_multi_test_novbmi PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX512_NOVBMI=1")
+
+  # Vibe100: the two builds of the Q2_0 kernels against the scalar unpack and, on a CPU with VBMI, against each other
+  # bit for bit (--exhaustive: every packed dword in every lane; --bench: AVX2 vs AVX-512 throughput).
+  add_executable(expert_variant_test src/kernels/cpu/expert_variant_test.cpp)
+  target_link_libraries(expert_variant_test PRIVATE strata_kernels_cpu)
+  add_test(NAME expert_variant_test COMMAND expert_variant_test)
+  # ... and the objects that can run on a CPU without VBMI hold no VBMI instruction (the VBMI build, expert.cpp.o, does:
+  # the test's own control).  Needs objdump, so GCC/Clang toolchains only.
+  if(NOT MSVC)
+    find_program(STRATA_OBJDUMP objdump)
+    if(STRATA_OBJDUMP AND CMAKE_AR)
+      set(_strata_novbmi_members expert_novbmi.cpp.o expert_dispatch.cpp.o expert_layout.cpp.o pool.cpp.o q2_avx2.cpp.o)
+      if(STRATA_NATIVE_EXPERTS)
+        list(APPEND _strata_novbmi_members native_expert.cpp.o iq_avx512.cpp.o iq_avx2.cpp.o kq_avx2.cpp.o)
+      endif()
+      add_test(NAME expert_novbmi_no_vbmi
+               COMMAND ${CMAKE_COMMAND} -DOBJDUMP=${STRATA_OBJDUMP} -DAR=${CMAKE_AR} -DARCHIVE=$<TARGET_FILE:strata_kernels_cpu>
+                       -DWORKDIR=${CMAKE_CURRENT_BINARY_DIR}/novbmi_check "-DNO_VBMI=${_strata_novbmi_members}"
+                       -DHAS_VBMI=expert.cpp.o -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_no_vbmi.cmake)
+    endif()
+  endif()
+
+  if(STRATA_NATIVE_EXPERTS)
+    # Vibe100: the i-quant AVX-512 rows (compiled without VBMI, so a Cascade Lake CPU runs them) against ggml's vec_dot.
+    add_executable(iq_avx512_test src/kernels/cpu/iq_avx512_test.cpp)
+    target_link_libraries(iq_avx512_test PRIVATE strata_kernels_cpu)
+    add_test(NAME iq_avx512_test COMMAND iq_avx512_test)
+  endif()
 
   add_executable(pool_test src/kernels/cpu/pool_test.cpp)
   target_link_libraries(pool_test PRIVATE strata_kernels_cpu)
-  add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/pack/full/experts.bin")   # see expert_parity above
+    add_test(NAME pool_test COMMAND pool_test --selftest WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
+  add_test(NAME pool_test_synthetic COMMAND pool_test --selftest --synthetic)
+  add_test(NAME pool_test_synthetic_novbmi COMMAND pool_test --selftest --synthetic)
+  set_tests_properties(pool_test_synthetic_novbmi PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX512_NOVBMI=1")
   # issue #29: tiny batches with sleeping workers, as on a big-VRAM card; a hang fails it
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)

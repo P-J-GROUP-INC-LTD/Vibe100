@@ -236,7 +236,7 @@ You need **only an NVIDIA driver** (version 580 or newer; update it with the NVI
 | --- | --- |
 | GPU | NVIDIA **RTX 20, 30, 40 or 50 series**, **12 GB VRAM or more** (8 GB runs, slowly). Measured on an RTX 5070 and an RTX 3090; RTX 20 (Turing, since 0.1.27) was tested by a contributor on an RTX 2070. A V100 / Titan V (Volta) works with an engine compiled here with CUDA 12.8 ([docs/volta/VOLTA.md](volta/VOLTA.md)). |
 | RAM | **64 GB** recommended (see the table above). |
-| CPU | x86-64 with AVX2 (any Intel/AMD desktop CPU from the last ~8 years). AVX-512 (Ryzen 7000/9000) is a bit faster. |
+| CPU | x86-64 with AVX2 (any Intel/AMD desktop CPU from the last ~8 years). AVX-512 with VNNI (Intel Cascade Lake Xeon Gold / Silver 2nd gen and newer, Ice Lake and newer, Ryzen 7000/9000) is a bit faster and is what the canonical Q2_0 pack needs; AVX-512 VBMI (Ice Lake and newer, Zen 4) is not required. See "CPU kernels" below. |
 | Disk | ~70-80 GB free for the model, ~6 GB for the MTP layer (+1 GB with images). **Q2_0 on an AVX-512 CPU** also writes a one-time ~40 GB copy of its experts for the fast CPU kernel. An NVMe SSD is strongly recommended. |
 | OS | Windows 10/11, or Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
 
@@ -738,13 +738,31 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
   draft layer, the KV cache (from 64K: only its most-read part, the rest streams from RAM), and an **expert cache** that fills the rest of VRAM with the most-used experts (it adapts to
   the conversation while you chat).
 - **RAM:** all 24,576 experts, pinned. The CPU computes the experts that are not on the GPU **in place**, at the same time
-  as the GPU works on the cached ones (AVX-512 / AVX2 kernels, ggml's for the i-quants).
+  as the GPU works on the cached ones (AVX-512 / AVX2 kernels, ggml's for the i-quants; see "CPU kernels" below).
 - **SSD:** the 28.8 GB n-gram table, read a few rows per token through the OS cache.
 - **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them. 2.4-3.2
   tokens per pass on average. When the reply repeats the context (code edits, quoted text), **prompt lookup** (engine
   0.1.7) drafts up to 5 tokens from the earlier copy, but only where its measured acceptance and cost say it pays:
   code edits 6-11% faster, other text unchanged. The drafts are checked like the MTP's, so the output is the same.
 - **Prompts** are processed in 2,048-token chunks with the experts streamed to the GPU over PCIe.
+
+### CPU kernels
+
+The engine picks the CPU expert kernels once, at start, from what the CPU (and the OS) can run:
+
+| CPU | kernels | canonical Q2_0 pack |
+| --- | --- | --- |
+| AVX-512 F/BW/VL/DQ + VNNI + **VBMI**: Intel Ice Lake / Tiger Lake / Sapphire Rapids and newer, AMD Zen 4 / Zen 5 (Ryzen 7000/9000) | AVX-512, VBMI build (`vpmultishiftqb` unpacks the 2-bit codes) | yes |
+| AVX-512 F/BW/VL/DQ + VNNI, **no VBMI**: Intel Cascade Lake / Cooper Lake (Xeon Gold / Silver 2nd and 3rd gen, Xeon W-3200) | AVX-512, no-VBMI build (the same code; the 2-bit codes are unpacked with shuffles, shifts and a mask; **bit-identical results** to the VBMI build) | yes |
+| AVX2 (Haswell / Zen 1 and newer, including Skylake-X without VNNI and Zen 2/3) | AVX2 (ggml-cpu for the i-quants) | no: setup picks an i-quant model |
+
+The i-quant packs' AVX-512 gate/up rows need only AVX-512 BW, so they can run on every AVX-512 CPU above, but on Cascade
+Lake they measure slower than the AVX2 rows for IQ2_XXS, IQ2_XS and IQ3_XXS (level for IQ3_S, faster for IQ2_S), so there
+only IQ2_S takes them by default; from Ice Lake / Zen 4 up every format does. The log says which Q2_0 build runs:
+`strata generate: CPU expert kernels: AVX-512 VNNI (no VBMI)`. Switches (in the config's `env`, `1` to enable):
+`STRATA_FORCE_AVX2` runs the AVX2 kernels wherever they exist, `STRATA_FORCE_AVX512_NOVBMI` runs the no-VBMI build (and
+the Cascade Lake i-quant choice) on a CPU that has VBMI, to compare the two on one machine, `STRATA_IQ512` takes the
+AVX-512 i-quant rows for every format on a Cascade Lake CPU, and `STRATA_NO_IQ512` never takes them.
 
 The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
 
