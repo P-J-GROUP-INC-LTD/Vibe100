@@ -262,7 +262,10 @@ def run_scenario(name: str, quant: QuantConfig, chunks: list, seed: int) -> dict
         rec_out[f"x.{l}"] = xs[l]
     rec_out.update(out)
     # selection margins of the oracle (how close the k-th and (k+1)-th best scores were), for the report
-    rec_out["cfg.margin_index"] = np.array([min(v) for k, v in sorted(shared.diag.items()) if k.startswith("index.")] or [0.0], np.float32)
+    margins = np.array([m for k, v in sorted(shared.diag.items()) if k.startswith("index.") for m in v] or [0.0], np.float64)
+    pos = margins[margins > 0]
+    # [smallest margin, smallest POSITIVE margin, number of selections with a margin, of which exactly tied at the boundary (resolved by the lower-index rule)]
+    rec_out["cfg.margin_index"] = np.array([margins.min(), pos.min() if pos.size else 0.0, margins.size, int((margins == 0).sum())], np.float32)
     return rec_out
 
 
@@ -302,7 +305,8 @@ def main() -> int:
             continue
         recs = run_scenario(name, quant, chunks, seed)
         write_bin(out / f"scn_{name}.bin", recs)
-        print(f"{name}: {len(recs)} records, min index margin {float(recs['cfg.margin_index'][0]):.3g}", flush=True)
+        m = recs["cfg.margin_index"]
+        print(f"{name}: {len(recs)} records; {int(m[2])} index selections with a boundary, {int(m[3])} exactly tied (lower-index rule), smallest non-zero gap {float(m[1]):.3g}", flush=True)
     print("DONE")
     return 0
 

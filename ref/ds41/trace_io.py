@@ -340,6 +340,9 @@ class _Capture:
                                        stale_index_k=stale_index_k)
             ratio = cfg.compress_ratios[layer]
             s = x.shape[0]
+            if layer == cfg.candidate_source_layer and "blocks" in cap.cur.get("margins", {}) and shared.candidates is not None:
+                # the candidate pool this call built: the block ids kept (the mask is block-expanded: one entry per block start)
+                cap.cur["cand"] = [np.nonzero(r[:: cfg.candidate_block_size])[0].astype(np.int32) for r in shared.candidates]
             if ratio:
                 cap.cur["topk"] = [r[r >= 0].astype(np.int32) for r in shared.topk_idxs]
                 if mode.value == "full":
@@ -389,6 +392,8 @@ def _emit_call(w: TraceWriter, model, cap: _Capture, tr: dict, ids, start_pos: i
                     lat, ik = c["pub"][p]
                     w.put("latent", p, lat, l)
                     w.put("index_k", p, ik, l)
+            if "cand" in c:
+                w.put("cand_blocks", p, c["cand"][t], l)
             w.put("attn_out", p, tr["attn_out"][l][t], l)
             w.put("ffn_in", p, c["ffn_in"][t], l)
             w.put("router_idx", p, tr["router_idx"][l][t], l)

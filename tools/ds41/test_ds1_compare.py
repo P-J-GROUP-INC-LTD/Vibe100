@@ -234,16 +234,22 @@ class Injection(unittest.TestCase):
         self.assertTrue(failed <= {("ffn_in", 1, 9), ("router_idx", 1, 9), ("router_w", 1, 9), ("ffn_out", 1, 9)}, failed)       # what reads it, nothing upstream
 
     def test_a_small_error_is_a_flip_not_a_failure_a_systematic_one_exceeds_the_budget(self):
-        one = T.engine_copy(self.ref, "inj_small_one", mutate={("attn_out", 6, 3): lambda a: a * np.float32(1.0 + 1e-3)})
+        """q is read by nothing downstream in layer mode, so a 1e-3 error in it is one isolated sample in the flip band (what one int8 flip inside the stage looks
+        like); the same error at every position is a systematic difference and exceeds the stage's budget."""
+        one = T.engine_copy(self.ref, "inj_small_one", mutate={("q", 6, 3): lambda a: a * np.float32(1.0 + 1e-3)})
         lay = self.layer_report(one)
-        self.assertTrue(lay.ok, lay.text())                                                  # one 1e-3 sample: in the flip band, allowed once
-        self.assertEqual(sum(s.level == C.Level.FLIP for s in lay.samples), 2)               # attn_out itself and the ffn_in computed from it
-        every = {("attn_out", p, 3): (lambda a: a * np.float32(1.0 + 1e-3)) for p in range(self.n)}
+        self.assertTrue(lay.ok, lay.text())
+        self.assertEqual([(s.stage, s.layer, s.pos) for s in lay.samples if s.level == C.Level.FLIP], [("q", 3, 6)])
+        every = {("q", p, 3): (lambda a: a * np.float32(1.0 + 1e-3)) for p in range(self.n)}
         many = T.engine_copy(self.ref, "inj_small_all", mutate=every)
         lay = self.layer_report(many)
         self.assertFalse(lay.ok)
-        self.assertTrue(any(v[0] == "attn_out" for v in lay.budget_violations()), lay.text())
+        self.assertEqual([v[0] for v in lay.budget_violations()], ["q"], lay.text())
         self.assertIn("a systematic difference", lay.text())
+        self.assertFalse(lay.failures())                                                    # none of them is beyond hard: the verdict comes from the budget
+        # an error beyond the hard tolerance fails at once
+        big = T.engine_copy(self.ref, "inj_big_one", mutate={("q", 6, 3): lambda a: a * np.float32(1.05)})
+        self.assertFalse(self.layer_report(big).ok)
 
     def test_nan_and_inf_always_fail(self):
         def poison(a):
@@ -276,7 +282,10 @@ class Injection(unittest.TestCase):
         # a dropped / foreign top-k position
         tk = self.ref.get("topk", 12, 6)
         self.assertGreater(len(tk), 2)
-        eng = T.engine_copy(self.ref, "inj_topk", mutate={("topk", 12, 6): lambda a: np.concatenate([a[1:], [a[-1] + 1]]).astype("<i4")})
+        def foreign(a):                                                       # three entries replaced by valid positions that were not selected
+            fresh = sorted(set(range(13)) - set(a.tolist()))[:3]
+            return np.sort(np.concatenate([a[3:], fresh])).astype("<i4")
+        eng = T.engine_copy(self.ref, "inj_topk", mutate={("topk", 12, 6): foreign})
         ff = C.compare_traces(eng, self.ref).first_failure()
         self.assertEqual((ff.stage, ff.layer, ff.pos), ("topk", 6, 12))
 

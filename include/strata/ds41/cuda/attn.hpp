@@ -20,8 +20,8 @@
 // HOW IT IS BUILT.  The kernels live in src/ds41/cuda/attn_impl.cuh, written once and compiled twice (nvcc for sm_70: attn_real.cu instantiates
 // AttnKernels<RealGeom>; the host compiler with -DDS41_EMU against the emulator: the tests).  The per-layer driver is host code
 // (src/ds41/attn/attn_host_impl.hpp, instantiated for RealGeom in attn_real.cpp).  The dense work (Q8_0 / BF16 GEMVs, the activation quantiser)
-// is NOT here: it goes through `AttnDenseOps` below, which DS1-B's dense.hpp / DS1-G's quantiser implement (the integrator writes the ~40-line
-// adapter; the tests have a plain C++ implementation).  Everything else - RMSNorm, RoPE, the three KV fake-quantisers, the compressor, the
+// is NOT here: it goes through `AttnDenseOps` below, implemented by `Ds41AttnDense<G>` (attn_dense.hpp: DS1-B's dense.hpp GEMVs + DS1-G's
+// ds41_quantize_acts<G>, ActOrder::kNatural); the tests also have a plain-C++ FP64 implementation.  Everything else - RMSNorm, RoPE, the three KV fake-quantisers, the compressor, the
 // indexer, top-k, sparse attention - is in this package, so the numerics of the attention do not depend on the other packages' details.
 //
 // T.  forward() takes T = 1..kMaxT consecutive positions pos0 .. pos0 + T - 1.  The dense projections run batched over the T rows (DS1-B's rule:
@@ -78,7 +78,7 @@ struct AttnQuantFlags {
 };
 
 // ---------------------------------------------------------------------------------------------------------------------------------
-// the dense work this package needs from DS1-B / DS1-G (the integrator swaps in the real ones; shapes and semantics as DS1.md section 2 / 5)
+// the dense work this package needs from DS1-B / DS1-G (implemented by Ds41AttnDense<G>, attn_dense.hpp; semantics as DS1.md section 2 / 5)
 // ---------------------------------------------------------------------------------------------------------------------------------
 struct AttnDenseOps {
     virtual ~AttnDenseOps() = default;

@@ -28,10 +28,10 @@ inline constexpr int kGemvThreads = 32 * kGemvWarps;
 inline constexpr int kWideWarps = 4;                    // warps per block of the BF16 / F32 GEMV (one warp per row)
 inline constexpr int kWideThreads = 32 * kWideWarps;
 #ifndef DS41_DENSE_WIDE_MINB
-#define DS41_DENSE_WIDE_MINB 4
+#define DS41_DENSE_WIDE_MINB 3
 #endif
 #ifndef DS41_DENSE_GEMV_MINB
-#define DS41_DENSE_GEMV_MINB 3
+#define DS41_DENSE_GEMV_MINB 2
 #endif
 inline constexpr int kMaxSmem = 96 * 1024;              // dynamic shared memory per block on sm_70 (opt-in above 48 KB)
 inline constexpr int kActSb = 304;                      // int8 activations: 256 quants + 8 fp32 scales + 16 pad, per super-block
@@ -653,6 +653,8 @@ inline int ilog2_exact(int v) {
     return l;
 }
 inline int round_up(int v, int m) { return (v + m - 1) / m * m; }
+/// Blocks of this much shared memory one SM can hold (at most 4: 128 threads x ~100-150 registers).  Launch heuristic only.
+inline int resident_blocks(size_t smem) { return std::max<int>(1, std::min<int>(4, (int) ((size_t) kMaxSmem / std::max<size_t>(smem, 1)))); }
 
 /// The geometry of one Q8_0 GEMV launch.  Everything that touches the NUMBERS (p_log2) is a function of k alone; the rest (tile width, rows per block) only
 /// decides which block computes which row.
@@ -679,8 +681,10 @@ inline Q8Plan plan_q8(int rows_per_group, int groups_x_mats, int k, int T, int t
     pl.smem = (size_t) pl.nt * tok;
     const int gpw = 32 >> pl.p_log2;
     const int min_rows = kGemvWarps * gpw;
-    const int target = std::max(1, (4 * sm_count()) / (pl.ntiles * groups_x_mats));      // row blocks per group / matrix we would like (launch heuristic only)
-    pl.rows_per_block = std::max(min_rows, round_up((rows_per_group + target - 1) / target, min_rows));
+    // one wave: as many row blocks (per group / matrix) as the card holds at once, each with an equal share of the rows (launch heuristic only: it decides which block
+    // computes which row, never what a row's value is)
+    const int target = std::max(1, (resident_blocks(pl.smem) * sm_count()) / (pl.ntiles * groups_x_mats));
+    pl.rows_per_block = std::max(min_rows, round_up((rows_per_group + target - 1) / target, gpw));
     pl.row_blocks = (rows_per_group + pl.rows_per_block - 1) / pl.rows_per_block;
     pl.fast = fast_ok && (k % 256 == 0);
     return pl;
@@ -819,7 +823,7 @@ inline void gemv_wide(Dev& dev, const void* w, int n, int k, const float* x, int
     while (nt > 1 && (size_t) nt * tok > (size_t) kMaxSmem) nt >>= 1;
     const int ntiles = (T + nt - 1) / nt;
     const size_t smem = (size_t) nt * tok;
-    const int target = std::max(1, (3 * sm_count()) / ntiles);
+    const int target = std::max(1, (resident_blocks(smem) * sm_count()) / ntiles);
     const int rpb = std::max(kWideWarps, round_up((n + target - 1) / target, kWideWarps));
     switch (nt) {
 #define DS41_DENSE_CASE(NT)                                                                                                                              \

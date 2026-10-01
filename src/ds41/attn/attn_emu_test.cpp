@@ -1186,7 +1186,8 @@ struct Replay {
     }
 
     void report() {
-        std::printf("INFO [%s] %d layers x %d positions: %ld layer-steps, %ld with an explained event (a quantiser flip or a near-tie, see header)\n", name.c_str(), nl, n_pos, rows_total, events_total);
+        std::printf("INFO [%s] %d layers x %d positions: %ld layer-steps, %ld with an explained event (a quantiser flip or a near-tie, see header); the oracle's index selections: %d with a k-th / (k+1)-th boundary, %d of them exactly tied (lower-index rule), smallest non-zero gap %.3g\n",
+                    name.c_str(), nl, n_pos, rows_total, events_total, (int) need(g, "cfg.margin_index").f()[2], (int) need(g, "cfg.margin_index").f()[3], (double) need(g, "cfg.margin_index").f()[1]);
         for (const auto& kv : stats)
             std::printf("INFO [%s]   %-10s compared %6ld  max error %.3g  events %ld\n", name.c_str(), kv.first.c_str(), kv.second.n, kv.second.max_err, kv.second.events);
         const long budget = std::max(4L, rows_total / 100);
