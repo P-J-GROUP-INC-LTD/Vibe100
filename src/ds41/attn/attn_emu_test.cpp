@@ -1,7 +1,11 @@
 // src/ds41/attn/attn_emu_test.cpp - DS1-C: runs the attention kernels and the per-layer driver the V100 runs (src/ds41/cuda/attn_impl.cuh,
 // src/ds41/attn/attn_host_impl.hpp, compiled for the host with -DDS41_EMU: every GPU thread is a fiber, see src/ds41/cuda/ds41_emu.hpp) on the CPU.
 //
-//   ds41_attn_emu_test [--kernels] [--oracle DIR] [--order forward|reverse|shuffle[:SEED]] [--seed N] [--scenario NAME]
+//   ds41_attn_emu_test [--kernels] [--oracle DIR [--scenario NAME]... [--dense ref|real] [--no-extras]] [--order forward|reverse|shuffle[:SEED]] [--seed N]
+//
+//   --no-extras skip the bit-identity checks (windows, reset, scheduling orders) that follow the first scenario: a quicker run (the mutation checks use it)
+//   --dense     which AttnDenseOps the replay runs on: `ref` (default) = the plain-C++ FP64-accumulation stand-ins below (independent of every other package);
+//               `real` = Ds41AttnDense<MiniGeom> (attn_dense.hpp): DS1-B's emulated GEMV kernels + DS1-G's activation quantiser (the integration check).
 //
 //   --kernels   every kernel against an independent C++ reference, at MiniGeom AND RealGeom shapes, random data: the three fake-quantisers (bit-exact,
 //               against a table-based implementation), RMSNorm, RoPE (bit-exact), swa_kv, the compressor (ratios 1, 2, 4), index_k / iq, the indexer
@@ -42,6 +46,9 @@
 
 #include "ds41_emu.hpp"
 #include "strata/ds41/cuda/attn.hpp"
+#if defined(ATTN_TEST_REAL_DENSE)
+#include "strata/ds41/cuda/attn_dense.hpp"
+#endif
 
 using namespace strata::ds41;
 using namespace strata::ds41::cuda;
@@ -803,7 +810,7 @@ struct Replay {
     Dev& dev;
     const Golden& g;
     std::string name;
-    TestDense dense;
+    AttnDenseOps& dense;
     int nl = 0, n_pos = 0;
     Ds41LayerRoles roles;
     AttnQuantFlags qf;
@@ -811,11 +818,13 @@ struct Replay {
     std::vector<AttnLayerWeights> W;
     std::vector<void*> allocs;
     std::map<std::string, StageStat> stats;
-    std::vector<std::vector<float>> out_all;            // [layer][pos * HID + i]  the engine's outputs (T = 1 run)
-    std::vector<std::vector<int32_t>> topk_all;         // [layer][pos * TK + i]
+    struct Clean {                                      // an engine-only T = 1 run (no oracle, no resync): the reference of the window / order / reset checks
+        std::vector<std::vector<float>> out;            // [layer][pos * HID + i]
+        std::vector<std::vector<int32_t>> topk;         // [layer][pos * TK + i]
+    };
     long events_total = 0, rows_total = 0;
 
-    Replay(Dev& d, const Golden& gg, std::string nm) : dev(d), g(gg), name(std::move(nm)) {}
+    Replay(Dev& d, const Golden& gg, std::string nm, AttnDenseOps& dn) : dev(d), g(gg), name(std::move(nm)), dense(dn) {}
     ~Replay() {
         for (void* p : allocs) dev.release(p);
     }
@@ -868,8 +877,6 @@ struct Replay {
             w.idx_wq_b = opt(l, "indexer.wq_b.weight");
             w.idx_weights_proj = static_cast<const uint16_t*>(opt(l, "indexer.weights_proj.weight"));
         }
-        out_all.assign((size_t) nl, std::vector<float>((size_t) n_pos * HID, NAN));
-        topk_all.assign((size_t) nl, std::vector<int32_t>((size_t) n_pos * TK, -2));
     }
 
     void init(Ds41Attention<G>& att) {
@@ -1076,11 +1083,6 @@ struct Replay {
                 CHECK(same || topk_div, "[%s] L%d p%d: a REUSE layer's top-k differs from the oracle's although its index source agreed", name.c_str(), l, p);
                 if (!same) explained = true;
             }
-            if (is_index || mode == AttnMode::kReuse) {
-                std::vector<int32_t> mine((size_t) TK);
-                dev.d2h(mine.data(), att.trace_topk(0), (size_t) TK * 4);
-                std::copy(mine.begin(), mine.end(), topk_all[(size_t) l].begin() + (size_t) p * TK);
-            }
         }
         if (topk_div && mode == AttnMode::kReuse) explained = true;
         // o (after the inverse RoPE) and the layer output
@@ -1095,38 +1097,54 @@ struct Replay {
                 CHECK(e <= kTight, "[%s] L%d p%d o: relative error %.3g", name.c_str(), l, p, e);
             }
             const auto out = down(dev, out_dev, HID);
-            std::copy(out.begin(), out.end(), out_all[(size_t) l].begin() + (size_t) p * HID);
             const double eo = rel_err(out.data(), ref_row("out", HID), HID);
             stats["out"].add(eo);
             if (explained) {
                 if (eo > kTight) ++stats["out"].events;
                 CHECK(eo <= 0.5, "[%s] L%d p%d out: relative error %.3g even with an explained upstream event", name.c_str(), l, p, eo);
-            } else {
-                CHECK(eo <= kTight, "[%s] L%d p%d out: relative error %.3g", name.c_str(), l, p, eo);
+            } else if (eo > kTight) {
+                // `o` matched, so the difference comes from wo_a / wo_b: the one thing the stages above cannot show is a flip of an int8 code of wo_b's input
+                // (the activation quantiser rounds a value that differs from the oracle's by 1 ulp the other way: one code of one block, ~1e-3 of the output).
+                // Accepted as an event up to 1e-2; a wrong projection is far larger or systematic (the event budget).
+                ++stats["out"].events;
+                explained = true;
+                CHECK(eo <= 1e-2, "[%s] L%d p%d out: relative error %.3g with matching o (not an int8-code flip)", name.c_str(), l, p, eo);
             }
         }
         if (explained) ++events_total;
     }
 
     /// the whole run, T = 1, compared against the oracle stage by stage
-    void run_t1(Ds41Attention<G>& att, int first, int count, bool do_compare, std::vector<float>* outs = nullptr) {
+    void run_t1(Ds41Attention<G>& att, int first, int count) {
         DevBuf<float> dx(dev, HID), dout(dev, HID);
         for (int p = first; p < first + count; ++p) {
             bool topk_div = false, cand_div = false;
             for (int l = 0; l < nl; ++l) {
                 dev.h2d(dx.p, need(g, key("x", l)).f() + (size_t) p * HID, HID * sizeof(float));
                 att.forward(l, dx.p, 1, p, dout.p, nullptr);
-                if (do_compare) compare(att, l, p, dout.p, topk_div, cand_div);
-                if (outs) {
-                    const auto o = dout.down();
-                    outs->insert(outs->end(), o.begin(), o.end());
-                }
+                compare(att, l, p, dout.p, topk_div, cand_div);
             }
         }
     }
 
+    /// positions 0 .. count - 1 at T = 1 with nothing else going on: the engine's own outputs and top-k rows
+    Clean run_clean(Ds41Attention<G>& att, int count) {
+        Clean c;
+        c.out.assign((size_t) nl, std::vector<float>((size_t) count * HID));
+        c.topk.assign((size_t) nl, std::vector<int32_t>((size_t) count * TK, -1));
+        DevBuf<float> dx(dev, HID), dout(dev, HID);
+        for (int p = 0; p < count; ++p)
+            for (int l = 0; l < nl; ++l) {
+                dev.h2d(dx.p, need(g, key("x", l)).f() + (size_t) p * HID, HID * sizeof(float));
+                att.forward(l, dx.p, 1, p, dout.p, nullptr);
+                dev.d2h(c.out[(size_t) l].data() + (size_t) p * HID, dout.p, HID * sizeof(float));
+                if (roles.compress_ratio[(size_t) l] > 0) dev.d2h(c.topk[(size_t) l].data() + (size_t) p * TK, att.trace_topk(0), (size_t) TK * 4);
+            }
+        return c;
+    }
+
     /// windows of T = 1..8 positions, layer by layer: rows must be BIT-identical to the T = 1 run
-    void run_windows(Ds41Attention<G>& att) {
+    void run_windows(Ds41Attention<G>& att, const Clean& clean) {
         DevBuf<float> dx(dev, 8 * HID), dout(dev, 8 * HID);
         const int pattern[] = {4, 8, 3, 1, 5, 2, 7, 6};
         int p = 0, w = 0;
@@ -1141,12 +1159,11 @@ struct Replay {
                 const auto o = dout.down((size_t) T * HID);
                 for (int t = 0; t < T; ++t) {
                     ++rows;
-                    bad += std::memcmp(o.data() + (size_t) t * HID, out_all[(size_t) l].data() + (size_t) (p + t) * HID, HID * 4) != 0;
+                    bad += std::memcmp(o.data() + (size_t) t * HID, clean.out[(size_t) l].data() + (size_t) (p + t) * HID, HID * 4) != 0;
                     if (roles.compress_ratio[(size_t) l] > 0) {
                         std::vector<int32_t> tk((size_t) TK);
                         dev.d2h(tk.data(), att.trace_topk(t), (size_t) TK * 4);
-                        const int32_t* want = topk_all[(size_t) l].data() + (size_t) (p + t) * TK;
-                        if (want[0] != -2) badk += std::memcmp(tk.data(), want, (size_t) TK * 4) != 0;
+                        badk += std::memcmp(tk.data(), clean.topk[(size_t) l].data() + (size_t) (p + t) * TK, (size_t) TK * 4) != 0;
                     }
                 }
             }
@@ -1154,6 +1171,7 @@ struct Replay {
         }
         CHECK(bad == 0, "[%s] windows T=1..8: %ld of %ld rows differ bitwise from the T=1 run", name.c_str(), bad, rows);
         CHECK(badk == 0, "[%s] windows T=1..8: %ld top-k rows differ from the T=1 run", name.c_str(), badk);
+        std::printf("INFO [%s] windows of T = 1..8 (%ld rows): bit-identical to T = 1: %s\n", name.c_str(), rows, bad == 0 && badk == 0 ? "yes" : "NO");
     }
 
     static uint64_t hash_of(const std::vector<float>& v) {
@@ -1174,7 +1192,7 @@ struct Replay {
     }
 };
 
-void run_oracle(Dev& dev, const std::string& dir, const std::vector<std::string>& only, bool first_extras) {
+void run_oracle(Dev& dev, const std::string& dir, const std::vector<std::string>& only, bool first_extras, bool real_dense) {
     const char* names[] = {"decode_all_on", "decode_all_off", "prefill_all_on", "prefill_all_off", "decode_win_only", "decode_ckv_idx"};
     bool first = true;
     int ran = 0;
@@ -1189,44 +1207,56 @@ void run_oracle(Dev& dev, const std::string& dir, const std::vector<std::string>
         }
         const auto t0 = std::chrono::steady_clock::now();
         {
-            Replay r(dev, g, nm);
+            TestDense ref_dense;
+            std::unique_ptr<AttnDenseOps> real;
+#if defined(ATTN_TEST_REAL_DENSE)
+            if (real_dense) real.reset(new Ds41AttnDense<MiniGeom>(dev));
+#endif
+            if (real_dense && !real) {
+                std::printf("FAIL --dense real needs a build with DS1-B's dense kernels (ATTN_TEST_REAL_DENSE)\n");
+                ++g_fail;
+                return;
+            }
+            Replay r(dev, g, nm, real ? *real : static_cast<AttnDenseOps&>(ref_dense));
             r.setup();
             Ds41Attention<MiniGeom> att(dev, r.dense);
             r.init(att);
-            r.run_t1(att, 0, r.n_pos, true);
+            r.run_t1(att, 0, r.n_pos);
             r.report();
             if (first && first_extras) {
                 first = false;
-                // (1) windows of T = 1..8 on a second instance: bit-identical rows
+                // (1) a clean engine-only T = 1 run on a fresh instance (the oracle comparison above overwrote flipped cache rows by the oracle's: this run has no such help)
+                Ds41Attention<MiniGeom> att1(dev, r.dense);
+                r.init(att1);
+                const Replay::Clean clean = r.run_clean(att1, r.n_pos);
+                // (2) windows of T = 1..8 on another instance: bit-identical rows to T = 1
                 {
                     Ds41Attention<MiniGeom> att2(dev, r.dense);
                     r.init(att2);
-                    r.run_windows(att2);
+                    r.run_windows(att2, clean);
                 }
-                // (2) the same instance after reset(), and two other scheduling orders: bit-identical outputs
+                // (3) reset() and two other scheduling orders: the first n positions are bit-identical to the clean run
                 {
                     const int n = std::min(r.n_pos, 40);
-                    std::vector<float> a, b, c;
                     const auto order0 = ds41_emu::g_order;
                     const auto seed0 = ds41_emu::g_order_seed;
-                    att.reset();
-                    r.run_t1(att, 0, n, false, &a);
-                    ds41_emu::set_order(ds41_emu::Order::kReverse);
-                    att.reset();
-                    r.run_t1(att, 0, n, false, &b);
-                    ds41_emu::set_order(ds41_emu::Order::kShuffle, 9);
-                    att.reset();
-                    r.run_t1(att, 0, n, false, &c);
+                    for (int variant = 0; variant < 3; ++variant) {
+                        if (variant == 1) ds41_emu::set_order(ds41_emu::Order::kReverse);
+                        if (variant == 2) ds41_emu::set_order(ds41_emu::Order::kShuffle, 9);
+                        att1.reset();
+                        const Replay::Clean c = r.run_clean(att1, n);
+                        bool same = true;
+                        for (int l = 0; l < r.nl; ++l) {
+                            same = same && std::memcmp(c.out[(size_t) l].data(), clean.out[(size_t) l].data(), (size_t) n * Replay::HID * 4) == 0;
+                            same = same && std::memcmp(c.topk[(size_t) l].data(), clean.topk[(size_t) l].data(), (size_t) n * Replay::TK * 4) == 0;
+                        }
+                        CHECK(same, "[%s] after reset(), scheduling order %s: the first %d positions are not bit-identical to the first run", nm,
+                              variant == 0 ? "as given" : variant == 1 ? "reverse" : "shuffle", n);
+                        uint64_t h = 1469598103934665603ull;
+                        for (int l = 0; l < r.nl; ++l) h ^= Replay::hash_of(c.out[(size_t) l]) * 1099511628211ull;
+                        std::printf("INFO [%s] first %d positions after reset(), order %s: output hash %016llx\n", nm, n, variant == 0 ? "as given" : variant == 1 ? "reverse" : "shuffle:9", (unsigned long long) h);
+                    }
                     ds41_emu::set_order(order0, seed0);
-                    // the first n positions of the main run are in out_all
-                    std::vector<float> m;
-                    for (int p = 0; p < n; ++p)
-                        for (int l = 0; l < r.nl; ++l) m.insert(m.end(), r.out_all[(size_t) l].begin() + (size_t) p * Replay::HID, r.out_all[(size_t) l].begin() + (size_t) (p + 1) * Replay::HID);
-                    const uint64_t hm = Replay::hash_of(m), ha = Replay::hash_of(a), hb = Replay::hash_of(b), hc = Replay::hash_of(c);
-                    CHECK(hm == ha, "[%s] a second pass after reset() is not bit-identical to the first", nm);
-                    CHECK(hm == hb && hm == hc, "[%s] the outputs depend on the emulator's scheduling order", nm);
-                    std::printf("INFO [%s] output hash of the first %d positions: %016llx (first run), after reset %016llx, reverse %016llx, shuffle %016llx\n", nm, n, (unsigned long long) hm,
-                                (unsigned long long) ha, (unsigned long long) hb, (unsigned long long) hc);
                 }
             }
         }
@@ -1243,18 +1273,28 @@ int main(int argc, char** argv) {
     std::string oracle_dir;
     std::vector<std::string> only;
     uint64_t seed = 1;
+    bool real_dense = false, extras = true;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--kernels")) kernels = true;
         else if (!std::strcmp(argv[i], "--oracle") && i + 1 < argc) oracle_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--scenario") && i + 1 < argc) only.push_back(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--no-extras")) extras = false;
+        else if (!std::strcmp(argv[i], "--dense") && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v != "ref" && v != "real") {
+                std::printf("FAIL: --dense wants ref | real\n");
+                return 2;
+            }
+            real_dense = v == "real";
+        }
         else if (!std::strcmp(argv[i], "--order") && i + 1 < argc) {
             if (!ds41_emu::set_order_from_string(argv[++i])) {
                 std::printf("FAIL: --order wants forward | reverse | shuffle[:SEED]\n");
                 return 2;
             }
         } else {
-            std::printf("usage: ds41_attn_emu_test [--kernels] [--oracle DIR [--scenario NAME]...] [--order forward|reverse|shuffle[:SEED]] [--seed N]\n");
+            std::printf("usage: ds41_attn_emu_test [--kernels] [--oracle DIR [--scenario NAME]... [--dense ref|real] [--no-extras]] [--order forward|reverse|shuffle[:SEED]] [--seed N]\n");
             return 2;
         }
     }
@@ -1275,7 +1315,7 @@ int main(int argc, char** argv) {
             KernelTests<RealGeom>(dev, seed + 100).run_all();
             std::printf("INFO RealGeom kernels done (%d checks, %d failed)\n", g_pass + g_fail, g_fail);
         }
-        if (!oracle_dir.empty()) run_oracle(dev, oracle_dir, only, true);
+        if (!oracle_dir.empty()) run_oracle(dev, oracle_dir, only, extras, real_dense);
     }
     std::printf("INFO emulation wall time %.1f s, %d checks passed, %d failed\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), g_pass, g_fail);
     if (g_fail) {

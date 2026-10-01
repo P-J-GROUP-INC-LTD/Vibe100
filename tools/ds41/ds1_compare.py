@@ -271,7 +271,7 @@ def float_metrics(e, o) -> dict:
     tiny = 1e-30
     ne, no = float(np.linalg.norm(e)), float(np.linalg.norm(o))
     return {**out, "rms_rel": rms_d / max(rms_o, tiny), "max_rel": max_d / max(amax, tiny), "max_abs": max_d,
-            "cos": float(e @ o / (ne * no)) if ne > 0 and no > 0 else (1.0 if ne == no else 0.0)}
+            "cos": float(min(1.0, max(-1.0, e @ o / (ne * no)))) if ne > 0 and no > 0 else (1.0 if ne == no else 0.0)}
 
 
 def float_level(m: dict, tol: FloatTol) -> Level:

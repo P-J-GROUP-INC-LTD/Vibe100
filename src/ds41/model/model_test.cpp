@@ -1171,6 +1171,23 @@ void test_bad_files(const Fx& fx, const GgufSet& g) {
         }
         expect_refusal("changed type", [&] { (void) Ds41Model<MiniGeom>::load(dev, first_of(d), opt); }, {"blk.1.ffn_norm.weight", "F16", "F32"});
     }
+    {   // a tensor offset that wraps around 2^64
+        const fs::path d = copy_all("wrap");
+        for (size_t i = 0; i < g.n_shards(); ++i) {
+            const fs::path p = d / fs::path(shard((int) i)).filename();
+            std::vector<uint8_t> f = read_bin(p);
+            const std::string nm = "blk.1.ffn_norm.weight";
+            if (std::search(f.begin(), f.end(), nm.begin(), nm.end()) == f.end()) continue;
+            patch_after_name(f, nm, [](uint8_t* a) {
+                uint32_t nd;
+                std::memcpy(&nd, a, 4);
+                const uint64_t off = 0xFFFFFFFFFFFFFF00ull;
+                std::memcpy(a + 4 + 8 * nd + 4, &off, 8);
+            });
+            write_bin(p, f);
+        }
+        expect_refusal("a wrapping offset", [&] { (void) GgufSet::open(first_of(d)); }, {"blk.1.ffn_norm.weight", "not a position in any file"});
+    }
     {   // a shard that is not there
         const fs::path d = copy_all("missing");
         fs::remove(d / fs::path(shard(1)).filename());
@@ -1272,6 +1289,69 @@ void test_helpers(const Fx& fx, const GgufSet& g) {
     CHECK(std::vector<uint8_t>(g.data(t), g.data(t) + t.nbytes) == before);
 }
 
+// ---------------------------------------------------------------------------------------------- 13. corrupt headers never crash the parser
+// Random damage to shard 1's header (byte flips, a header cut short), the data section left as a hole: the open either succeeds or throws a ModelError; what it
+// accepts goes through the config / tensor validation without a crash.  Under ASAN / UBSAN this is the parser's memory-safety test.
+void test_header_fuzz(const Fx& fx, const GgufSet& g) {
+    const fs::path tmp = fx.dir / "fuzz";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+    const std::string p1 = g.shard(0).path;
+    const uint64_t hdr = g.shard(0).data_start, size1 = g.shard(0).size;
+    std::vector<uint8_t> head = read_bin(p1);
+    head.resize((size_t) hdr);
+    const fs::path m1 = tmp / "mini-ds41-MXFP4-00001-of-00003.gguf";
+    uint64_t x = 0x2545F4914F6CDD1Dull;
+    const auto rnd = [&]() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        return x;
+    };
+    int opened = 0, refused = 0, other = 0;
+    for (int trial = 0; trial < 1500; ++trial) {
+        std::vector<uint8_t> f = head;
+        uint64_t want_size = size1;
+        const int kind = (int) (rnd() % 4);
+        if (kind == 0) {                                    // 1-4 flipped bytes anywhere in the header
+            for (int k = 0, n = 1 + (int) (rnd() % 4); k < n; ++k) f[rnd() % f.size()] ^= (uint8_t) (1 + rnd() % 255);
+        } else if (kind == 1) {                             // flipped bytes in the first 300 bytes (counts, the first keys)
+            for (int k = 0, n = 1 + (int) (rnd() % 3); k < n; ++k) f[rnd() % 300] = (uint8_t) rnd();
+        } else if (kind == 2) {                             // cut short, file size follows
+            f.resize((size_t) (rnd() % f.size()));
+            want_size = f.size();
+        } else {                                            // a huge value in an aligned 8-byte field
+            const size_t at = (size_t) (rnd() % (f.size() - 8)) & ~(size_t) 7;
+            const uint64_t v = rnd() | 0x8000000000000000ull;
+            std::memcpy(f.data() + at, &v, 8);
+        }
+        {
+            std::ofstream o(m1, std::ios::binary | std::ios::trunc);
+            o.write(reinterpret_cast<const char*>(f.data()), (std::streamsize) f.size());
+        }
+        fs::resize_file(m1, want_size);                     // the data section: a hole
+        try {
+            const GgufSet bad({m1.string(), g.shard(1).path, g.shard(2).path});
+            ++opened;
+            try {
+                const Ds41Config c = read_config(bad.meta());
+                Findings fi;
+                validate_tensors(c, bad.directory(), fi);
+                (void) c.describe();
+            } catch (const ModelError&) {
+            }
+        } catch (const ModelError&) {
+            ++refused;
+        } catch (const std::exception& e) {
+            ++other;
+            std::fprintf(stderr, "  trial %d (kind %d): %s: %s\n", trial, kind, typeid(e).name(), e.what());
+        }
+    }
+    fs::remove_all(tmp);
+    CHECK(other == 0 && opened + refused == 1500 && refused > 100);
+    std::fprintf(stderr, "  header fuzz: %d refused, %d opened (and validated)\n", refused, opened);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1312,6 +1392,7 @@ int main(int argc, char** argv) {
         {"load under HostDev", [&] { test_load(fx, *g); }},
         {"files that are not this model", [&] { test_bad_files(fx, *g); }},
         {"helpers (Engram constants, RoPE tables, page-cache advice)", [&] { test_helpers(fx, *g); }},
+        {"corrupt headers", [&] { test_header_fuzz(fx, *g); }},
     };
     for (const auto& t : tests) {
         const int before = g_fail;

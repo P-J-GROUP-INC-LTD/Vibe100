@@ -384,6 +384,8 @@ void GgufSet::open_shard(const std::string& path, Shard& s, int index, Findings&
         throw ModelError(path + ": the data section would start at " + std::to_string(s.info.data_start) + ", past the end of the file (" +
                          std::to_string(s.info.size) + " bytes): truncated?");
     for (TensorLoc& t : tl) {
+        if (t.offset > std::numeric_limits<uint64_t>::max() - s.info.data_start)
+            throw ModelError(path + ": tensor `" + t.name + "` has the offset " + std::to_string(t.offset) + ", which is not a position in any file (corrupt tensor table)");
         t.abs_offset = s.info.data_start + t.offset;
         tensors_.push_back(std::move(t));
     }

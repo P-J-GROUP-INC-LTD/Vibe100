@@ -27,6 +27,12 @@ inline constexpr int kGemvWarps = 4;                    // warps per block of th
 inline constexpr int kGemvThreads = 32 * kGemvWarps;
 inline constexpr int kWideWarps = 4;                    // warps per block of the BF16 / F32 GEMV (one warp per row)
 inline constexpr int kWideThreads = 32 * kWideWarps;
+#ifndef DS41_DENSE_WIDE_MINB
+#define DS41_DENSE_WIDE_MINB 4
+#endif
+#ifndef DS41_DENSE_GEMV_MINB
+#define DS41_DENSE_GEMV_MINB 3
+#endif
 inline constexpr int kMaxSmem = 96 * 1024;              // dynamic shared memory per block on sm_70 (opt-in above 48 KB)
 inline constexpr int kActSb = 304;                      // int8 activations: 256 quants + 8 fp32 scales + 16 pad, per super-block
 inline constexpr int kXSb = 1040;                       // fp32 activations: 256 floats + 4 pad, per super-block
@@ -140,7 +146,7 @@ DS41_FI void sb_f32(const uint32_t (&w)[68], int nblk, const unsigned char* xsb,
 // ---- the Q8_0 GEMV, int8 activations -----------------------------------------------------------------------------------------------------------
 // grid.x = ntiles * row_blocks * nmat (token tile fastest, so that the tiles of one row range run side by side and share the weights through L2).
 template <int NT, bool FAST>
-DS41_KERNEL DS41_LAUNCH_BOUNDS(kGemvThreads) void q8_int8_kernel(const uint8_t* DS41_RESTRICT wa, const uint8_t* DS41_RESTRICT wb, int N, int K,
+DS41_KERNEL DS41_LAUNCH_BOUNDS(kGemvThreads, DS41_DENSE_GEMV_MINB) void q8_int8_kernel(const uint8_t* DS41_RESTRICT wa, const uint8_t* DS41_RESTRICT wb, int N, int K,
                                                                  const int8_t* DS41_RESTRICT xq, const float* DS41_RESTRICT xs, int T, float* DS41_RESTRICT ya,
                                                                  float* DS41_RESTRICT yb, int p_log2, int rows_per_block, int row_blocks, int ntiles) {
     DS41_DYN_SMEM(smem);
@@ -207,7 +213,7 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(kGemvThreads) void q8_int8_kernel(const uint8_t* 
 // ---- the Q8_0 GEMV, FP32 activations (plain and grouped) --------------------------------------------------------------------------------------------
 // grid.x = ntiles * row_blocks_per_group * groups.  Row n = g * R + r of the matrix multiplies x[t][g * x_group_stride ..].
 template <int NT, bool FAST>
-DS41_KERNEL DS41_LAUNCH_BOUNDS(kGemvThreads) void q8_f32_kernel(const uint8_t* DS41_RESTRICT W, int R, int K, const float* DS41_RESTRICT x, int x_tok_stride,
+DS41_KERNEL DS41_LAUNCH_BOUNDS(kGemvThreads, DS41_DENSE_GEMV_MINB) void q8_f32_kernel(const uint8_t* DS41_RESTRICT W, int R, int K, const float* DS41_RESTRICT x, int x_tok_stride,
                                                                 int x_group_stride, int T, float* DS41_RESTRICT y, int p_log2, int rows_per_block,
                                                                 int row_blocks, int ntiles, int Ntot) {
     DS41_DYN_SMEM(smem);
@@ -314,7 +320,7 @@ DS41_FI void wide_chunk(const uint4& wv, int c, const unsigned char* tile, int t
 }
 
 template <int NT, bool BF16>
-DS41_KERNEL DS41_LAUNCH_BOUNDS(kWideThreads) void wide_kernel(const uint8_t* DS41_RESTRICT W, int N, int K, const float* DS41_RESTRICT x, int T, float* DS41_RESTRICT y,
+DS41_KERNEL DS41_LAUNCH_BOUNDS(kWideThreads, DS41_DENSE_WIDE_MINB) void wide_kernel(const uint8_t* DS41_RESTRICT W, int N, int K, const float* DS41_RESTRICT x, int T, float* DS41_RESTRICT y,
                                                               int rows_per_block, int ntiles) {
     DS41_DYN_SMEM(smem);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
