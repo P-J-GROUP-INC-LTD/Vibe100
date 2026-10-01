@@ -52,7 +52,10 @@ quantization: fp8 e4m3, weight blocks 32x32, scale ue8m0, experts fp4
 
 - Routed experts: **MXFP4** — `w1/w3.weight` I8 [2304,2560] (packed e2m1, K=5120), `w2.weight` I8 [5120,1152]
   (K=2304); scales F8_E8M0 [2304,160] / [5120,72] = one power-of-two scale per 32 K-elements. Nibble table
-  `[0,.5,1,1.5,2,3,4,6,-0,-.5,-1,-1.5,-2,-3,-4,-6]`, element 2k = low nibble. Bit-identical to GGML MXFP4.
+  `[0,.5,1,1.5,2,3,4,6,-0,-.5,-1,-1.5,-2,-3,-4,-6]`, element 2k = low nibble, 2k+1 = high nibble (`convert.py`), scales in a
+  separate tensor. **Same codes, scales and size as GGML MXFP4, different byte layout**: GGML interleaves the scale
+  with its block (17 B) and packs element j / j+16 in the low / high nibble of byte j. A GGUF is already in GGML's
+  layout; converting from the safetensors permutes nibbles (`tools/ds41/ggml_codecs.py: mxfp4_from_official`).
   **One expert = 3 × (5,898,240 + 368,640) = 18,800,640 B** (checked against the shard headers).
 - Attention, shared experts, indexer `wq_b`, Engram `wkv`, DSpark `main_proj`: FP8 e4m3 + E8M0 scale per 32×32
   block; activations quantised to e4m3 per 32 along K (dynamic).
@@ -220,6 +223,7 @@ Read 2026-10-01 from the 12 shard headers and the DSpark sidecar by HTTP range r
   `exp_probs_b_vl`) and metadata keys (no CSA2 layer maps; `engram.head_count/key_length/pad_id`). The pack tool
   accepts both spellings; only mxxm-t's has MXFP4 experts.
 
-**Memory on the target box (384 GB):** experts 288.8 GB (268.9 GiB) + Engram 104.4 GB (97.3 GiB) = 393 GB — just
-over. With the experts resident and ~10 GiB for the OS and engine, ~80 % of Engram stays in the page cache; the
-rest is read from the SSD (the GGUF author measured NVMe ≈ 2× SATA for prompt processing).
+**Memory on the target box (24 × 16 GiB = 384 GiB, ~377 GiB usable):** experts 268.95 GiB + Engram 97.28 GiB =
+366.2 GiB. With the experts resident and ~12 GiB for the OS, engine buffers and `token_embd`, ~96 GiB remain for
+Engram's page cache — ~98 % of it (`tools/ds41/manifest.py` memory plan); with DSpark on the CPU ~91 %. The rest
+is read from the SSD (the GGUF author measured NVMe ≈ 2× SATA for prompt processing).

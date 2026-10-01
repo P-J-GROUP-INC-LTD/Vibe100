@@ -22,8 +22,9 @@ The brief's principles stand: correctness before speed, change one variable at a
 **Decided (2026-10-01): the routed experts run in MXFP4** — the format DeepSeek released them in, so the experts are
 used bit for bit as trained, with no re-quantisation step and no quality question to measure. Every expert kernel
 (CPU and GPU), the pack layout and the cache sizing target exactly one format: per expert, `w1`/`w3` as 2304 rows of
-2560 packed e2m1 bytes + 160 E8M0 scales, `w2` as 5120 rows of 1152 bytes + 72 scales — 18,800,640 bytes, identical
-to GGML's MXFP4 blocks (17 bytes per 32 values), so an MXFP4 GGUF of the experts maps onto the same kernels.
+2560 packed e2m1 bytes + 160 E8M0 scales, `w2` as 5120 rows of 1152 bytes + 72 scales — 18,800,640 bytes. The
+kernels use GGML's block layout (17 bytes per 32 values, scale first, element j / j+16 in byte j), which the MXFP4
+GGUF already has; DeepSeek's safetensors hold the same codes and scales in another byte order.
 Q4_K / Q2_K / i-quant experts are out of scope.
 
 ## 2. Memory map on one V100 32 GB + host RAM
@@ -42,12 +43,12 @@ Q4_K / Q2_K / i-quant experts are out of scope.
 per socket on Cascade Lake-SP → 12 channels, ≈ 256 GB/s theoretical, ~200 GB/s if both sockets read locally — to
 be measured), one V100 32 GB, weights from an **MXFP4 GGUF**. Consequences:
 
-- **RAM: the 288.8 GB of MXFP4 experts fit; Engram does not fit beside them.** Experts resident in RAM (split
-  across the two NUMA nodes, see below); Engram's 202.8 GB stay on the SSD, mapped, with the ~70 GB of RAM left
-  over acting as page cache for hot rows. Per token Engram reads 48 rows (~200 KB of 4 KB pages, ~2,400 IOPS at
-  50 tok/s — easy for NVMe). Layer 1's rows are needed right after sampling, so the reads are issued the moment a
-  token is known (and for the prompt, all at once). Only a small staging pool is page-locked for GPU fills, not the
-  whole 289 GB.
+- **RAM: the experts (268.95 GiB) and Engram (97.28 GiB) together are 366 GiB of 377 usable.** Experts resident
+  in RAM (split across the two NUMA nodes, see below); Engram stays mapped from the SSD and ~96 GiB of page cache
+  holds ~98 % of it (the RAM budget table below). Per token Engram reads 48 rows of 136 B (MXFP4 in this GGUF);
+  a miss costs a 4 KB page read (~2,400 IOPS at 50 tok/s — easy for NVMe). Layer 1's rows are needed right after
+  sampling, so the reads are issued the moment a token is known (and for the prompt, all at once). Only a small
+  staging pool is page-locked for GPU fills, not the whole 269 GiB.
 - **RAM budget** (24 × 16 GiB = 384 GiB, ~377 GiB usable; sizes from the GGUF's tensor table):
 
   | Item | GiB | Where |
