@@ -38,9 +38,10 @@ std::string gpu_arch_problem(int ordinal);
 // The GPU architectures this binary was compiled for ("gfx1100,gfx1201"); "" on CUDA builds.
 const char* compiled_gpu_archs();
 
-// Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
-// run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and
-// this is the matching check at run time (a binary can be carried to a different machine).
+// Throws when there is no CUDA device, when the device is older than the engine supports (compute capability
+// 7.0, Volta; 6.0 in the experimental Pascal build), or when this binary carries no code for it.  `CMakeLists.txt`
+// already refuses to COMPILE for an unsupported architecture, and this is the matching check at run time (a binary
+// can be carried to a different machine).
 DeviceInfo device_info(int ordinal = 0);
 
 class CudaError : public std::runtime_error {

@@ -50,7 +50,8 @@ asks whether to share the model across them (recommended when two can). An insta
 its next start. Or choose yourself: `START-HERE.bat --gpus 0,2` (both, remembered), `--gpus all`, or `--gpu 0` (one
 card, this start only). Each card keeps the experts of its own layers, and prompts flow through the cards in a
 pipeline: on an RTX 5080 + RTX 3090 prompts were read 18-20% faster than on the 5080 alone, decoding on par.
-Every card must be an RTX 20 series or newer with 8 GB or more. See [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
+Every card must be an RTX 20 series or newer (or a V100, which cannot share a model with an RTX 50) with 8 GB or more.
+See [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
 
 ## Which model should I pick?
 
@@ -92,9 +93,16 @@ RX 7800 XT / 7700 XT and RX 9060 XT were validated by their owners):
 `./setup.sh --backend hip`, chosen by itself on a PC with no NVIDIA card Strata can use. It installs ROCm without sudo
 and compiles the engine (no images yet; several cards with `--gpus`). Details: [AMD HIP](docs/AMD_HIP.md).
 
+**NVIDIA V100 / Titan V (Volta, 16 or 32 GB)** is supported by this port: `./setup.sh` (`START-HERE.bat`) compiles
+the engine for it with CUDA 12.8 - the ready-made engine is built with CUDA 13, which dropped Volta - and installs
+that toolkit if it is missing (driver 570 up to the 580 branch). Nothing has been measured on a V100 yet. How to
+install it by hand or in Docker, the two run-time switches (`STRATA_VOLTA_ATTN`, `STRATA_PREFILL_F16_GEMM`), the
+verification tools and the known limits: [docs/volta/VOLTA.md](docs/volta/VOLTA.md).
+
 ## Install
 
-**You need:** an NVIDIA RTX 20, 30, 40 or 50 card with 12 GB of VRAM or more (RTX 20 since 0.1.27), enough RAM for the size you pick (above;
+**You need:** an NVIDIA RTX 20, 30, 40 or 50 card with 12 GB of VRAM or more (RTX 20 since 0.1.27; a V100 / Titan V works
+too: [docs/volta/VOLTA.md](docs/volta/VOLTA.md)), enough RAM for the size you pick (above;
 a big GPU makes up for less RAM - the [low-RAM mode](docs/DETAILS.md)),
 ~80 GB of free disk space (an SSD makes the first start much faster), and Windows 10/11 or Linux. The only thing you
 install yourself is a current **NVIDIA driver** ([nvidia.com/drivers](https://www.nvidia.com/drivers) or the NVIDIA
@@ -137,6 +145,9 @@ the same way - nothing big is downloaded again.
    `docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .` builds for one card only (faster).
    The default covers RTX 30 (86), RTX 40 (89), RTX 50 (120) and A-series (80); a card outside that
    set needs a rebuild with its own arch. Add `--build-arg BUILD_VISION=0` to skip the image encoder.
+   A V100 / Titan V needs a CUDA 12 base image (driver 570 or newer):
+   `docker build -t vibe100 --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04 --build-arg CUDA_ARCHITECTURES=70 .`
+   ([docs/volta/VOLTA.md](docs/volta/VOLTA.md)).
 3. Run (the first start downloads the ~70 GB model, then starts; later starts go straight to serving):
    `docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data strata`
 

@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # Strata: Qwen3.8-Flash-Next on NVIDIA GPUs (RTX 30/40/50, 12+ GB VRAM; two or
-# three cards can share one model, 8 GB each - docs/MULTI_GPU.md).
+# three cards can share one model, 8 GB each - docs/MULTI_GPU.md).  A V100 / Titan
+# V (Volta) is a build argument away - see "V100" below and docs/volta/VOLTA.md.
 #
 # The engine is compiled during docker build, so the first container start only
 # downloads the model (~70 GB) and starts the server. docker build has no GPU,
@@ -14,7 +15,24 @@
 #   docker build -t strata .
 #   docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .        # RTX 40 only
 #
-# Run (host needs an NVIDIA driver >= 580 and nvidia-container-toolkit):
+# V100 / Titan V (Volta, sm_70): CUDA 13 dropped Volta, so the image needs a CUDA 12
+# base - BASE_IMAGE - and the architecture must be named, since the default list
+# below is the one for RTX cards (an RTX 50 engine built with CUDA 12.8 crashed on
+# long prompts, issues #220 / #224, and one engine cannot be made for both):
+#   docker build -t vibe100 \
+#     --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04 \
+#     --build-arg CUDA_ARCHITECTURES=70 .
+# A V100 together with RTX 20/30/40 cards in one image is fine (CUDA_ARCHITECTURES=
+# "70;75;86;89", still CUDA 12.8); with an RTX 50 card it is not (the build stops and
+# says so).  Leave the architecture out on a CUDA 12 base and the image builds for the
+# RTX list: the engine has no code for a V100, and the container compiles one at its
+# first start (setup.py does that, 15-20 minutes).  On the default CUDA 13 base CMake
+# refuses sm_70 and says why.  Run the V100 image like any other; the container's
+# driver check is setup.py's (a V100 needs driver 570 or newer - CUDA 12.8 - and the
+# 580 branch is the last that supports Volta, R590 does not).
+#
+# Run (host needs an NVIDIA driver >= 580 - >= 570 for the V100 image - and
+# nvidia-container-toolkit):
 #   docker run --rm --gpus all \
 #     -p 8080:8080 \
 #     --ulimit memlock=-1 \
@@ -38,7 +56,10 @@
 # -e GPUS=0,2. A volume set up for one card switches to the pair on its first start
 # on a two-card host unless GPU or GPUS pins it. LOW_RAM=on runs on one card.
 
-FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+# The CUDA toolkit the engine is compiled with.  13.0 for RTX cards (the default);
+# a Volta engine needs a 12.x one (--build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04).
+ARG BASE_IMAGE=nvidia/cuda:13.0.0-devel-ubuntu24.04
+FROM ${BASE_IMAGE}
 
 # STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1
 # and docker stop's SIGTERM reaches it (see setup.start). Normal Linux starts, which
@@ -54,7 +75,8 @@ WORKDIR /opt/strata
 COPY . .
 
 # RTX 20 (75), RTX 30 (86), RTX 40 (89), RTX 50 (120), plus 80 for A-series. CMakeLists
-# refuses anything below 75. BUILD_VISION=0 skips the image encoder build.
+# refuses anything below 70; 70 (V100 / Titan V) needs a CUDA 12 BASE_IMAGE and cannot
+# be in the same image as 120. BUILD_VISION=0 skips the image encoder build.
 ARG CUDA_ARCHITECTURES=75;80;86;89;120
 ARG BUILD_VISION=1
 
@@ -72,8 +94,14 @@ import json, os, pathlib, shutil
 import setup
 
 llama = setup.get_llama_cpp()
-nvcc, _ = setup.find_nvcc()
 arch = os.environ.get("CUDA_ARCHITECTURES", "75;80;86;89;120").strip().strip('"').replace(",", ";")
+archs = [int(a.split("-")[0]) for a in arch.split(";") if a.split("-")[0].isdigit()]
+setup.refuse_conflict(archs)             # a Volta card and an RTX 50 cannot share one engine (CUDA 12 vs 13)
+nvcc, cuda_v = setup.find_nvcc(archs)    # for Volta: only a CUDA 12.x toolkit counts
+if nvcc is None:
+    raise SystemExit(f"CUDA_ARCHITECTURES={arch} needs a CUDA 12.x toolkit (CUDA 13 dropped Volta, sm_70), and this "
+                     "base image has none: --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04")
+print(f"building with CUDA {cuda_v[0]}.{cuda_v[1]} ({nvcc}) for sm_" + ", sm_".join(str(a) for a in archs))
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
 setup.cmake_build(setup.ROOT, setup.ROOT / "build", "strata",

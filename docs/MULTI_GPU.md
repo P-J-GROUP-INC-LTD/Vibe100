@@ -18,7 +18,7 @@ Strata can use it:
 ```
   Your NVIDIA GPUs:
     GPU 0: NVIDIA GeForce RTX 5080, 16 GB VRAM - can be used
-    GPU 1: NVIDIA GeForce GTX 1080 Ti, 11 GB VRAM - not supported - older than the RTX 20 series (compute capability 6.1; Strata needs 7.5 or newer)
+    GPU 1: NVIDIA GeForce GTX 1080 Ti, 11 GB VRAM - not supported - older than Volta (V100; compute capability 6.1; Strata needs 7.0 or newer)
     GPU 2: NVIDIA GeForce RTX 3090, 24 GB VRAM - can be used
   ...
   1) GPU 0 (NVIDIA GeForce RTX 5080, 16 GB) + GPU 2 (NVIDIA GeForce RTX 3090, 24 GB) together   (recommended)
@@ -41,7 +41,8 @@ now on; the answer is kept.
 ```
 
 **Not supported** (setup says so and names the cards that can be used instead):
-- a card older than the RTX 20 series (compute capability below 7.5: GTX 10 and older);
+- a card older than Volta (compute capability below 7.0: GTX 10 and older), or a V100 together with an RTX 50
+  card (CUDA 12 vs 13: one engine cannot be built for both; [docs/volta/VOLTA.md](volta/VOLTA.md));
 - a card with less than 8 GB of VRAM, together with others (each card holds a copy of the dense weights and its
   own prompt buffers);
 - Intel GPUs, and a mix of NVIDIA and AMD cards. (AMD cards share a model among themselves: `./setup.sh --backend
@@ -105,8 +106,9 @@ into the card that owns the layer.
   leaves WDDM refusing allocations); the rest streams through the pinned staging ring. A Linux driver has no such
   limit, so there the whole arena is pinned (since 0.1.31; the cap cost a 4090 + 3060 split two thirds of its
   prompt speed, #253). `STRATA_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena, on any OS.
-- Every card needs compute capability 7.5 (RTX 20 or newer). The pre-sm_80 QSA scorer path is fp32 FMAs, so a
-  Turing card runs the same kernels instead of the tensor-core prompt attention.
+- Every card needs compute capability 7.0 (V100 / Titan V) or 7.5 (RTX 20 or newer). The pre-sm_80 QSA scorer path
+  is fp32 FMAs, so a Turing or Volta card runs the same kernels; Volta's prompt attention is its own WMMA kernel
+  (docs/volta/PLAN.md).
 
 ## Measured
 

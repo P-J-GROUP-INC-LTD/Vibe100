@@ -61,6 +61,44 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
     }
     return "";
 }
+#else
+// The compute-capability check in device_info() says whether the card is one the engine's SOURCE supports; this
+// says whether THIS BINARY carries machine code for it.  They differ whenever the binary was built for other
+// cards than the one it is run on - the prebuilt release engine has no Volta code, and an engine built with
+// -DCMAKE_CUDA_ARCHITECTURES=80 has none for an RTX 20 - and the first kernel launch would otherwise fail with
+// "no kernel image is available for execution on the device", from deep inside whichever stage ran first.
+// cudaFuncGetAttributes on a kernel of this very file asks the driver the same question up front, for the
+// device that is current (device_info() has just made `d` current), without running anything.
+// "" when the binary can run on the card (or when the probe failed for a reason that is not about code: the next
+// real CUDA call reports that one with its own context, as it always did).
+std::string missing_code_problem(const DeviceInfo& d) {
+    cudaFuncAttributes attr{};
+    const cudaError_t e = cudaFuncGetAttributes(&attr, poison_kernel);
+    if (e == cudaSuccess) return "";
+    cudaGetLastError();          // these errors are not sticky, but a stale one would be blamed on the next caller
+    if (e != cudaErrorNoKernelImageForDevice && e != cudaErrorInvalidDeviceFunction &&
+        e != cudaErrorUnsupportedPtxVersion) {
+        return "";
+    }
+    const int sm = d.cc_major * 10 + d.cc_minor;
+    std::string why = "GPU " + std::to_string(d.ordinal) + " (" + d.name + ") is compute capability " +
+                      std::to_string(d.cc_major) + "." + std::to_string(d.cc_minor) + " (sm_" +
+                      std::to_string(sm) + "), but this Strata engine has no code it can run";
+#if defined(STRATA_CUDA_ARCHS)
+    why += std::string(" (it was built for CMAKE_CUDA_ARCHITECTURES=") + STRATA_CUDA_ARCHS + ")";
+#endif
+    if (e == cudaErrorUnsupportedPtxVersion) {
+        why += ": the engine's code for it is newer than the installed NVIDIA driver can load - update the driver, or "
+               "rebuild the engine with an older CUDA toolkit";
+    } else {
+        why += ": rebuild the engine for this card with -DCMAKE_CUDA_ARCHITECTURES=" + std::to_string(sm);
+    }
+    if (sm == 70 && e != cudaErrorUnsupportedPtxVersion) {
+        why += " using a CUDA 12.x toolkit (CUDA 13 cannot build for Volta; ./setup.sh does this for a V100)";
+    }
+    why += ", or choose another GPU with CUDA_VISIBLE_DEVICES";
+    return why;
+}
 #endif
 
 }  // namespace
@@ -99,7 +137,7 @@ DeviceInfo device_info(int ordinal) {
 #if defined(STRATA_USE_HIP)
         throw CudaError(std::string("no HIP device is present; this engine was compiled for ") + STRATA_HIP_ARCHS, -1);
 #else
-        throw CudaError("no CUDA device is present; Strata needs an NVIDIA GPU (RTX 20 series or newer)", -1);
+        throw CudaError("no CUDA device is present; Strata needs an NVIDIA GPU (V100 / Titan V, or RTX 20 series or newer)", -1);
 #endif
     }
     if (ordinal < 0 || ordinal >= count) {
@@ -127,28 +165,31 @@ DeviceInfo device_info(int ordinal) {
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
     // The engine supports compute capability 7.5 and newer (Turing: the QSA scorer's tf32 mma has a portable
-    // fp32-FMA fallback below sm_80, the tensor-core prompt kernels refuse and fall back).  Compiling for a
-    // supported arch is enforced by CMake; RUNNING on an older card is caught here, because a binary can be carried
-    // to a machine with an older card and would otherwise silently take whatever path the driver chose.  The HIP
-    // backend checks the card against the architectures the binary was compiled for (and wave32).
+    // fp32-FMA fallback below sm_80, the tensor-core prompt kernels refuse and fall back) and, in the Vibe100 port,
+    // 7.0 (Volta: V100 / Titan V, whose tensor-core paths are separate kernels - docs/volta/VOLTA.md).  Compiling for
+    // a supported arch is enforced by CMake; RUNNING on an older card is caught here, because a binary can be carried
+    // to a machine with an older card and would otherwise silently take whatever path the driver chose.  A card that
+    // is new enough but that the binary carries no code for (a V100 against the prebuilt engine) is caught right
+    // after.  The HIP backend checks the card against the architectures the binary was compiled for (and wave32).
 #if defined(STRATA_USE_HIP)
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);
 #else
-    // #236: the experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON: Pascal sm_60, Volta sm_70) runs on the cards it
-    // was built for - refusing them below 7.5 there made the flag useless; the release engine keeps 7.5
+    // #236: the experimental build (-DSTRATA_EXPERIMENTAL_SM60=ON: Pascal sm_6x) runs on the cards it was built
+    // for - refusing them below 7.0 there would make the flag useless.  A normal build admits Volta and newer.
 #if defined(STRATA_EXPERIMENTAL_SM60)
     constexpr int kMinCc = 60;
-    const char* const kNeed = "6.0 or newer (this is the experimental Pascal / Volta build)";
+    const char* const kNeed = "6.0 or newer (this is the experimental Pascal build; Volta and newer need no flag)";
 #else
-    constexpr int kMinCc = 75;
-    const char* const kNeed = "7.5 or newer (RTX 20 / 30 / 40 / 50 series)";
+    constexpr int kMinCc = 70;
+    const char* const kNeed = "7.0 or newer (V100 / Titan V, RTX 20 / 30 / 40 / 50 series)";
 #endif
     if (d.cc_major * 10 + d.cc_minor < kMinCc) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) + "; Strata needs compute capability " + kNeed,
                         -1);
     }
+    if (const std::string why = missing_code_problem(d); !why.empty()) throw CudaError(why, -1);
 #endif
     return d;
 }

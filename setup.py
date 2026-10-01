@@ -14,7 +14,8 @@ What the first run does (each step is skipped when it is already done):
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ..., and NVIDIA's CUDA libraries)
   4. gets the Strata engine: a ready-made build for RTX 20/30/40/50 cards (no compiler needed); if none fits your PC,
-     it installs the build tools (asks first) and compiles the engine for your GPU
+     it installs the build tools (asks first) and compiles the engine for your GPU.  A V100 / Titan V (Volta) is always
+     compiled here, with CUDA 12.8: the ready-made engine is built with CUDA 13, which dropped Volta (docs/volta/VOLTA.md)
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
@@ -85,6 +86,13 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
+# Volta (sm_70: V100, Titan V): CUDA 13 dropped it, so the ready-made engine (built with CUDA 13.0, sm_75 and up) has no
+# code for it and never will, and an engine for it is always compiled here with a CUDA 12.x toolkit (12.8: the one
+# the setup installs when it is missing).  CUDA 12.8 needs driver 570; R580 is the last driver branch that supports Volta.
+PREBUILT_MIN_ARCH = 75                 # the ready-made engine covers sm_75 (RTX 20) and newer
+CUDA13_MIN_ARCH = 120                  # RTX 50 (sm_120): built with CUDA 13.0 (an engine built with 12.8 crashed, #220)
+CUDA12_TOOLKIT = "12.8"                # what is installed for a Volta engine
+MIN_DRIVER_CUDA12 = 570                # CUDA 12.8
 MIN_ENGINE = (0, 1, 31)                # v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (#214)
@@ -361,9 +369,12 @@ def cc(g) -> str:
 
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can)."""
-    if int(g["arch"]) < 75:
-        return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
-                "newer)")
+    arch = int(g["arch"])
+    if arch < 70:
+        return (f"not supported - older than Volta (V100; compute capability {cc(g)}; Strata needs 7.0 or newer)")
+    if 70 < arch < 75:                                      # 7.2 is the Jetson Xavier SoC; 7.1, 7.3, 7.4 do not exist
+        return (f"not supported - compute capability {cc(g)} is not a desktop GPU (Strata needs 7.0, a V100 / Titan V, "
+                "or 7.5 and newer)")
     if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
         return (f"not supported together with other GPUs - {g['vram_gb']:.0f} GB of VRAM (a card sharing the model "
                 f"needs {SPLIT_MIN_VRAM_GB} GB or more)")
@@ -385,11 +396,54 @@ def gpu_table(found) -> None:
     for g in found:
         p = gpu_problem(g)
         say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + ("can be used" if p is None else p))
+    why = cards_conflict([g for g in found if gpu_problem(g) is None])
+    if why:
+        say("    Note: " + why)
+
+
+def needs_cuda12(archs) -> bool:
+    """An engine for these architectures has to be built with CUDA 12: it includes Volta (sm_70), which CUDA 13 dropped."""
+    return any(int(x) < PREBUILT_MIN_ARCH for x in archs)
+
+
+def arch_conflict(archs) -> bool:
+    """One engine cannot be built for these: Volta needs CUDA 12 (13 dropped it) and an RTX 50 card (sm_120) needs
+    CUDA 13 (an engine built with 12.8 crashed on long prompts there, #220)."""
+    return needs_cuda12(archs) and any(int(x) >= CUDA13_MIN_ARCH for x in archs)
+
+
+def conflict_text(old: str, new: str) -> str:
+    return (f"{old} is a Volta card, which needs an engine built with CUDA 12 (CUDA 13 dropped Volta), and {new} is an "
+            "RTX 50 card, which needs one built with CUDA 13 (an engine built with CUDA 12.8 crashed on long prompts "
+            "there, issue #220): one engine cannot be built for both")
+
+
+def refuse_conflict(archs) -> None:
+    """Stops with a plain message when no single engine can be built for these architectures (arch_conflict)."""
+    a = sorted({int(x) for x in archs})
+    if arch_conflict(a):
+        fail("one engine cannot be built for " + ", ".join(f"sm_{x}" for x in a) + ": " +
+             conflict_text(f"sm_{min(a)}", f"sm_{max(a)}"),
+             "choose cards that share one engine with --gpu N / --gpus A,B (a V100 can share one with RTX 20/30/40 "
+             "cards, not with an RTX 50), or make a second engine (another Strata folder, another Docker image) for "
+             "the other card")
+
+
+def cards_conflict(cards) -> str | None:
+    """arch_conflict() for cards, in words naming them (None: they can share one engine)."""
+    if not arch_conflict([g["arch"] for g in cards]):
+        return None
+    old = next(g for g in cards if needs_cuda12([g["arch"]]))
+    new = next(g for g in cards if int(g["arch"]) >= CUDA13_MIN_ARCH)
+    return conflict_text(gpu_name(old), gpu_name(new))
 
 
 def together_ok(found) -> list:
-    """The cards that can share one model, in the order they would (empty if fewer than two)."""
+    """The cards that can share one model, in the order they would (empty if fewer than two).  A V100 is left out
+    when there is an RTX 50 card: they cannot share one engine (arch_conflict); it still runs a model alone."""
     ok_ = sorted([g for g in found if gpu_problem(g, together=True) is None], key=gpu_rank)
+    if arch_conflict([g["arch"] for g in ok_]):
+        ok_ = [g for g in ok_ if not needs_cuda12([g["arch"]])]
     return ok_ if len(ok_) >= 2 else []
 
 
@@ -399,7 +453,7 @@ def parse_gpus(text, found) -> list:
         sel = [g["index"] for g in together_ok(found)]
         if not sel:
             gpu_table(found)
-            fail("--gpus all: this PC does not have two GPUs Strata can use together")
+            fail("--gpus all: this PC does not have two GPUs Strata can use together")      # (the table says why)
         return sel
     try:
         sel = [int(x) for x in str(text).split(",") if x.strip()]
@@ -425,8 +479,17 @@ def check_gpus(sel, found, what="") -> None:
         ones = " or ".join(f"--gpu {x['index']}" for x in single)
         both = "--gpus " + ",".join(str(x["index"]) for x in can) if can else ""
         hint = ((f"use these together: {both}" + (f" (or one card: {ones})" if not together else "")) if can else
-                f"use one card: {ones}" if single else "Strata needs an NVIDIA RTX 20 series or newer card")
+                f"use one card: {ones}" if single else "Strata needs an NVIDIA V100 / Titan V or RTX 20 series or newer card")
         fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
+    chosen = [x for x in found if x["index"] in sel]
+    if together and (why := cards_conflict(chosen)):       # a V100 with an RTX 50: two toolkits, so two engines
+        say()
+        gpu_table(found)
+        can = together_ok(found)
+        single = [x for x in found if gpu_problem(x) is None]
+        hint = ("use these together: --gpus " + ",".join(str(x["index"]) for x in can) + " - or one card: " if can
+                else "use one card: ") + " or ".join(f"--gpu {x['index']}" for x in single)
+        fail(f"GPUs {','.join(str(i) for i in sel)} {what}cannot share one engine: {why}", hint)
 
 
 def engine_archs():
@@ -481,7 +544,8 @@ def choose_gpus(a, found) -> list:
     single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
     if not single:
         gpu_table(found)
-        fail("none of your GPUs can run Strata", "it needs an NVIDIA RTX 20 series or newer (compute capability 7.5+)")
+        fail("none of your GPUs can run Strata", "it needs an NVIDIA V100 / Titan V (compute capability 7.0) or an RTX 20 "
+                                                 "series or newer (7.5+)")
     can = together_ok(found)
     if not can:
         return [single[0]["index"]]
@@ -497,6 +561,9 @@ def choose_gpus(a, found) -> list:
     for g in found:
         if gpu_problem(g, together=True) is not None:
             say(f"     (GPU {g['index']}, {g['name']}: {gpu_problem(g, together=True)})")
+        elif g not in can:                                 # a V100 beside an RTX 50: it runs a model alone (--gpu N)
+            say(f"     (GPU {g['index']}, {g['name']}: not together with the RTX 50 - a V100 needs an engine built with "
+                "CUDA 12, an RTX 50 one built with CUDA 13)")
     pick = opts[int(ask("Which GPUs?", [str(i) for i in range(1, len(opts) + 1)], "1", a.yes or a.check)) - 1]
     return [g["index"] for g in pick]
 
@@ -546,7 +613,10 @@ def gpu_info(pick=None):
     return {**g, "count": len(found)}
 
 
-def find_nvcc():
+def find_nvcc(archs=None):
+    """(nvcc, (major, minor)) of the toolkit to compile with, or (None, None).  Every toolkit found is looked at and the
+    newest wins - except for an engine that includes Volta (archs has sm_70): CUDA 13 cannot build for it, so only a
+    12.x toolkit counts, and a CUDA 13 first on PATH is passed over for the 12.x installed beside it."""
     cands = [shutil.which("nvcc")]
     if os.environ.get("CUDA_PATH"):
         cands.append(str(Path(os.environ["CUDA_PATH"]) / "bin" / ("nvcc.exe" if WIN else "nvcc")))
@@ -558,9 +628,12 @@ def find_nvcc():
         cands += [str(p / "bin" / "nvcc") for p in sorted(Path("/usr/local").glob("cuda*"), reverse=True)]
         cands += [str(p / "bin" / "nvcc") for p in sorted(Path("/opt").glob("cuda*"), reverse=True)]   # Arch (#46)
     best = (None, None)
+    volta = archs is not None and needs_cuda12(archs)
     for c in dict.fromkeys(cands):                     # every toolkit found; the newest wins
         if c and Path(c).exists():
             v = re.search(r"release (\d+)\.(\d+)", out([c, "--version"]))
+            if v and volta and not 12 <= int(v.group(1)) < 13:
+                continue
             if v and (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
                 best = (c, (int(v.group(1)), int(v.group(2))))
     return best
@@ -1033,6 +1106,14 @@ def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
     updating: called to replace an installed engine, which starts instead when this fails (no compile)."""
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
+    if needs_cuda12(gpu.get("archs", [gpu["arch"]])):
+        # a V100 (Volta): the ready-made engine is built with CUDA 13, which dropped Volta - whatever its BUILD.json
+        # says, it has no sm_70 code.  The engine is compiled here with CUDA 12.8 instead (build_engine).
+        if not updating:
+            say("  The ready-made engine has no code for a V100 / Titan V (Volta): CUDA 13, which it is built with, "
+                "dropped Volta.")
+            say("  The engine is compiled here with CUDA 12.8 instead (docs/volta/VOLTA.md).")
+        return None
     if info.exists() and (eng / EXE).exists():
         meta = json.loads(info.read_text())
         ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
@@ -1157,7 +1238,11 @@ def update_installed_engine(url_base) -> None:
         try:                                           # a failed compile must not stop the model from starting
             if gpu is None:
                 raise RuntimeError("no NVIDIA GPU found")
-            gpu = {**gpu, "archs": sorted({int(gpu["arch"]), *(int(x) for x in meta.get("archs", []))})}
+            own = {int(x) for x in meta.get("archs", [])}
+            archs = own | {int(gpu["arch"])}
+            if arch_conflict(archs):                   # the biggest card is an RTX 50 and the engine is a V100's (or the
+                archs = own                            # other way round): it is rebuilt for the cards it was made for
+            gpu = {**gpu, "archs": sorted(archs)}
             build_engine(gpu, vision, False, get_llama_cpp())
         except (Exception, SystemExit) as e:
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
@@ -1178,20 +1263,30 @@ def update_installed_engine(url_base) -> None:
 
 def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
-    nvcc, cuda_v = find_nvcc()
-    # RTX 50 (sm_120): CUDA 13.0 - an engine built with 12.8 crashed in the prompt path on Linux (#220)
-    need_cuda = (13, 0) if max(int(x) for x in gpu.get("archs", [gpu["arch"]])) >= 120 else (12, 0)
+    archs = [int(x) for x in gpu.get("archs", [gpu["arch"]])]
+    refuse_conflict(archs)
+    # A V100 (Volta): CUDA 12.x - 13 dropped it (nvcc 13 has no sm_70).  RTX 50 (sm_120): CUDA 13.0 - an engine built with
+    # 12.8 crashed in the prompt path on Linux (#220).  Anything between: any CUDA 12 or newer (13.0 is what gets installed).
+    cuda12 = needs_cuda12(archs)
+    nvcc, cuda_v = find_nvcc(archs)
+    need_cuda = (13, 0) if max(archs) >= CUDA13_MIN_ARCH else (12, 0)
+    toolkit = f"the NVIDIA CUDA Toolkit {CUDA12_TOOLKIT}" if cuda12 else "the NVIDIA CUDA Toolkit 13.0"
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
     if not have_cc:
         missing.append("Visual Studio 2022 Build Tools (C++)" if WIN else "the C++ compiler (build-essential)")
     if nvcc is None or cuda_v < need_cuda:
-        missing.append("the NVIDIA CUDA Toolkit 13.0")
+        missing.append(toolkit)
     if not missing:
         ok(f"build tools present (CUDA {cuda_v[0]}.{cuda_v[1]})")
         return nvcc, vcvars
     say("  The engine has to be compiled for your PC, which needs: " + " and ".join(missing) + ".")
+    if cuda12 and (nvcc is None or cuda_v < need_cuda):
+        newer = find_nvcc()[1]                          # the CUDA 13 that is there, if any (it is passed over)
+        say("  (Your V100 / Titan V is a Volta card, which CUDA 13 dropped: its engine has to be built with CUDA 12."
+            + (f" The CUDA {newer[0]}.{newer[1]} you have stays as it is; 12 is installed next to it." if newer else "")
+            + ")")
     say("  They can be installed now (about 8-10 GB, 15-40 minutes" + (", Windows will ask for permission" if WIN else
                                                                         ", sudo will ask for your password") + ").")
     if ask("  Install them now?", ["y", "n"], "y", yes) != "y":
@@ -1207,14 +1302,17 @@ def install_build_tools(gpu, yes):
                  "--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"],
                 check=False)
         if nvcc is None or cuda_v < need_cuda:
-            run([*wg, "--id", "Nvidia.CUDA", "--version", "13.0"], check=False)
+            # (12.8 for a V100: the --version string is the one winget's Nvidia.CUDA package lists - checked below by
+            # looking for the toolkit afterwards, with the manual download in the hint if it did not install)
+            run([*wg, "--id", "Nvidia.CUDA", "--version", CUDA12_TOOLKIT if cuda12 else "13.0"], check=False)
         vcvars = find_vcvars()
     else:
         apt = shutil.which("apt-get")
         if apt is None:
             fail("missing: " + " and ".join(missing) + " (the automatic install is only done on Ubuntu/Debian)",
                  "install them with your distribution's packages (Arch: pacman -S base-devel cuda; nvcc is found on "
-                 "PATH, in /usr/local/cuda* and in /opt/cuda*), then run it again")
+                 "PATH, in /usr/local/cuda* and in /opt/cuda*), then run it again" +
+                 ("; for a V100 the toolkit must be a CUDA 12.x one (12.8 or 12.9), not 13" if cuda12 else ""))
         if not have_cc:
             run(["sudo", "apt-get", "install", "-y", "build-essential"])
         if nvcc is None or cuda_v < need_cuda:
@@ -1222,18 +1320,24 @@ def install_build_tools(gpu, yes):
             ver = osr.get("VERSION_ID", "").strip('"').replace(".", "")
             if osr.get("ID") != "ubuntu" or ver not in ("2204", "2404"):
                 fail("the CUDA Toolkit can be installed automatically on Ubuntu 22.04 / 24.04 only",
+                     "install CUDA 12.8 (a V100 needs a 12.x toolkit, not 13) from https://developer.nvidia.com/cuda-12-8-1-download-archive"
+                     " and run it again" if cuda12 else
                      "install it from https://developer.nvidia.com/cuda-downloads and run it again")
             deb = Path("/tmp/cuda-keyring.deb")
             download(f"https://developer.download.nvidia.com/compute/cuda/repos/ubuntu{ver}/x86_64/cuda-keyring_1.1-1_all.deb",
                      deb, "CUDA repository key")
             run(["sudo", "dpkg", "-i", str(deb)])
             run(["sudo", "apt-get", "update"])
-            run(["sudo", "apt-get", "install", "-y", "cuda-toolkit-13-0"])
-    nvcc, cuda_v = find_nvcc()
+            pkg = "cuda-toolkit-" + (CUDA12_TOOLKIT if cuda12 else "13.0").replace(".", "-")   # cuda-toolkit-12-8 / -13-0
+            run(["sudo", "apt-get", "install", "-y", pkg])
+    nvcc, cuda_v = find_nvcc(archs)
     if (WIN and find_vcvars() is None) or (not WIN and shutil.which("g++") is None):
         fail("the C++ build tools did not install", "install them by hand (README.md) and run it again")
     if nvcc is None or cuda_v < need_cuda:
-        fail("the CUDA Toolkit did not install", "install it from https://developer.nvidia.com/cuda-downloads, then run it again")
+        fail(f"the CUDA Toolkit {CUDA12_TOOLKIT if cuda12 else '13.0'} did not install",
+             "install CUDA 12.8 (not 13: it has no Volta) from https://developer.nvidia.com/cuda-12-8-1-download-archive,"
+             " then run it again" if cuda12 else
+             "install it from https://developer.nvidia.com/cuda-downloads, then run it again")
     ok(f"build tools installed (CUDA {cuda_v[0]}.{cuda_v[1]})")
     return nvcc, find_vcvars() if WIN else None
 
@@ -1259,6 +1363,27 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
         if run(build, check=False).returncode != 0:
             say("  (the build stopped - trying it once more)")
             run(build)
+
+
+def fresh_build_folder(bdir: Path, nvcc, archs) -> None:
+    """A build folder made with another CUDA major version is started afresh when Volta is involved (the new engine's
+    architectures, or the folder's own, include sm_70): a V100's CUDA 12 and the CUDA 13 of the newer cards share no
+    objects, and CMake does not switch a build folder's compiler in place.  One that is merely out of date is left
+    alone: only what changed is compiled again."""
+    try:
+        made = next(iter(sorted(bdir.glob("CMakeFiles/*/CMakeCUDACompiler.cmake"))), None)
+        if made is None:
+            return
+        old_major = int(re.search(r'CMAKE_CUDA_COMPILER_VERSION "(\d+)\.', made.read_text(errors="ignore")).group(1))
+        old_archs = [int(x) for x in re.findall(r"\d+", re.search(
+            r"^CMAKE_CUDA_ARCHITECTURES:[A-Z]+=(.*)$", (bdir / "CMakeCache.txt").read_text(errors="ignore"), re.M).group(1))]
+        new_major = int(re.search(r"release (\d+)\.", out([str(nvcc), "--version"])).group(1))
+    except (AttributeError, OSError, ValueError):
+        return
+    if new_major != old_major and (needs_cuda12(archs) or needs_cuda12(old_archs)):
+        say(f"  (the build folder {bdir.name} was made with CUDA {old_major}, this engine is built with CUDA "
+            f"{new_major}: starting it afresh)")
+        shutil.rmtree(bdir, ignore_errors=True)
 
 
 ENGINE_SOURCES = ("CMakeLists.txt", "src", "include", "third_party/ggml")
@@ -1298,6 +1423,7 @@ def build_engine(gpu, vision, yes, llama) -> Path:
         return eng
     if local:
         archs = sorted(built | set(archs))
+    refuse_conflict(archs)
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs}, yes)
     cuda_archs = ";".join(str(x) for x in archs)
     if not engine_ok:
@@ -1305,6 +1431,7 @@ def build_engine(gpu, vision, yes, llama) -> Path:
             "10-20 minutes, once) ..." if new_arch else
             "  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
             if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
+        fresh_build_folder(ROOT / "build", nvcc, archs)
         cmake_build(ROOT, ROOT / "build", "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata.bat")
@@ -1314,6 +1441,8 @@ def build_engine(gpu, vision, yes, llama) -> Path:
         defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}"]
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+        if vision == "gpu":
+            fresh_build_folder(ROOT / "build-vision", nvcc, archs)
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision", defs, vcvars, "build-vision.bat")
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
@@ -1845,7 +1974,10 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     say("  The installed engine has no code for " + ", ".join(f"{g['name']} (sm_{g['arch']})" for g in missing) +
         ": it is compiled for " + ("these cards" if len(cards) > 1 else "it") + " now.")
     main = gpu_info(cards[0]["index"])
-    archs = sorted({int(x) for x in meta.get("archs", [])} | {int(g["arch"]) for g in cards})
+    built = {int(x) for x in meta.get("archs", [])}
+    if meta.get("source") != "local" and needs_cuda12([g["arch"] for g in cards]):
+        built = set()                                  # a ready-made engine's list (RTX 20-50) is not for a CUDA 12 compile
+    archs = sorted(built | {int(g["arch"]) for g in cards})
     vision = meta.get("vision") or ("gpu" if (ROOT / "engine" / VEXE).exists() else "none")
     build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp())
     dirs = json.loads(info.read_text()).get("cuda_dirs") or []
@@ -2052,7 +2184,7 @@ def main() -> int:
             say("  (the AMD card: ./setup.sh --backend hip)")
     if hip:                                            # AMD (experimental): compiled here
         if WIN:
-            fail("Strata's AMD backend runs on Linux only", "use an NVIDIA RTX 20 series or newer card on Windows")
+            fail("Strata's AMD backend runs on Linux only", "use an NVIDIA V100 or RTX 20 series or newer card on Windows")
         say("  Your AMD GPUs:" if amd else "  No AMD GPU found (the amdgpu driver's KFD topology is empty).")
         for g in amd:
             say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + (amd_problem(g) or "can be used"))
@@ -2096,9 +2228,18 @@ def main() -> int:
         if multi:
             ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
         ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {cc(gpu)}, driver {gpu['driver']}")
-        if driver_major(gpu) < MIN_DRIVER:
-            fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
-                 "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
+        if needs_cuda12(gpu["archs"]):                 # a V100 / Titan V: never the ready-made engine
+            nv, nv_v = find_nvcc(gpu["archs"])
+            ok("Volta (V100 / Titan V): the engine is compiled on this PC with CUDA 12 - CUDA 13 dropped Volta, so the "
+               "ready-made engine has no code for it" + (f" (CUDA {nv_v[0]}.{nv_v[1]} found)" if nv else
+                                                         f" (CUDA {CUDA12_TOOLKIT} is installed for it; asks first)"))
+        # a V100's engine is built with CUDA 12.8 (driver 570); the others' with / for CUDA 13 (580)
+        min_driver = MIN_DRIVER_CUDA12 if needs_cuda12(gpu["archs"]) else MIN_DRIVER
+        if driver_major(gpu) < min_driver:
+            fail(f"the NVIDIA driver is too old ({gpu['driver']}; {min_driver} or newer is needed)",
+                 "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again"
+                 + ("; a V100 needs driver 570 up to the 580 branch (the last one that supports Volta)"
+                    if min_driver == MIN_DRIVER_CUDA12 else ""))
     if gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()

@@ -1,6 +1,8 @@
 #!/bin/sh
 # Strata for Linux: the first run installs everything and starts the model; later runs just start it.
 # Needs only an NVIDIA driver (or, experimental: an AMD RX 7900 XT/XTX with the amdgpu driver, see docs/AMD_HIP.md).
+# A V100 / Titan V (Volta) also gets the CUDA 12.8 toolkit installed (asks first): the ready-made engine is built with
+# CUDA 13, which dropped Volta, so the engine for it is compiled here (docs/volta/VOLTA.md).
 # Python (with venv) is installed through apt/dnf if it is missing (asks for sudo).
 cd "$(dirname "$0")" || exit 1
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate

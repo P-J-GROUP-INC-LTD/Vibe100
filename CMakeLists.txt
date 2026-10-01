@@ -4,9 +4,13 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2.  The kernels need sm_80 or newer (tf32 mma, bf16 math) and the guard
-# below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
-# and is wrong about its own performance, which is the worst of both outcomes.
+# CUDA targets arrive in Phase 2.  The kernels are written for Turing (sm_75) and newer - RTX 20 / 30 / 40 / 50 -
+# and Volta (sm_70: V100, Titan V) is supported by the Vibe100 port (docs/volta/VOLTA.md): of the three kernels that
+# use tensor-core PTX, the prompt attention has a Volta (WMMA) version beside the Turing/Ampere ones and the other
+# two (the QSA select and scorer) take their FP32 fallbacks, and the dense prefill GEMMs run on FP16 tensor cores
+# because Volta has no bf16 ones.  The guard below refuses anything older (Pascal is an opt-in
+# experiment, -DSTRATA_EXPERIMENTAL_SM60=ON): silently building for an unsupported arch would produce a binary
+# that runs and is wrong about its own performance, which is the worst of both outcomes.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.31 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
@@ -52,6 +56,9 @@ endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
+# Vibe100 (Volta port): the FP16-tensor-core prefill GEMM against an FP64 reference (GPU, synthetic, no model); with
+# the tests, or alone with -DSTRATA_PARITY_PREFILL_GEMM=ON.  CUDA only.
+option(STRATA_PARITY_PREFILL_GEMM "Build the gemm_volta_parity program" OFF)
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
@@ -63,12 +70,57 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
 endif()
 
+# CUDA 13 dropped Volta (and Pascal): its nvcc has no compute_70 / sm_70.  Said once, here, because there are two
+# places that notice - before enable_language(CUDA), where CMake's own compiler test would otherwise die with
+# nvcc's "Unsupported gpu architecture 'compute_70'" (which names no remedy), and after it, on the compiler CMake
+# really chose.
+function(_strata_refuse_cuda13_for_old_arch arch cuda_version nvcc)
+  message(FATAL_ERROR
+    "CMAKE_CUDA_ARCHITECTURES includes ${arch}, but the CUDA compiler is CUDA ${cuda_version} (${nvcc}).  CUDA 13 "
+    "dropped Volta (V100 / Titan V, sm_70) and Pascal: its nvcc cannot generate code for them.  Build for a V100 with "
+    "a CUDA 12.x toolkit - 12.8 or 12.9 - installed next to the newer one, and point CMake at its nvcc:\n"
+    "  cmake -S . -B build -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${arch} "
+    "-DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc\n"
+    "(Windows: -DCMAKE_CUDA_COMPILER=\"C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8/bin/nvcc.exe\".)  "
+    "./setup.sh / START-HERE.bat find or install CUDA 12.8 and do this for you; docs/volta/VOLTA.md has the details.  "
+    "RTX 50 cards (sm_120) need CUDA 13, so a V100 and an RTX 50 need two separate engines.")
+endfunction()
+
 if(STRATA_ENABLE_CUDA)
+  # Which nvcc is enable_language(CUDA) about to use?  (CMake's own order: CMAKE_CUDA_COMPILER, $CUDACXX, then PATH
+  # and $CUDA_PATH/bin.)  Only matters when the architectures below Turing were asked for, and only the nvcc's own
+  # `--version` is trusted: if it cannot be found or read, say nothing and let CMake report what it finds.
+  set(_strata_early_archs "${CMAKE_CUDA_ARCHITECTURES}")
+  if("${_strata_early_archs}" STREQUAL "" AND NOT "$ENV{CUDAARCHS}" STREQUAL "")
+    set(_strata_early_archs "$ENV{CUDAARCHS}")
+  endif()
+  if("${_strata_early_archs}" MATCHES "(^|;)(60|61|62|70|72)(-[a-z]+)?(;|$)")
+    set(_strata_early_arch "${CMAKE_MATCH_2}")
+    if(CMAKE_CUDA_COMPILER)
+      set(_strata_early_nvcc "${CMAKE_CUDA_COMPILER}")
+    elseif(NOT "$ENV{CUDACXX}" STREQUAL "")
+      set(_strata_early_nvcc "$ENV{CUDACXX}")
+    else()
+      unset(_strata_found_nvcc CACHE)             # a lookup, not a setting: never remembered between configures
+      find_program(_strata_found_nvcc NAMES nvcc PATHS "$ENV{CUDA_PATH}/bin")
+      set(_strata_early_nvcc "${_strata_found_nvcc}")
+      unset(_strata_found_nvcc CACHE)
+    endif()
+    if(_strata_early_nvcc)
+      execute_process(COMMAND "${_strata_early_nvcc}" --version OUTPUT_VARIABLE _strata_early_out
+                      ERROR_QUIET RESULT_VARIABLE _strata_early_rc)
+      if(_strata_early_rc EQUAL 0 AND "${_strata_early_out}" MATCHES "release ([0-9]+)\\.([0-9]+)")
+        if(CMAKE_MATCH_1 GREATER_EQUAL 13)
+          _strata_refuse_cuda13_for_old_arch("${_strata_early_arch}" "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}" "${_strata_early_nvcc}")
+        endif()
+      endif()
+    endif()
+  endif()
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
-  option(STRATA_EXPERIMENTAL_SM60 "community build for GPUs below compute capability 7.5: Pascal sm_60, Volta sm_70 (#236)" OFF)
+  option(STRATA_EXPERIMENTAL_SM60 "community build for Pascal GPUs (sm_60/61/62), below Volta; a V100 (sm_70) needs no flag" OFF)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
   endif()
@@ -76,25 +128,39 @@ if(STRATA_ENABLE_CUDA)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
     # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
     # portable fp32-FMA fallback, so RTX 20 (75), 30 (86), RTX 40 (89) and RTX 50 (120) build too.
-    # Pre-sm_75 is refused.
+    # Volta port (Vibe100): V100 / Titan V (70) builds too - the prompt attention and the prefill GEMMs have Volta
+    # tensor-core (HMMA) routes, the other tf32/mma kernels their FP32 fallbacks (docs/volta/PLAN.md).  Below Volta
+    # is refused unless STRATA_EXPERIMENTAL_SM60 asks for Pascal.
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    # STRATA_EXPERIMENTAL_SM60: a Pascal (sm_60, GP100-class) or Volta (sm_70, V100 / Titan V, #236) build.
-    # These sit below every architecture the kernels were written for, so two intrinsics are replaced below
-    # their arch - `__dp4a` (6.1+) and `__nanosleep` (7.0+) - in include/strata/kernels/dp4a.hpp, which is
-    # bit-exact for the first and merely a shorter pause for the second (sm_70 has both).  Community-tested,
-    # not in the ready-made engine; RTX 20/30/40/50 cards must use the release engine instead.  It needs a CUDA
-    # 12.x toolkit: CUDA 13 dropped sm_60 and sm_70 (nvcc fails CMake's compiler test with "compute_70").
-    if(_base LESS 75 AND NOT STRATA_EXPERIMENTAL_SM60)
-      message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
-        "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.  (A Pascal sm_60 or Volta sm_70 build is "
-        "-DSTRATA_EXPERIMENTAL_SM60=ON; upstream does not support it.)")
-    endif()
     if(_base LESS 60)
-      message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES '${CMAKE_CUDA_ARCHITECTURES}': even the experimental build "
-                          "needs compute capability 6.0 (sm_60) or newer")
+      message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES '${CMAKE_CUDA_ARCHITECTURES}': Strata supports NVIDIA GPUs of "
+                          "compute capability 7.0 (Volta: V100 / Titan V) and newer; anything older than Pascal "
+                          "(sm_60) cannot be built at all, even with -DSTRATA_EXPERIMENTAL_SM60=ON")
+    endif()
+    # STRATA_EXPERIMENTAL_SM60: a Pascal (sm_60, GP100-class; sm_61 / sm_62) build.  These sit below every
+    # architecture the kernels were written for, so two intrinsics are replaced below their arch - `__dp4a` (6.1+)
+    # and `__nanosleep` (7.0+) - in include/strata/kernels/dp4a.hpp, which is bit-exact for the first and merely a
+    # shorter pause for the second.  Community-tested, not in the ready-made engine.  Volta (sm_70) has both and
+    # is a supported target, not part of this flag; it is the arch of #236's original V100 experiment.
+    if(_base LESS 70 AND NOT STRATA_EXPERIMENTAL_SM60)
+      message(FATAL_ERROR
+        "Strata needs an NVIDIA GPU of compute capability 7.0 or newer (V100 / Titan V, RTX 20 / 30 / 40 / 50 series), "
+        "but CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}' (Pascal).  A Pascal sm_6x build is "
+        "-DSTRATA_EXPERIMENTAL_SM60=ON; upstream does not support it.")
+    endif()
+    # 71 to 74 are not desktop parts: 72 is the Jetson AGX Xavier SoC (ARM, shared memory, never run by this port),
+    # and 71 / 73 / 74 do not exist
+    if(_base GREATER 70 AND _base LESS 75 AND NOT STRATA_EXPERIMENTAL_SM60)
+      message(FATAL_ERROR
+        "CMAKE_CUDA_ARCHITECTURES '${CMAKE_CUDA_ARCHITECTURES}': sm_${_base} is not a desktop GPU.  (sm_72 is the "
+        "Jetson Xavier SoC, which this engine has never run on; there is no sm_71, sm_73 or sm_74.)  A V100 / Titan V "
+        "is sm_70.  -DSTRATA_EXPERIMENTAL_SM60=ON builds this arch anyway, untested.")
+    endif()
+    # CUDA 13 cannot make sm_70 (nor the Pascal sm_6x) code; the compiler CMake chose is known by now
+    if(_base LESS 75 AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+      _strata_refuse_cuda13_for_old_arch("${_base}" "${CMAKE_CUDA_COMPILER_VERSION}" "${CMAKE_CUDA_COMPILER}")
     endif()
     # #220 / #224: RTX 50 engines built with CUDA 12.8 crashed in the prompt path on Linux (13.0 and newer did not)
     if(_base GREATER_EQUAL 120 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
@@ -178,8 +244,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   if(STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
-    # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236)
+    # the runtime device check (src/core/device.cu) admits the cards this build was made for (#236): with the
+    # flag, Pascal (cc 6.0) as well; a normal build admits cc 7.0 (Volta) and newer without any definition
     target_compile_definitions(strata_core PRIVATE STRATA_EXPERIMENTAL_SM60=1)
+  endif()
+  if(STRATA_ENABLE_CUDA)
+    # what this binary has code for, so device.cu's "no code for this GPU" message can say what it was built for
+    string(REPLACE ";" "," _strata_arch_list "${CMAKE_CUDA_ARCHITECTURES}")
+    target_compile_definitions(strata_core PRIVATE STRATA_CUDA_ARCHS="${_strata_arch_list}")
   endif()
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -371,6 +443,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # Volta port: the FP16 tensor-core route of the prefill GEMMs against an FP64 reference (GPU, synthetic, no model);
+  # with the tests, or alone with -DSTRATA_PARITY_PREFILL_GEMM=ON.  Listed only once its source exists, so a tree
+  # without it still configures.  It calls cuBLAS itself for the upstream bf16 route, so it links it explicitly.
+  if((STRATA_BUILD_TESTS OR STRATA_PARITY_PREFILL_GEMM) AND STRATA_ENABLE_CUDA
+     AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/gemm_volta_parity.cpp")
+    add_executable(gemm_volta_parity src/prefill/gemm_volta_parity.cpp)
+    target_include_directories(gemm_volta_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(gemm_volta_parity PRIVATE strata_prefill CUDA::cudart CUDA::cublas)
+  endif()
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::hipblaslt)
