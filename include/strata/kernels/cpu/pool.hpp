@@ -29,6 +29,7 @@
 
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/platform/numa.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -62,6 +63,31 @@ struct ExpertJobMulti {
     /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
 };
+
+/// ================================ NUMA (Vibe100 WP-F) ================================
+///
+/// **WHAT THE POOL KNOWS ABOUT THE MACHINE'S NODES, AND WHAT IT DOES WITH IT.**  A dual-socket box has two memory
+/// controllers, and this pool is DRAM-bound, so a worker that reads its expert across the socket link is a worker running
+/// at a fraction of its core's bandwidth.  `PoolNuma` is the CPU layout the pool should respect; `ArenaMirror` (platform/
+/// numa.hpp) is one copy of the expert arena per node.  With both set the pool does two things, and nothing else changes:
+///
+///   * `physical_cores()` lists a core of the GPU's node FIRST (the host loop pins itself to `physical_cores(false)[0]`,
+///     and `physical_cores(true)` leaves that same core out), and then alternates between the nodes, so the workers - all
+///     of them, or the first `--pool-workers N` - are spread over both memory controllers;
+///   * each job's expert pointer is TRANSLATED, once per job, from the primary arena (the one the GPU's DMA reads) to the
+///     copy on the node of the thread that runs it: `p' = copy[node] + (p - primary)` when `p` lies inside the primary,
+///     else `p` (a staged or override buffer is left alone).  Jobs, the host loop and every caller keep primary pointers.
+///
+/// Correctness never depends on where a thread really runs: every copy holds the same bytes, so a worker that the OS moved,
+/// or a host that was never pinned, only loses speed.  A pool with no `PoolNuma` and no mirror behaves exactly as before.
+struct PoolNuma {
+    std::vector<std::vector<int>> node_cpus;   ///< logical CPUs of each node, indexed by node INDEX
+    int host_node = -1;                        ///< node index the host thread should live on (the GPU's); -1 = no preference
+    bool active() const { return node_cpus.size() >= 2; }
+};
+/// Process-wide, set once BEFORE the pool is built and before the session pins the host (both ask `physical_cores`).
+void set_pool_numa(const PoolNuma& p);
+void clear_pool_numa();
 
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
 /// worker.  On the 6-core/12-thread machine this project measures on, `hardware_concurrency()/2` workers on
@@ -112,6 +138,16 @@ public:
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
+
+    /// **THE MIRRORED ARENA** (see `PoolNuma`).  Call it between batches (the workers are parked): from then on every job
+    /// whose blob lies in `m.primary` is read from the copy of the node that runs it.  An inactive `m` switches it off.
+    void set_mirror(const strata::platform::ArenaMirror& m);
+    bool mirrored() const { return mir_len_ != 0; }
+    /// The node INDEX each worker (and the host) belongs to, or -1 (unpinned / a core no node claims).
+    int worker_node(int i) const { return i >= 0 && i < n_ ? wnode_[(size_t) i] : -1; }
+    int host_node() const { return hnode_; }
+    /// The logical CPU worker `i` is pinned to, or -1.
+    int worker_cpu(int i) const { return i >= 0 && i < n_ ? wcpu_[(size_t) i] : -1; }
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -179,6 +215,21 @@ private:
 
     int n_ = 0;
     bool host_works_ = true;
+    // ---- the mirrored arena.  `mir_len_ == 0` is "off" and makes `xl` the identity: `off < 0` never holds, so the hot path
+    // pays one subtract and one compare.  Written only by the host between batches, read by the workers after the
+    // epoch's acquire.
+    uintptr_t mir_lo_ = 0;
+    uint64_t mir_len_ = 0;
+    static constexpr int kMaxNodes = 8;
+    const uint8_t* mir_copy_[kMaxNodes] = {};
+    int mir_nodes_ = 0, mir_primary_ = 0;
+    std::vector<int> wnode_, weff_, wcpu_;   // per worker: its node index, the index it reads (valid), its CPU
+    int hnode_ = -1, heff_ = 0;              // the same for the host thread
+    /// `p` as read from node `node`'s copy.  Branch-free in the usual compiler's hands (a compare and a conditional move).
+    const uint8_t* xl(const uint8_t* p, int node) const {
+        const uintptr_t off = (uintptr_t) p - mir_lo_;
+        return off < mir_len_ ? mir_copy_[node] + off : p;
+    }
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;
     /// The host's own scratch when `host_works_`.  A separate object rather than a share of `scratch_[i]`,

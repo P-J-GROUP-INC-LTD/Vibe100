@@ -237,6 +237,15 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
+# ---- strata_numa (Vibe100 WP-F: NUMA mirroring of the CPU expert arena) -------------------------------------------
+# Topology from sysfs, mbind / move_pages by raw syscall, the mirror plan and the replica builder (include/strata/
+# platform/numa.hpp).  No libnuma and no GPU runtime: it is linked by the CPU pool (strata_kernels_cpu) and by the
+# arena (strata_core), and the CPU-only tests run on any machine.  Linux does the work; elsewhere it reports "not available".
+find_package(Threads REQUIRED)
+add_library(strata_numa STATIC src/platform/numa.cpp)
+target_include_directories(strata_numa PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_numa PUBLIC Threads::Threads PRIVATE strata_warnings)
+
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
@@ -256,7 +265,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
-  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_core PUBLIC strata_plan strata_warnings strata_numa ${_strata_gpu_runtime_target})
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)
@@ -407,6 +416,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(file_expert_source_test PRIVATE strata_engine)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
+  endif()
+  if(STRATA_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/numa_arena_test.cpp")
+    # Vibe100 WP-F: the mirrored resident arena end to end (ArenaExpertSource + the pool) on a fake two-node sysfs tree; no
+    # GPU needed (an arena that cannot be CUDA-registered is a path it handles)
+    add_executable(numa_arena_test tests/core/numa_arena_test.cpp)
+    target_link_libraries(numa_arena_test PRIVATE strata_engine)
+    add_test(NAME numa_arena_test COMMAND numa_arena_test)
+    set_tests_properties(numa_arena_test PROPERTIES TIMEOUT 120)
   endif()
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
@@ -839,7 +856,7 @@ else()
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 endif()
 find_package(Threads REQUIRED)
-target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
+target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads strata_numa)   # the pool's NUMA layout and mirror (WP-F)
 
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #
@@ -1064,6 +1081,19 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+
+  # Vibe100 WP-F (NUMA mirroring), CPU only, no GPU and no model, on a one-node machine: the topology parser on fake sysfs
+  # trees (1 and 2 nodes, "0-11,24-35" cpu lists, the GPU on node -1 / 0 / 1), the mirror planner's refusal paths (one
+  # node, mmap / low-RAM, shared arena, no room, taskset), the replica builder with a fake two-node topology, and the
+  # pool reading the replica by node (--synthetic: ten random experts; every path of the pool, bit for bit).
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(numa_test src/platform/numa_test.cpp)
+    target_link_libraries(numa_test PRIVATE strata_numa)
+    add_test(NAME numa_test COMMAND numa_test)
+    add_test(NAME pool_test_numa_mirror COMMAND pool_test --selftest --numa-mirror)
+    add_test(NAME pool_test_numa_mirror_novbmi COMMAND pool_test --selftest --numa-mirror)
+    set_tests_properties(pool_test_numa_mirror_novbmi PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX512_NOVBMI=1")
+  endif()
 
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)

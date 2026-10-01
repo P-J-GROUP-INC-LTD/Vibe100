@@ -764,6 +764,20 @@ only IQ2_S takes them by default; from Ice Lake / Zen 4 up every format does. Th
 the Cascade Lake i-quant choice) on a CPU that has VBMI, to compare the two on one machine, `STRATA_IQ512` takes the
 AVX-512 i-quant rows for every format on a Cascade Lake CPU, and `STRATA_NO_IQ512` never takes them.
 
+### NUMA mirroring (two-socket machines)
+
+On a PC with two NUMA nodes (a dual-socket workstation or server: two memory controllers, a link between the sockets) the CPU
+experts are read from RAM that is half on the wrong socket for half of the threads, and the CPU path is memory-bound, so that
+is its speed. With `--numa auto` (the default) the engine, on Linux with two or more NUMA nodes and the normal full-RAM expert
+arena, keeps **one copy of the arena in each node's RAM**: the copy on the GPU's node is the one the GPU reads (and the only one
+registered with CUDA), the other is bound to its node and filled by threads running there, and every CPU worker reads the copy of
+its own node. It costs one more arena of RAM per extra node (the arena is 23-50 GB), is refused with a one-line reason when a node
+lacks the room (`STRATA_NUMA_HEADROOM_GIB`, default 6, is kept free on top of the copy) and does nothing on a one-node PC, in the
+low-RAM modes (`--mmap-experts`, `--resident-experts`, `--resident-budget-gib`) or with `--shared-expert-arena`. `--numa off` keeps
+one copy; the environment `STRATA_NUMA_MIRROR=0|1` overrides the option for an A/B run. Do not combine it with `numactl
+--interleave=all` (the log warns). The startup log states the nodes, the GPU's node, the copy sizes and where a sample of each
+copy's pages was found. Details, the A/B and how to check it with `numastat`: [docs/volta/VOLTA.md](volta/VOLTA.md).
+
 The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
 
 ---

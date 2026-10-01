@@ -6,6 +6,7 @@
 
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -2200,8 +2201,53 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
-    PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
-                                     shared_arena_file, pack_hash);
+
+    // ================================ NUMA (WP-F): THE DECISION, BEFORE ANYTHING IS ALLOCATED ================================
+    //
+    // Whether to mirror, and on which node the primary goes (the GPU's), has to be known BEFORE the arena exists: the bind
+    // must precede the first touch, and the first touch is the CUDA registration inside the constructor.  See the class
+    // comment for what a mirror is.
+    namespace plat = strata::platform;
+    numa_notes_.clear();
+    replicas_.release();
+    pool_numa_ = strata::kernels::cpu::PoolNuma{};
+    const uint64_t arena_cap = want + (uint64_t) blob;
+    plat::NumaTopology topo;
+    plat::MirrorPlan plan;
+    {
+        topo = plat::numa_discover();
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); dev = 0; }
+        plat::numa_set_gpu(topo, strata::core::gpu_pci_bus_id(dev));
+        plat::MirrorInputs in;
+        in.mode = numa_mode_;
+        in.topo = &topo;
+        in.allowed_cpus = plat::numa_allowed_cpus();
+        in.arena_bytes = arena_cap;
+        in.full_ram = true;               // this class IS the full-RAM mode; mmap / low-RAM / budget use FileExpertSource
+        in.shared_file = !shared_arena_file.empty();
+        in.headroom = plat::numa_headroom_bytes();
+        uint64_t avail = 0;
+        if (available_memory_bytes(avail)) in.global_available = avail;
+        plan = plat::plan_arena_mirror(in);
+        if (topo.multi()) numa_notes_.push_back("NUMA: " + plat::numa_describe(topo));
+        if (!plan.mirror) {
+            // an explicit `--numa mirror` (or STRATA_NUMA_MIRROR=1) that cannot be honoured is a warning, not a note
+            numa_notes_.push_back(std::string("NUMA: ") + (numa_mode_ == plat::NumaMode::Mirror ? "WARNING: mirroring was asked for but " : "") +
+                                  "expert arena NOT mirrored (--numa " + plat::numa_mode_name(numa_mode_) + "): " + plan.why_not);
+        } else {
+            std::string det;
+            if (plat::numa_task_policy_interleaved(det))
+                numa_notes_.push_back("NUMA: WARNING: this process runs under a memory INTERLEAVE policy (" + det +
+                                      "; numactl --interleave?).  The mirror binds its copies explicitly (a per-mapping "
+                                      "policy outranks the process's), so they should still land on their nodes - the "
+                                      "placement lines below say whether they did - but the interleave spreads "
+                                      "everything else over both nodes and the combination is pointless: run without "
+                                      "numactl --interleave.");
+        }
+    }
+    PinnedArena* a = new PinnedArena(arena_cap, bounds, max_pinned_bytes,
+                                     shared_arena_file, pack_hash, plan.mirror ? plan.primary_node : -1);
     if (!a->valid()) {
         const std::string why = a->note;
         delete a;
@@ -2221,6 +2267,42 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         delete a;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
+    }
+    // ---- NUMA (WP-F): the replicas, now that the primary holds the experts.  A failed bind of the PRIMARY (a container that
+    // forbids mbind, say) leaves the arena as it always was and the mirror off: replicas whose readers cannot be told
+    // from the unbound primary would only cost memory.
+    if (plan.mirror && !a->bound && !topo.faked) {
+        numa_notes_.push_back("NUMA: expert arena NOT mirrored: the primary's bind to node " + std::to_string(plan.primary_node) +
+                              " failed (" + a->bind_note + "); one copy kept");
+    } else if (plan.mirror) {
+        plat::MirrorOptions mo;
+        mo.faked = topo.faked;
+        mo.threads = 12;
+        mo.lock = plat::arena_lock_allowed();
+        std::vector<std::string> log;
+        replicas_.build(a->data(), want, arena_cap, plan, topo, mo, log);
+        auto gib = [](uint64_t v) {
+            char t[32];
+            std::snprintf(t, sizeof t, "%.2f GiB", (double) v / 1073741824.0);
+            return std::string(t);
+        };
+        std::string line = std::string("NUMA: expert arena ") + (replicas_.count() > 0 ? "MIRRORED" : "NOT mirrored") +
+                           ": primary " + gib(arena_cap) + " on node " + std::to_string(plan.primary_node) + " [" +
+                           (plan.gpu_node_assumed ? "ASSUMED the GPU's node" : "the GPU's node") + "; " +
+                           (a->registered_bytes > 0 ? "CUDA-registered " + gib(a->registered_bytes) : std::string("not CUDA-registered")) +
+                           "; " + (a->bound ? "bound" : "UNBOUND") + "; the only copy any GPU DMA reads] + " +
+                           std::to_string(replicas_.count()) + " replica" + (replicas_.count() == 1 ? "" : "s") + " of " +
+                           gib(arena_cap) + " on node" + (plan.replica_nodes.size() == 1 ? "" : "s");
+        for (size_t i = 0; i < plan.replica_nodes.size(); ++i) line += (i ? "," : " ") + std::to_string(plan.replica_nodes[i]);
+        if (plan.gpu_node_assumed) line += " (GPU node: " + topo.gpu_note + ")";
+        numa_notes_.push_back(line);
+        for (const std::string& l : log) numa_notes_.push_back("NUMA:   " + l);
+        if (replicas_.count() > 0) {
+            for (const auto& n : topo.nodes) pool_numa_.node_cpus.push_back(n.cpus);
+            pool_numa_.host_node = topo.index_of_node(plan.primary_node);
+        } else {
+            numa_notes_.push_back("NUMA: no replica could be kept: one copy");
+        }
     }
     arena_ = a;
     base_ = a->data();
@@ -2252,6 +2334,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
+    // the replicas first: nothing may read a copy once the primary is going away, and the pool is told to stop using
+    // them by its owner (`ExpertPool::set_mirror` with an inactive mirror) before this runs
+    replicas_.release();
+    pool_numa_ = strata::kernels::cpu::PoolNuma{};
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;
@@ -2259,6 +2345,23 @@ void ArenaExpertSource::close() {
     base_ = nullptr;
     blobs_ = 0;
     n_expert_ = 0;
+}
+
+std::vector<std::string> numa_single_copy_notes(strata::platform::NumaMode mode, const std::string& why) {
+    namespace plat = strata::platform;
+    std::vector<std::string> out;
+    plat::NumaTopology topo = plat::numa_discover();
+    if (topo.multi()) out.push_back("NUMA: " + plat::numa_describe(topo));
+    plat::MirrorInputs in;
+    in.mode = mode;
+    in.topo = &topo;
+    in.full_ram = false;
+    in.not_full_ram_why = why;
+    in.arena_bytes = 1;
+    const plat::MirrorPlan p = plat::plan_arena_mirror(in);
+    out.push_back(std::string("NUMA: ") + (mode == plat::NumaMode::Mirror ? "WARNING: mirroring was asked for but " : "") +
+                  "experts NOT mirrored (--numa " + plat::numa_mode_name(mode) + "): " + p.why_not);
+    return out;
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {

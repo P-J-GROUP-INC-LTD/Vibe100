@@ -257,6 +257,10 @@ struct Options {
     bool no_host_worker = false;
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
+    /// Vibe100 WP-F, `--numa auto|mirror|off`: one copy of the resident expert arena per NUMA node, the GPU's node's copy
+    /// the one the card reads, each pool worker reading its own node's (docs/volta/VOLTA.md).  `auto` mirrors on a
+    /// multi-node Linux box when the arena is the full-RAM one and each node has room; STRATA_NUMA_MIRROR=0/1 overrides.
+    strata::platform::NumaMode numa = strata::platform::NumaMode::Auto;
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), 4 GiB of RAM headroom, and plain mmap
@@ -543,6 +547,16 @@ void usage() {
                  "  --mmap-experts       R2.1: opt OUT of the resident expert arena, back to MapViewOfFile.\n"
                  "                       The A/B arm: the mmap's rate depends on the OS page cache holding\n"
                  "                       34 GB, and measured 71.97 vs 34.78 ms/token cold vs warm.\n"
+                 "  --numa auto|mirror|off  Vibe100 WP-F, two-socket boxes: keep one copy of the resident expert\n"
+                 "                       arena on EACH NUMA node (the GPU's node's copy is the one the card reads and\n"
+                 "                       the only one CUDA registers), and let every CPU worker read its own node's\n"
+                 "                       copy instead of crossing the socket link.  auto (default): mirror when this is\n"
+                 "                       Linux with >= 2 nodes, the experts are the full-RAM arena (not --mmap-experts /\n"
+                 "                       the low-RAM modes / --shared-expert-arena) and every node has room for its copy\n"
+                 "                       plus STRATA_NUMA_HEADROOM_GIB (6); otherwise one copy, and the log says why.\n"
+                 "                       STRATA_NUMA_MIRROR=0|1 overrides this option (A/B); STRATA_NUMA_GPU_NODE=N\n"
+                 "                       names the GPU's node when the BIOS reports none.  Do not combine with\n"
+                 "                       numactl --interleave: the log warns.\n"
                  "  --shared-expert-arena FILE  Linux: back the resident arena with one MAP_SHARED file.\n"
                  "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
                  "                       A small header binds an existing backing file to the same pack.\n"
@@ -1173,6 +1187,12 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--numa") {
+            if (!strata::platform::parse_numa_mode(next("--numa"), o.numa)) {
+                std::fprintf(stderr, "strata generate: --numa takes auto, mirror or off\n");
+                return 2;
+            }
+        }
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = true;
         else if (a == "--resident-experts") {
@@ -2418,6 +2438,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: experts via mmap (--mmap-experts; %s)\n",
                      src.gguf_mode() ? "the GGUF shards in place, no experts.bin" : "the A/B arm of R2.1");
         srcp = &src;
+        // Vibe100 WP-F: one copy, the OS's page cache decides where it sits - said once, with the reason
+        {
+            std::string env_note;
+            const strata::platform::NumaMode nm = strata::platform::numa_mode_with_env(o.numa, &env_note);
+            if (!env_note.empty()) std::fprintf(stderr, "strata generate: NUMA: %s\n", env_note.c_str());
+            for (const std::string& l : strata::core::numa_single_copy_notes(
+                     nm, o.resident_cpu_experts
+                             ? "--resident-experts / --resident-budget-gib: only the experts the GPU cache does not hold are "
+                               "copied into RAM, the rest are read from the file"
+                             : "--mmap-experts, the low-RAM mode: the experts are read from the file through the OS cache"))
+                std::fprintf(stderr, "strata generate: %s\n", l.c_str());
+        }
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
         // Under WDDM (Windows, WSL2), a multi-GPU run (a layer split, or remote experts) starts with at most 8 GiB of
@@ -2434,12 +2466,24 @@ int main(int argc, char** argv) {
         else if (pin_wddm_cap)
             std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
                                  "(STRATA_ARENA_PIN_GIB changes it)\n");
+        // Vibe100 WP-F: the NUMA mirror is decided (and the primary bound to the GPU's node) inside `open`, before the first
+        // page is touched; the pool is told below, once it exists.
+        {
+            std::string env_note;
+            arena_src.set_numa(strata::platform::numa_mode_with_env(o.numa, &env_note));
+            if (!env_note.empty()) std::fprintf(stderr, "strata generate: NUMA: %s\n", env_note.c_str());
+        }
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
+            for (const std::string& l : arena_src.numa_notes()) std::fprintf(stderr, "strata generate: %s\n", l.c_str());
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
+        for (const std::string& l : arena_src.numa_notes()) std::fprintf(stderr, "strata generate: %s\n", l.c_str());
+        // The pool's layout must be set BEFORE it is built (and before the session pins the host): the host core is chosen
+        // on the GPU's node and the workers alternate between the nodes (pool.hpp, `PoolNuma`).
+        if (arena_src.mirror().active()) strata::kernels::cpu::set_pool_numa(arena_src.pool_numa());
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
@@ -2461,6 +2505,24 @@ int main(int argc, char** argv) {
         srcp = &arena_src;
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    // Vibe100 WP-F: from here every job's expert pointer is translated to the copy of the node its thread runs on.  The
+    // source keeps handing out PRIMARY pointers (the only ones a GPU DMA may see); the pool does the rest.
+    if (arena_src.mirror().active()) {
+        pool.set_mirror(arena_src.mirror());
+        std::vector<int> per((size_t) arena_src.pool_numa().node_cpus.size(), 0);
+        int unknown = 0;
+        for (int i = 0; i < pool.workers(); ++i) {
+            const int nd = pool.worker_node(i);
+            if (nd >= 0 && nd < (int) per.size()) ++per[(size_t) nd]; else ++unknown;
+        }
+        std::string wl;
+        for (size_t i = 0; i < per.size(); ++i) wl += (i ? ", " : "") + std::string("node") + std::to_string(i) + "=" + std::to_string(per[i]);
+        const std::vector<int> host_cores = strata::kernels::cpu::physical_cores(false);
+        std::fprintf(stderr, "strata generate: NUMA: expert pool workers per node: %s%s; the host thread goes to core %d on node %d "
+                             "(the GPU's); every thread reads its own node's copy of the experts\n",
+                     wl.c_str(), unknown ? (", " + std::to_string(unknown) + " on no known node").c_str() : "",
+                     host_cores.empty() ? -1 : host_cores[0], pool.host_node());
+    }
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both

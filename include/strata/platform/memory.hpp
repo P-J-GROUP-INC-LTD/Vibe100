@@ -20,6 +20,10 @@ struct LockResult {
 /// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden.
 LockResult lock_resident(void* p, uint64_t bytes);
 
+/// The arena lock policy: false when `STRATA_ARENA_LOCK=0` (the A/B arm that leaves the arena pageable), true otherwise.
+/// One place for the question the pinned arena (pinned.cu) and the NUMA replicas (numa.cpp's caller) both ask.
+bool arena_lock_allowed();
+
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
 

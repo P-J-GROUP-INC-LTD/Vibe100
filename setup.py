@@ -1857,9 +1857,30 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
+def apply_numa(cfg: dict) -> bool:
+    """Vibe100 WP-F: the engine's `--numa auto|mirror|off` (one copy of the expert arena per NUMA node, so each CPU worker
+    reads its own socket's memory - docs/volta/VOLTA.md).  The setting is kept in the model's config as "numa" and shows in
+    its engine arguments only when it is not the engine's default: "auto" (or none) passes nothing, so a config made before
+    this existed, and a one-socket PC, are untouched.  A config without a "numa" setting is left alone (a `--numa` someone
+    wrote into its arguments by hand stays).  Returns whether cfg["args"] changed."""
+    if "numa" not in cfg:
+        return False
+    args = list(cfg.get("args") or [])
+    new = list(args)
+    while "--numa" in new:
+        i = new.index("--numa")
+        del new[i:i + 2]
+    if cfg.get("numa") in ("mirror", "off"):
+        new += ["--numa", cfg["numa"]]
+    if new == args:
+        return False
+    cfg["args"] = new
+    return True
+
+
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
           layer_split=None, keep=None) -> int:
-    """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab)."""
+    """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab, --numa)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
@@ -1870,6 +1891,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         ok("saved for this model: " + ", ".join("api key" if k == "api_key" else f"{k.replace('_', ' ')} {v}"
                                                 for k, v in keep.items()))
+    if apply_numa(cfg):                                  # --numa lives in the engine's arguments, where the server reads it
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
@@ -2109,6 +2132,13 @@ def main() -> int:
                          "(for a PC with a big GPU and little RAM); auto: when the experts would not fit the RAM. In "
                          "this mode the experts the GPU does not hold are copied into RAM once when they fit (resident), "
                          "else read through the OS file cache (mmap); resident / mmap force one of the two")
+    ap.add_argument("--numa", choices=["auto", "mirror", "off"],
+                    help="two-socket PCs (a Xeon workstation with a V100: docs/volta/VOLTA.md): keep one copy of the "
+                         "model's experts in the RAM of EACH socket so every CPU thread reads its own socket's memory "
+                         "instead of crossing the link between them. auto (default, nothing is passed): mirror when the "
+                         "PC has two NUMA nodes, the experts fit twice and each node has the room; mirror: ask for it "
+                         "(the engine still says why when it cannot); off: one copy. Saved for the model. Needs an "
+                         "engine built from this source (the Volta build). Do not combine with numactl --interleave")
     ap.add_argument("--backend", choices=["cuda", "hip"],
                     help="cuda = NVIDIA (default), hip = AMD RX 7900 / 7800 / 7700 XT, RX 9060 XT / 9070 / AI PRO R9700 on "
                          "Linux (experimental; chosen by itself when the PC has no NVIDIA card Strata can use)")
@@ -2166,13 +2196,13 @@ def main() -> int:
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         calibrate_config(pick_cfg)
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab})
+                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab, "numa": a.numa})
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         if not a.build:
             update_installed_engine(a.prebuilt)
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab})
+                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab, "numa": a.numa})
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -2180,7 +2210,7 @@ def main() -> int:
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab})
+                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab, "numa": a.numa})
 
     # ---- 1. the PC
     step(1, "checking your PC")
@@ -2620,6 +2650,9 @@ def main() -> int:
         cfg["api_key"] = a.api_key
     if a.draft_vocab:
         cfg["draft_vocab"] = a.draft_vocab
+    if a.numa:                                         # WP-F: "auto" is the default and passes nothing (apply_numa)
+        cfg["numa"] = a.numa
+        apply_numa(cfg)
     if vision != "none":
         cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj), "model": str(shards[0]),
                          "gpu": vision == "gpu", "max_tokens": VISION[vision]["max_tokens"]}

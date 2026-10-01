@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -26,6 +27,33 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
 }  // namespace
+
+namespace {
+std::mutex g_numa_mu;
+PoolNuma g_numa;   // empty (inactive) unless the engine found a NUMA machine and is mirroring the arena
+
+PoolNuma numa_snapshot() {
+    std::lock_guard<std::mutex> lk(g_numa_mu);
+    return g_numa;
+}
+
+// The node INDEX that owns logical CPU `cpu` in `pn`, or -1.
+int numa_node_of(const PoolNuma& pn, int cpu) {
+    for (size_t i = 0; i < pn.node_cpus.size(); ++i)
+        if (std::find(pn.node_cpus[i].begin(), pn.node_cpus[i].end(), cpu) != pn.node_cpus[i].end()) return (int) i;
+    return -1;
+}
+}  // namespace
+
+void set_pool_numa(const PoolNuma& p) {
+    std::lock_guard<std::mutex> lk(g_numa_mu);
+    g_numa = p;
+}
+
+void clear_pool_numa() {
+    std::lock_guard<std::mutex> lk(g_numa_mu);
+    g_numa = PoolNuma{};
+}
 
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
@@ -89,6 +117,43 @@ std::vector<int> physical_cores(bool skip_first) {
         cores.push_back(cpu);
     }
 #endif
+    // ---- NUMA (WP-F): with a mirrored arena the order is part of the design.  The FIRST core is the host loop's (the
+    // session pins itself to `physical_cores(false)[0]` and the pool leaves `physical_cores(true)` without it), and it must
+    // be on the GPU's node: the host drives the GPU's doorbell and reads the pinned buffers the card writes.  The rest then
+    // ALTERNATE between the nodes, starting with a node other than the host's (the host also drains, so it already counts
+    // for its own node), so that `--pool-workers N` spreads N workers over both memory controllers instead of filling the
+    // first socket.  With no mirror the legacy order (ascending, one per physical core) is untouched.
+    const PoolNuma pn = numa_snapshot();
+    if (pn.active() && !cores.empty()) {
+        std::vector<std::vector<int>> by(pn.node_cpus.size());
+        std::vector<int> rest;
+        for (int c : cores) {
+            const int ni = numa_node_of(pn, c);
+            (ni >= 0 ? by[(size_t) ni] : rest).push_back(c);
+        }
+        std::vector<int> ordered;
+        int h = pn.host_node;
+        if (h < 0 || h >= (int) by.size() || by[(size_t) h].empty()) h = -1;
+        if (h >= 0) {
+            ordered.push_back(by[(size_t) h].front());
+            by[(size_t) h].erase(by[(size_t) h].begin());
+        } else {
+            h = 0;   // no usable preference: the legacy first core stays the host's
+            ordered.push_back(cores.front());
+            for (auto& b : by) b.erase(std::remove(b.begin(), b.end(), cores.front()), b.end());
+            rest.erase(std::remove(rest.begin(), rest.end(), cores.front()), rest.end());
+        }
+        std::vector<size_t> next(by.size(), 0);
+        for (bool took = true; took;) {
+            took = false;
+            for (size_t k = 1; k <= by.size(); ++k) {
+                const size_t ni = ((size_t) h + k) % by.size();
+                if (next[ni] < by[ni].size()) { ordered.push_back(by[ni][next[ni]++]); took = true; }
+            }
+        }
+        ordered.insert(ordered.end(), rest.begin(), rest.end());
+        cores.swap(ordered);
+    }
     if (skip_first && !cores.empty()) cores.erase(cores.begin());
     return cores;
 }
@@ -179,6 +244,25 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
     const std::vector<int> cores = physical_cores(true);
     n_ = n_workers > 0 ? n_workers : (int) cores.size();
     if (n_ < 1) n_ = 1;
+    // NUMA (WP-F): each worker's node, from the core it is pinned to.  Without a `PoolNuma` every entry is -1 and nothing
+    // below ever reads it.
+    {
+        const PoolNuma pn = numa_snapshot();
+        wnode_.assign((size_t) n_, -1);
+        weff_.assign((size_t) n_, 0);
+        wcpu_.assign((size_t) n_, -1);
+        for (int i = 0; i < n_; ++i) {
+            const int core = pin && i < (int) cores.size() ? cores[(size_t) i] : -1;
+            wcpu_[(size_t) i] = core;
+            if (pn.active() && core >= 0) wnode_[(size_t) i] = numa_node_of(pn, core);
+        }
+        if (pn.active()) {
+            // the host loop pins itself to `physical_cores(false)[0]` (session.cpp), so ITS node is the node of that core -
+            // which is `pn.host_node` unless that node had no core to give (then the legacy first core stays the host's)
+            const std::vector<int> all = physical_cores(false);
+            hnode_ = !all.empty() ? numa_node_of(pn, all.front()) : pn.host_node;
+        }
+    }
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
@@ -204,6 +288,25 @@ ExpertPool::~ExpertPool() {
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();
     for (auto& t : threads_) t.join();
+}
+
+void ExpertPool::set_mirror(const strata::platform::ArenaMirror& m) {
+    if (!m.active()) {
+        mir_len_ = 0;
+        mir_lo_ = 0;
+        mir_nodes_ = 0;
+        return;
+    }
+    mir_nodes_ = (std::min)((int) m.copy.size(), kMaxNodes);
+    mir_primary_ = m.primary_index >= 0 && m.primary_index < mir_nodes_ ? m.primary_index : 0;
+    for (int i = 0; i < kMaxNodes; ++i)
+        mir_copy_[i] = i < mir_nodes_ && m.copy[(size_t) i] != nullptr ? m.copy[(size_t) i] : m.primary;
+    // A thread whose node holds no copy (or is unknown) reads the primary: the identity translation.
+    auto eff = [&](int node) { return node >= 0 && node < mir_nodes_ ? node : mir_primary_; };
+    for (int i = 0; i < n_; ++i) weff_[(size_t) i] = eff(wnode_[(size_t) i]);
+    heff_ = eff(hnode_);
+    mir_lo_ = (uintptr_t) m.primary;
+    mir_len_ = m.bytes;   // last: `xl` is the identity until the whole description is in place
 }
 
 void ExpertPool::publish() {
@@ -340,6 +443,8 @@ void ExpertPool::wait_done(int n) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
+    // The copy this thread reads (WP-F): its node's, or the primary when no mirror is set.  Fixed for the whole batch.
+    const int node = id >= 0 ? weff_[(size_t) id] : heff_;
     for (;;) {
         const int ci = claim(epoch);
         if (ci < 0) break;
@@ -348,15 +453,15 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
         if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
-            s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
+            s2_expert_vnni_q(xl(j.blob, node), *j.act, j.out, scratch);
         } else if (mode_ == 1) {
             const int e = (int) i / parts_a_, part = (int) i % parts_a_;
             const int r0 = FF * part / parts_a_, r1 = FF * (part + 1) / parts_a_;
-            s2_expert_gu_rows(jobs_[e].blob, *jobs_[e].act, split_[(size_t) e].ff, r0, r1);
+            s2_expert_gu_rows(xl(jobs_[e].blob, node), *jobs_[e].act, split_[(size_t) e].ff, r0, r1);
         } else if (mode_ == 2) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
-            s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+            s2_expert_down_rows(xl(jobs_[e].blob, node), split_[(size_t) e].a2, jobs_[e].out, r0, r1);
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
             const int per = mode_ == 5 ? FF : H;
@@ -365,6 +470,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
+                // ONE translation per job: every address below (gate, up at `up_off`, down at `down_off`) is an offset
+                // from this base, so a job never reads half from one node's copy and half from another's.
+                const uint8_t* mb = xl(mjobs_[e].blob, node);
                 if (mode_ == 5 && nfmt_->gu_type == 42) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
@@ -372,25 +480,25 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     float* up[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
                     const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+                    q2_rows_any(mb, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+                    q2_rows_any(mb + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         for (int r = r0; r < r1; ++r)
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    native_gu_rows(*nfmt_, mb, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                 } else if (nfmt_->d_type == 42) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
+                    q2_rows_any(mb + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
                                 mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 } else {
                     const void* hq[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    native_down_rows(*nfmt_, mb, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
                 r += r1 - r0;
             }
@@ -402,14 +510,15 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
+                const uint8_t* mb = xl(mjobs_[e].blob, node);   // see mode 5: one translation per job
                 if (mode_ == 3) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    s2_expert_gu_rows_multi(mjobs_[e].blob, mjobs_[e].act, mjobs_[e].nt, ff, r0, r1);
+                    s2_expert_gu_rows_multi(mb, mjobs_[e].act, mjobs_[e].nt, ff, r0, r1);
                 } else {
                     const ActQ* a2[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    s2_expert_down_rows_multi(mjobs_[e].blob, a2, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    s2_expert_down_rows_multi(mb, a2, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
                 r += r1 - r0;
             }
@@ -519,7 +628,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
 void ExpertPool::run(ExpertJob* jobs, int n) {
     if (n <= 0) return;
     if (n_ == 1) {   // no workers: run inline, so a single-core machine still produces a token
-        for (int i = 0; i < n; ++i) s2_expert_vnni_q(jobs[i].blob, *jobs[i].act, jobs[i].out, scratch_[0]);
+        for (int i = 0; i < n; ++i) s2_expert_vnni_q(xl(jobs[i].blob, heff_), *jobs[i].act, jobs[i].out, scratch_[0]);
         return;
     }
     // Wait for every worker to be parked BEFORE touching the batch, so the publish below is the only thing
@@ -556,7 +665,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
             hstate_.store(ci, std::memory_order_relaxed);
             hstate_ms_.store(now_ms(), std::memory_order_relaxed);
             const ExpertJob& j = jobs_[ci];
-            s2_expert_vnni_q(j.blob, *j.act, j.out, host_scratch_);
+            s2_expert_vnni_q(xl(j.blob, heff_), *j.act, j.out, host_scratch_);
             done_.fetch_add(1, std::memory_order_release);
         }
     }

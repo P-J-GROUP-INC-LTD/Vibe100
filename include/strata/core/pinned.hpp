@@ -27,6 +27,10 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 /// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
 int arena_pin_cap_gib();
 
+/// WP-F: the PCI address of CUDA/HIP device `device` ("0000:3B:00.0"), or empty when the runtime will not say.  The NUMA code
+/// reads the GPU's node from `/sys/bus/pci/devices/<it>/numa_node`.
+std::string gpu_pci_bus_id(int device);
+
 struct PinnedArena {
     void* base = nullptr;
     uint64_t capacity = 0;
@@ -49,8 +53,18 @@ struct PinnedArena {
     /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a
     /// small header and is refused when its stored hash does not match.  Empty `shared_file` preserves the
     /// existing allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
+    ///
+    /// WP-F, `numa_node` >= 0 (a NUMA node id, Linux): the reservation is bound to that node with `mbind(MPOL_BIND)` right
+    /// after it is mapped and BEFORE `cudaHostRegister` (or anything else) touches a page, so the pages the driver pins
+    /// - and every one the loader writes - are allocated on that node and only there.  This is the PRIMARY copy of a
+    /// mirrored arena: it lives on the GPU's node, it is the one CUDA registers, and it is the only one a GPU DMA ever
+    /// reads.  `bound` / `bind_note` report the outcome (a failed bind leaves a usable, unbound arena).  A hugetlb mapping
+    /// is attempted only when that node's own 2 MiB pool holds the arena (a bound mapping on a dry pool is a SIGBUS).
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes = 0,
-                const std::string& shared_file = {}, uint64_t shared_pack_hash = 0);
+                const std::string& shared_file = {}, uint64_t shared_pack_hash = 0, int numa_node = -1);
+    int bind_node = -1;               ///< the node it was asked to be bound to (-1: not asked)
+    bool bound = false;               ///< the bind succeeded
+    std::string bind_note;            ///< "mbind(MPOL_BIND) to node 1" / "mbind to node 1 FAILED (...)"
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base

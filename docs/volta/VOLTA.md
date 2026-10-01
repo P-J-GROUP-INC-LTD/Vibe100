@@ -143,18 +143,79 @@ building anything on top.
 
 ## Getting the speed
 
-**NUMA (two-socket servers).** Most V100 boxes are dual-socket Xeons. Linux puts a program's memory on the socket
-that first touched it; the engine loads 35-55 GB of experts, and CPU threads on both sockets then read them, so many of those
-reads cross to the other socket, and the pinned memory the card copies from may sit far from the card's PCIe lanes.
-Interleaving the model's memory across the sockets evens that out:
+**NUMA (two-socket servers).** Most V100 boxes are dual-socket Xeons, and the CPU's share of the work is limited by
+memory bandwidth. Linux puts a program's memory on the socket that first touched it; the engine loads 23-50 GB of experts
+into RAM, and CPU threads on both sockets then read them, so about half of those reads cross the link between the sockets
+(UPI on a Xeon), and the pinned memory the card copies from may sit far from the card's PCIe lanes. The engine now fixes this
+itself by **mirroring the experts: one full copy in each socket's RAM, every CPU thread reading its own socket's copy**
+(`--numa auto`, the default). Someone who tried full mirroring of Qwen3.8-Flash-Next in another engine on a dual-Xeon
+V100 box (Dell Precision 7920, 2x Xeon Gold 6226) reported about 2x decode; that figure is theirs, not measured with
+this engine - the A/B below is how to find out what it is on yours.
+
+What `--numa auto` does, on Linux with two or more NUMA nodes, when the experts are the normal full-RAM arena (the default):
+
+- the **primary copy** goes on the GPU's node (read from `/sys/bus/pci/devices/<card>/numa_node`; a BIOS that says `-1`
+  gives no answer, and the engine then assumes node 0 and says so in the log). It is bound to that node before its first
+  page is touched, registered with CUDA as before, and it is the **only copy the card ever reads** (expert cache fills,
+  `--pcie-frac` misses, prompt streaming);
+- one **replica** goes on every other node that has CPUs: bound to that node, filled by threads running there, locked in RAM
+  like the arena (`STRATA_ARENA_LOCK=0` leaves it pageable), never registered with CUDA;
+- every CPU worker, and the host thread's own share of the drain, reads the copy of **its own node**; the host thread that
+  drives the card is put on a core of the **GPU's node**, and the workers are spread over both nodes;
+- it costs one more arena of RAM per extra node (23-50 GB, 384 GB on this box) and a few seconds at start: the replica is
+  copied from the primary by threads pinned to the replica's node. A node must have room for its copy plus
+  `STRATA_NUMA_HEADROOM_GIB` (default 6) of other memory, counting the file cache it can reclaim, or the engine keeps one copy.
+
+It keeps **one copy, and prints one line saying why**, when: the PC has one NUMA node (or BIOS node interleaving hides the
+second one - turn that off for this); the experts are not the full-RAM arena (`--mmap-experts`, `--resident-experts`,
+`--resident-budget-gib`: they sit in the OS file cache, which the engine does not place; `--shared-expert-arena`); every CPU
+the process may use is on the GPU's node (`taskset`, `numactl --cpunodebind`); a node lacks the room; or `mbind` is refused
+(some containers). The startup log shows the whole decision:
 
 ```
-numactl --interleave=all ./setup.sh            # or ./run-<model>.sh
+strata generate: NUMA: 2 NUMA nodes: node0 cpus 0-11,24-35 (...), node1 cpus 12-23,36-47 (...); GPU 0000:3b:00.0 on node 1
+strata generate: NUMA: expert arena MIRRORED: primary 31.64 GiB on node 1 [the GPU's node; CUDA-registered 31.64 GiB; bound; the only copy any GPU DMA reads] + 1 replica of 31.64 GiB on node 0
+strata generate: NUMA:   primary on node 1: 64 of 64 sampled pages on node 1
+strata generate: NUMA:   replica on node 0: 4 KiB pages; mbind(MPOL_BIND) to node 0; 31.64 GiB copied in 2.9 s; 64 of 64 sampled pages on node 0; mlock
+strata generate: NUMA: expert pool workers per node: node0=11, node1=12; the host thread goes to core 12 on node 1 (the GPU's); ...
 ```
 
-or turn on **node interleaving** in the BIOS. `nvidia-smi topo -m` shows which socket the GPU hangs off. This is
-how such boxes usually behave, not something measured with this engine: `profile_decode.sh` before and after tells you
-whether it matters on yours.
+(The lines are the shape, not output from a V100: the placement lines are `move_pages` queries on a sample of pages after
+the copy; a replica whose pages are not on its node is dropped and the line says `DROPPED`. If a replica's line ends in
+`mlock failed (... raise ulimit -l)`, the replica stays pageable: `ulimit -l unlimited` (a systemd unit: `LimitMEMLOCK=infinity`)
+locks it; with no swap configured that changes nothing.)
+
+Controls: `--numa auto|mirror|off` (`mirror` asks for it; the engine still refuses, with the reason, where it cannot), set
+at setup or later with `./setup.sh --numa off` (saved for the model), and the environment `STRATA_NUMA_MIRROR=0` / `=1`,
+which overrides the option for one run - the A/B switch. If the log says the GPU's node was ASSUMED (the BIOS reports
+`numa_node -1`), tell it with `STRATA_NUMA_GPU_NODE=N` (what `nvidia-smi topo -m` shows: the card's CPU affinity).
+
+**Do not combine it with `numactl --interleave=all`** (or BIOS node interleaving): interleaving spreads every page of every
+allocation over both nodes, which is the opposite of placing a copy on each. The mirror binds its copies explicitly, and a
+per-mapping policy outranks the process's, so they should still land where they belong - but then the interleave only
+spreads everything else, and the engine prints a warning when it sees a process-wide interleave policy. The interleave
+remains the right quick fix when the mirror cannot be used (low-RAM modes, not enough RAM for two copies):
+
+```
+STRATA_NUMA_MIRROR=0 numactl --interleave=all ./setup.sh            # or ./run-<model>.sh
+```
+
+**Checking it on the box.** `nvidia-smi topo -m` shows which socket the GPU hangs off (the engine's log must agree). While the
+model runs, `numastat -p $(pgrep -f strata)` should show roughly one arena's worth of memory on EACH node (the primary on the
+GPU's node, the replica on the other); with `STRATA_NUMA_MIRROR=0` the same command shows the arena split by whichever threads
+touched it first. To measure the gain, run the same prompt three times and compare tokens/s and the pool's `drain` time in
+`--stats` (the CPU path is memory-bound, so the drain is what shrinks): `STRATA_NUMA_MIRROR=0` (before), the default (mirror),
+and `STRATA_NUMA_MIRROR=0 numactl --interleave=all` (the old quick fix). The signs of it working: the mirror's drain time is
+clearly below both, and `pcm-memory` / `mlc` shows UPI traffic during decode falling to a fraction of the other runs'.
+If mirror is not faster than interleave, look first at whether the log says the primary landed on the GPU's node.
+
+**BIOS (Dell Precision 7920 and similar dual-Xeon workstations).** In the system setup: *Memory Settings → Node
+Interleaving: **Disabled*** (with it enabled Linux sees one blended node and the engine cannot put a copy next to each
+socket — the mirror and the DeepSeek port's per-socket split both need the two nodes); *Sub-NUMA Clustering: Disabled*
+(2 nodes, not 4); *System Profile: Performance* (or the highest-performance profile offered). The 7920's PCIe slots are
+divided between the two CPUs, so the slot decides which socket owns the card: `nvidia-smi topo -m` shows it, and a
+second GPU is best placed on the other CPU's slots. On Linux, `kernel.numa_balancing=0` (`sysctl`) keeps the kernel from
+migrating pages behind the engine's back, and the `performance` CPU governor avoids clock ramp-up delays.
 
 **PCIe Gen3.** A V100 talks to the host at PCIe 3.0 x16 (about 12 GB/s in practice), slower than the Gen4 / Gen5 of
 newer cards. Strata copies the experts the card is missing over PCIe, or computes them on the CPU; how much goes each way
@@ -175,6 +236,10 @@ longer context takes VRAM from the experts' cache (more in [DETAILS.md](../DETAI
 
 - **Nothing is measured on a V100 by this port.** No speed, no quality, no memory number. Gate 0 in the plan is
   exactly that: numbers from a V100.
+- **The NUMA mirror has only run against FAKE two-node topologies** (a one-node VM with a made-up sysfs tree: the parser, the
+  planner, the replica copy, and every pool path reading the right copy are tested, bit for bit). On a real two-socket box
+  it is unverified: that the primary lands on the GPU's node, that `mbind` is allowed where you run it, that the replica's
+  pages are found on their node, and the speed - the log's placement lines and the A/B above are how to find out.
 - **The long-context selection runs on the ordinary FP32 cores.** Strata's block-score selection has a tensor-core kernel
   for Ampere and newer; on Volta the engine uses its older warp kernel (correct, slower). It only matters for long
   prompts, and whether it shows in the profile is for step 4 above to say.

@@ -1,6 +1,9 @@
 // src/platform/memory.cpp - see include/strata/platform/memory.hpp.
 #include "strata/platform/memory.hpp"
 
+#include <cstdlib>
+#include <string>
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -13,6 +16,11 @@
 #endif
 
 namespace strata::platform {
+
+bool arena_lock_allowed() {
+    const char* e = std::getenv("STRATA_ARENA_LOCK");
+    return e == nullptr || std::string(e) != "0";
+}
 
 #if defined(_WIN32)
 LockResult lock_resident(void* p, uint64_t bytes) {

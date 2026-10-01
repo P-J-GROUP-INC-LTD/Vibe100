@@ -4,9 +4,9 @@
 #   1. confirm the card: nvidia-smi must say compute capability 7.0 (a Quadro P4000 is 6.1 - Pascal, no tensor cores -
 #      and a baseline from it says nothing about a V100: Gate 0), with a loud banner when it does not
 #   2. the NUMA picture: `numactl -H`, which node the GPU hangs off, and the advice for a dual-socket Xeon
-#      (the engine pins ~35-60 GB of experts in RAM that the CPU pool streams every token; first-touch puts them all on
-#      one socket and leaves half the memory bandwidth idle: run under `numactl --interleave=all`, or turn on BIOS
-#      node interleaving)
+#      (the engine keeps 23-50 GB of experts in RAM that the CPU pool streams every token; since WP-F it MIRRORS them,
+#      one copy per socket (--numa auto, the default) - keep BIOS node interleaving OFF so both nodes are visible;
+#      --numa-interleave runs the old quick fix instead, `numactl --interleave=all` with the mirror off, for the A/B)
 #   3. one engine run with `--stats` on a fixed prompt, N tokens
 #   4. the pure-GPU floor (`--gpu-only-full`: pre + post graphs + LM head, no CPU pool) so the GPU's idle share is a number
 #   5. `nsys profile --trace=cuda,nvtx,osrt` of the same decode, then `nsys stats --report cuda_gpu_kern_sum,
@@ -201,15 +201,15 @@ numa_report() {
   if [[ "$nodes" -gt 1 ]]; then
     local policy; policy="$(numactl --show 2>/dev/null | awk '/^policy:/ {print $2}')"
     if [[ "$NUMA_INTERLEAVE" == 1 ]]; then
-      echo "  -> the engine will run under 'numactl --interleave=all' (--numa-interleave)."
+      echo "  -> this run uses the old quick fix: 'numactl --interleave=all' with the engine's mirror OFF (--numa-interleave)."
     elif [[ "$policy" == "interleave" ]]; then
-      echo "  -> this shell already runs with an interleave policy: good."
+      echo "  WARNING: this shell already runs with an interleave policy; the engine's NUMA mirror (the default) binds its"
+      echo "  copies explicitly, but for a clean measurement run without numactl (mirror) or with --numa-interleave (A/B)."
     else
-      echo "  ADVICE: $nodes NUMA nodes (a dual-socket machine).  The engine's expert arena is written by one thread and"
-      echo "  lands on one node ('first touch'), so the CPU pool reads it all through one socket's memory controllers."
-      echo "  Run under 'numactl --interleave=all' (this script: --numa-interleave) or enable node interleaving in the BIOS,"
-      echo "  and compare tok/s.  The alternative, 'numactl --cpunodebind=${gpu_node:-N} --membind=${gpu_node:-N}', only helps"
-      echo "  when the experts fit one socket's RAM and its cores suffice."
+      echo "  $nodes NUMA nodes (a dual-socket machine).  The engine mirrors its expert arena on every node by default"
+      echo "  (--numa auto: the startup log's 'NUMA:' lines say what it did).  A/B it: this script as is (mirror), with"
+      echo "  STRATA_NUMA_MIRROR=0 (one copy, first touch), and with --numa-interleave (numactl --interleave=all, mirror off)."
+      echo "  Keep BIOS 'Node Interleaving' disabled: with it on the OS sees one node and nothing can be placed."
     fi
   fi
 }
@@ -284,7 +284,8 @@ run() {
 # engine_cmd EXTRA... : the command array for one engine run (numactl wrapper, config args, then EXTRA)
 engine_cmd() {
   CMD=()
-  [[ $NUMA_INTERLEAVE == 1 ]] && CMD+=(numactl --interleave=all)
+  # the interleave A/B: the mirror off (STRATA_NUMA_MIRROR=0), so the two policies are not stacked
+  [[ $NUMA_INTERLEAVE == 1 ]] && CMD+=(env STRATA_NUMA_MIRROR=0 numactl --interleave=all)
   CMD+=("$EXE" ${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"} "$@")
 }
 

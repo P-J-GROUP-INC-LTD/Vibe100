@@ -87,7 +87,8 @@ from the source that matter on this box, both CPU-side and independent of the GP
    copy and the GPU's DMA reads the copy on the GPU's node. The user measured ~2x decode from full mirroring of Qwen
    Next on this box. (Mirroring is simpler than re-partitioning Strata's compile-time-geometry kernels by rows; the
    DeepSeek port, whose 269 GiB of experts cannot be mirrored, splits rows instead — `docs/deepseek/PLAN.md` §2.)
-   Work package WP-F, after WP-E (AVX-512 without VBMI).
+   **Done: WP-F** — `--numa auto` (default) mirrors the arena (primary on the GPU's node, CUDA-registered; one replica
+   per other node; workers read their node's copy; placement verified at start); `STRATA_NUMA_MIRROR=0` for the A/B.
 
 ## 4. Honest limits
 

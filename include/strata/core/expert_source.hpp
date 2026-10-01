@@ -611,6 +611,29 @@ public:
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
 
+    // ================================ NUMA MIRRORING (Vibe100 WP-F) ================================
+    //
+    // **ONE COPY OF THE ARENA PER NUMA NODE, ONE OF THEM THE GPU's.**  On a dual-socket box half the pool's reads of ONE
+    // arena cross the socket link (the pool is DRAM-bound, so that is its speed).  With `Mirror`/`Auto` (>= 2 nodes, this
+    // resident-RAM mode, room for it) `open` binds the arena - the PRIMARY - to the GPU's node before its first touch
+    // and registers it with CUDA as ever, then makes one more copy on every other node that has CPUs, bound to that node,
+    // filled by threads pinned to it.  `blob()`, `pinned()` and `device_alias()` keep naming the primary, which is the only
+    // copy any GPU DMA (cache fills, `--pcie-frac` misses, prompt streaming) ever sees; the POOL translates a job's pointer
+    // to its own node's copy (`ExpertPool::set_mirror`, pool.hpp), so no other code changes.  Replicas are never
+    // CUDA-registered; they are mlock'ed when the arena's lock policy allows.  Placement is VERIFIED (move_pages in query
+    // mode, on a sample) and reported; a replica that did not land on its node is dropped.
+    //
+    // Call before `open`: the mode is `--numa` after STRATA_NUMA_MIRROR's say (platform::numa_mode_with_env).
+    void set_numa(strata::platform::NumaMode mode) { numa_mode_ = mode; }
+    /// After `open`: the lines to print (topology, the decision and why, copy sizes, verified placement, warnings).
+    const std::vector<std::string>& numa_notes() const { return numa_notes_; }
+    /// After `open`: the mirror for `ExpertPool::set_mirror` (inactive when the arena is a single copy) and the pool
+    /// layout to give `set_pool_numa` BEFORE the pool is built and the host is pinned.
+    const strata::platform::ArenaMirror& mirror() const { return replicas_.mirror(); }
+    const strata::kernels::cpu::PoolNuma& pool_numa() const { return pool_numa_; }
+    /// The replicas themselves, for the report and the tests.
+    const strata::platform::NumaReplicas& replicas() const { return replicas_; }
+
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
     const std::string& note() const { return note_; }
@@ -637,7 +660,16 @@ private:
     double load_copy_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
     std::string gguf_;
+    strata::platform::NumaMode numa_mode_ = strata::platform::NumaMode::Auto;
+    std::vector<std::string> numa_notes_;
+    strata::platform::NumaReplicas replicas_;
+    strata::kernels::cpu::PoolNuma pool_numa_;
 };
+
+/// WP-F: what the startup says about NUMA when the experts are NOT one resident RAM arena (`--mmap-experts`, the low-RAM
+/// and RAM-budget modes), where there is exactly one copy and the OS's page cache decides where it sits.  `why` names the
+/// mode.  Empty on a machine with no NUMA topology to speak of (non-Linux).
+std::vector<std::string> numa_single_copy_notes(strata::platform::NumaMode mode, const std::string& why);
 
 /// Plan v0.3 P6: checks native_experts.txt's GGUF spans against the files, before anything is read: each layer's
 /// gate/up/down at its recorded (file, offset) must be that tensor (`blk.L.ffn_<role>_exps.weight`), of the

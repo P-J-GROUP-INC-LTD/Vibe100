@@ -1,6 +1,7 @@
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa.hpp"
 
 #include <cuda_runtime.h>
 
@@ -56,7 +57,7 @@ static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes, int bind_node) {
     mapping_base = nullptr;
     mapping_bytes = 0;
 #ifdef _WIN32
@@ -199,14 +200,32 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         return (uint8_t*) map + kSharedArenaHeaderBytes;
     }
 
-    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+    // WP-F: a mapping that is going to be bound to a node draws its hugepages from THAT node's pool, and a pool that runs
+    // dry is a SIGBUS at the first touch rather than a fallback.  So with `bind_node` the per-node pool is asked first
+    // (an unreadable one counts as empty), and the mapping is plain 4 KB pages unless it holds the whole arena.
+    bool try_huge = true;
+    std::string huge_skip;
+    if (bind_node >= 0) {
+        bool known = false;
+        const uint64_t room = strata::platform::numa_node_free_hugepage_bytes(bind_node, known);
+        if (!known || room < bytes) {
+            try_huge = false;
+            huge_skip = known ? "node " + std::to_string(bind_node) + " has " + std::to_string(room >> 20) +
+                                    " MiB of free 2 MB hugepages, the arena needs " + std::to_string(bytes >> 20) +
+                                    " MiB; using 4 KB pages"
+                              : "no 2 MB hugepage pool on node " + std::to_string(bind_node) + "; using 4 KB pages";
+        }
+    }
+    void* p = MAP_FAILED;
+    if (try_huge)
+        p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
     if (p != MAP_FAILED) {
         got = PageBacking::LargePages;
         note = "hugetlb 2 MB pages";
         return p;
     }
-    note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
+    note = try_huge ? "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages" : huge_skip;
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     got = PageBacking::NormalPages;
     return p == MAP_FAILED ? nullptr : p;
@@ -237,6 +256,16 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
 }  // namespace
+
+std::string gpu_pci_bus_id(int device) {
+    char id[64] = {0};
+#if defined(__HIPCC__)
+    if (hipDeviceGetPCIBusId(id, (int) sizeof id, device) != hipSuccess) { (void) cudaGetLastError(); return {}; }
+#else
+    if (cudaDeviceGetPCIBusId(id, (int) sizeof id, device) != cudaSuccess) { (void) cudaGetLastError(); return {}; }
+#endif
+    return id;
+}
 
 int arena_pin_cap_gib() {
     const char* e = std::getenv("STRATA_ARENA_PIN_GIB");
@@ -295,12 +324,24 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
-                         uint64_t shared_pack_hash) : capacity(bytes) {
+                         uint64_t shared_pack_hash, int numa_node) : capacity(bytes), bind_node(numa_node) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    // a bound arena is a private anonymous mapping: a shared file's placement is not this process's to choose
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes,
+                   shared_file.empty() ? bind_node : -1);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
+    }
+    // WP-F: THE BIND COMES BEFORE THE REGISTRATION, which is the first thing to touch a page (cudaHostRegister pins what is
+    // resident, and faults in what is not).  After it, a page is allocated on `bind_node` or not at all.
+    if (base != nullptr && bind_node >= 0 && shared_file.empty()) {
+        std::string err;
+        bound = strata::platform::numa_bind_memory(base, bytes, bind_node, err,
+                                                   backing == PageBacking::LargePages ? (2ull << 20) : 4096);
+        bind_note = bound ? "mbind(MPOL_BIND) to node " + std::to_string(bind_node)
+                          : "mbind to node " + std::to_string(bind_node) + " FAILED (" + err + ")";
+        note = bind_note + "; " + note;
     }
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
@@ -353,8 +394,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                    std::to_string(registered_slices) + " slices pinned (" + std::to_string(registered_bytes >> 30) +
                    " GiB); " + note;
             if (registered_bytes < bytes) {
-                const char* env = std::getenv("STRATA_ARENA_LOCK");
-                if (env == nullptr || std::string(env) != "0") {
+                if (strata::platform::arena_lock_allowed()) {
                     const strata::platform::LockResult lr =
                         strata::platform::lock_resident((uint8_t*) base + registered_bytes, bytes - registered_bytes);
                     locked_bytes = lr.locked_bytes;
@@ -379,8 +419,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             // Plan v0.3 P0.1: keep it RESIDENT instead. Unpinned, Windows trims the arena under memory pressure
             // and the CPU pool's rate then depends on the OS; locking it through the working set needs no
             // special privilege. STRATA_ARENA_LOCK=0 is the A/B arm.
-            const char* env = std::getenv("STRATA_ARENA_LOCK");
-            if (env == nullptr || std::string(env) != "0") {
+            if (strata::platform::arena_lock_allowed()) {
                 const strata::platform::LockResult lr = strata::platform::lock_resident(base, bytes);
                 locked_bytes = lr.locked_bytes;
                 note = lr.note + "; " + note;
