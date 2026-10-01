@@ -12,7 +12,9 @@ constexpr double kGiB = 1073741824.0;
 double gib(uint64_t b) { return (double) b / kGiB; }
 double gib(int64_t b) { return (double) b / kGiB; }
 
+#if defined(__GNUC__)
 std::string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
+#endif
 std::string fmt(const char* f, ...) {
     char buf[1024];
     va_list ap;

@@ -142,6 +142,7 @@ struct Report {
         std::printf("%s  %s%s%s\n", ok ? "PASS" : "FAIL", what.c_str(), detail.empty() ? "" : "  ", detail.c_str());
         std::fflush(stdout);
     }
+    void info(const std::string& what) { std::printf("INFO  %s\n", what.c_str()); std::fflush(stdout); }     // not a check: measurements, skipped suites
     int finish(const char* suite) const {
         if (fails == 0) std::printf("%s: ALL PASS (%d checks)\n", suite, checks);
         else std::printf("%s: %d of %d checks FAILED\n", suite, fails, checks);
@@ -162,6 +163,16 @@ inline std::string fmt(const char* f, ...) {
 // ---------------------------------------------------------------------------------------------------------------------------------
 // numbers
 // ---------------------------------------------------------------------------------------------------------------------------------
+/// The tolerance floors of the checks that go through expf (sigmoid, softmax: the coefficients, the Engram gate) are for the host's libm (< 1 ulp, the emulation); CUDA's expf is
+/// documented at 2 ulp (and its division / sqrt are IEEE), so the GPU programs (-DDS1D_ON_GPU) widen exactly those floors by this factor.  Everything else is the same.
+#ifdef DS1D_ON_GPU
+inline constexpr double kLibmFactor = 4.0;
+inline constexpr bool kOnGpu = true;
+#else
+inline constexpr double kLibmFactor = 1.0;
+inline constexpr bool kOnGpu = false;
+#endif
+
 inline uint32_t bits_of(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);

@@ -460,6 +460,18 @@ bool GgufSet::advise_random(const TensorLoc& t) const {
 #endif
 }
 
+bool GgufSet::prefetch(const TensorLoc& t) const {
+#if defined(__linux__)
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    const uint64_t a = t.abs_offset / page * page, b = align_up(t.abs_offset + t.nbytes, page);
+    const Shard& s = shards_[(size_t) t.shard];
+    return madvise((void*) (s.base + a), (size_t) std::min<uint64_t>(b, s.info.size) - (size_t) a, MADV_WILLNEED) == 0;
+#else
+    (void) t;
+    return false;
+#endif
+}
+
 void GgufSet::drop_cache(const TensorLoc& t, uint64_t off, uint64_t len) const {
 #if defined(__linux__)
     if (off >= t.nbytes) return;

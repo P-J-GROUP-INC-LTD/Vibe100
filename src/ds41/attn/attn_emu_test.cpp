@@ -36,6 +36,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #include "ds41_emu.hpp"
 #include "strata/ds41/cuda/attn.hpp"
 
@@ -574,7 +578,7 @@ struct KernelTests {
                 for (int i = 0; i < c.n_sel && i < c.n_comp; ++i) std::swap(pool[(size_t) i], pool[(size_t) (i + rng.below(c.n_comp - i))]);
                 std::vector<int> pick(pool.begin(), pool.begin() + std::min(c.n_sel, c.n_comp));
                 std::sort(pick.begin(), pick.end());
-                for (size_t i = 0; i < pick.size(); ++i) tk[i] = pick[i];
+                for (size_t i = 0; i < pick.size() && i < tk.size(); ++i) tk[i] = pick[i];
             }
             std::vector<float> cos, sin;
             rope_row(cos, sin);
@@ -1255,6 +1259,12 @@ int main(int argc, char** argv) {
         }
     }
     if (!kernels && oracle_dir.empty()) kernels = true;
+#if defined(__GLIBC__)
+    // every emulated launch allocates one 256 KB stack per GPU thread: keep them in the heap instead of an mmap / munmap (page-fault) round trip each
+    mallopt(M_MMAP_THRESHOLD, 1 << 30);
+    mallopt(M_TRIM_THRESHOLD, 1 << 30);
+    mallopt(M_TOP_PAD, 256 << 20);
+#endif
     std::printf("INFO emulator scheduling order: %s (seed %llu)\n", ds41_emu::order_name(), (unsigned long long) ds41_emu::g_order_seed);
     const auto t0 = std::chrono::steady_clock::now();
     {

@@ -1064,6 +1064,25 @@ void test_load(const Fx& fx, const GgufSet& g) {
         }
         CHECK(ok && m->cache.slot_of(3, 6) == -1 && m->cache.slot_of(4, 15) == 3 + 1 + 15);
     }
+    {   // bounded staging: with an odd 1,000-byte piece (every tensor above that goes up in many pieces) the device holds the same bytes
+        LoadOptions opt;
+        opt.n_slots = 0;
+        opt.build_arena = false;
+        opt.upload_piece_bytes = 1000;
+        opt.log = [](const std::string&) {};
+        auto m = Ds41Model<MiniGeom>::load(dev, fx.shard1, opt);
+        bool same = true;
+        size_t n = 0;
+        for (const TensorSpec& s : specs) {
+            const TensorLoc& loc = dir.at(s.name);
+            const DevTensor* dt = s.lt == LT::OutputNorm ? &m->weights.output_norm : s.lt == LT::Output ? &m->weights.head : s.layer >= 0 ? m->weights.at(s.layer).slot(s.lt) : nullptr;
+            if (!dt) continue;
+            ++n;
+            same = same && device_bytes(dev, dt->p, dt->nbytes) == std::vector<uint8_t>(g.data(loc), g.data(loc) + loc.nbytes);
+        }
+        CHECK(same && n > 150 && m->cache.n_slots() == 0 && m->cache.n_resident() == 0);
+        expect_refusal("an upload piece of 0 bytes", [&] { LoadOptions o = opt; o.upload_piece_bytes = 0; (void) Ds41Model<MiniGeom>::load(dev, fx.shard1, o); }, {"piece of 0 bytes"});
+    }
     {   // refusals of the options
         LoadOptions opt;
         opt.n_slots = 2;
@@ -1190,6 +1209,68 @@ void test_bad_files(const Fx& fx, const GgufSet& g) {
     CHECK(dev.live.empty());
 }
 
+// ---------------------------------------------------------------------------------------------- 12. helpers for the other packages
+struct FakeEngramConstants {                 // the member names of DS1-D's cuda::EngramConstants
+    std::vector<int32_t> layer_ids;
+    int32_t n_heads = 0, max_ngram_size = 0, pad_token_id = 0, compressed_vocab_size = 0;
+    std::vector<int64_t> primes, offsets, multipliers;
+    std::vector<int32_t> token_map;
+    std::vector<int64_t> num_embeddings;
+};
+struct FakeTableView {                       // ... and of cuda::EngramTableView
+    const uint8_t* base = nullptr;
+    int64_t rows = 0;
+};
+
+void test_helpers(const Fx& fx, const GgufSet& g) {
+    const Ds41Config c = read_config(g.meta());
+    const FakeEngramConstants ec = engram_constants_as<FakeEngramConstants>(c);
+    CHECK(ec.layer_ids == std::vector<int32_t>({1, 3}) && ec.n_heads == 2 && ec.max_ngram_size == 4 && ec.pad_token_id == 2 && ec.compressed_vocab_size == 300);
+    CHECK(ec.primes == c.engram.primes && ec.offsets == c.engram.offsets && ec.multipliers == c.engram.multipliers && ec.token_map == c.engram.token_map && ec.num_embeddings == c.engram.num_embeddings);
+    CHECK(ec.token_map.size() == 512 && ec.primes.size() == 12);
+
+    // RoPE tables on the device: both kinds, per layer, equal to the host tables and (within a float32 rounding) to the oracle's
+    cuda::HostDev dev;
+    {
+        const DeviceRope rope(dev, c, 64);
+        CHECK(rope.n_pos() == 64 && rope.device_bytes() == 4ull * 64 * 8 * 4);
+        const size_t n = 64 * 8;
+        for (int kind = 0; kind < 2; ++kind) {
+            const RopeTable t = build_rope_table(kind ? c.rope_csa : c.rope_swa, c.rope_dim, 64);
+            const int layer = kind ? 2 : 0;
+            std::vector<float> cs(n), sn(n);
+            dev.d2h(cs.data(), rope.cos(layer), n * 4);
+            dev.d2h(sn.data(), rope.sin(layer), n * 4);
+            CHECK(cs == t.cos && sn == t.sin);
+            const std::vector<uint8_t> raw = read_bin(fx.gold / (kind ? "rope_csa.f32" : "rope_swa.f32"));
+            double worst = 0;
+            for (size_t i = 0; i < n; ++i) {
+                float gc, gs;
+                std::memcpy(&gc, raw.data() + 4 * i, 4);
+                std::memcpy(&gs, raw.data() + 4 * (n + i), 4);
+                worst = std::max({worst, (double) std::fabs(gc - cs[i]), (double) std::fabs(gs - sn[i])});
+            }
+            CHECK(worst <= 1.3e-7);
+        }
+        CHECK(rope.cos(0) == rope.cos(1) && rope.cos(2) == rope.cos(7) && rope.cos(0) != rope.cos(2) && rope.sin(0) != rope.sin(4));
+        DeviceRope moved = std::move(const_cast<DeviceRope&>(rope));
+        CHECK(moved.cos(2) != nullptr && rope.n_pos() == 0);
+    }
+    CHECK(dev.live.empty());
+    expect_refusal("RoPE tables of 0 positions", [&] { DeviceRope r(dev, c, 0); }, {"0 positions"});
+
+    // page-cache advice on a mapping must not change what is read
+    const TensorDir dir = g.directory();
+    const TensorLoc& t = dir.at("blk.0.ffn_gate_exps.weight");
+    const std::vector<uint8_t> before(g.data(t), g.data(t) + t.nbytes);
+    (void) g.advise_random(t);
+    g.prefetch(t);
+    g.drop_cache(t);
+    g.drop_cache(t, 100, 5000);
+    g.drop_cache(t, t.nbytes + 10, 5);        // past the end: nothing
+    CHECK(std::vector<uint8_t>(g.data(t), g.data(t) + t.nbytes) == before);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1229,6 +1310,7 @@ int main(int argc, char** argv) {
         {"NUMA and arena", [&] { test_numa_choice(*g); }},
         {"load under HostDev", [&] { test_load(fx, *g); }},
         {"files that are not this model", [&] { test_bad_files(fx, *g); }},
+        {"helpers (Engram constants, RoPE tables, page-cache advice)", [&] { test_helpers(fx, *g); }},
     };
     for (const auto& t : tests) {
         const int before = g_fail;

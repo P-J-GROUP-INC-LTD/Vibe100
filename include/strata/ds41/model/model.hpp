@@ -178,13 +178,67 @@ public:
 
     /// Uploads every dense tensor of `specs` (their LT slots) into ONE device allocation and maps the host tensors.  The files must have been
     /// validated against `specs` (validate_tensors).  `dir` / `gguf` outlive the weights.
-    void load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& cfg, const std::vector<TensorSpec>& specs, const TensorDir& dir, const LogFn& log);
+    /// `piece_bytes`: a tensor goes up in pieces of at most this size (bounded staging: the driver pins and copies one piece at a time).
+    void load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& cfg, const std::vector<TensorSpec>& specs, const TensorDir& dir, const LogFn& log,
+              uint64_t piece_bytes = 64ull << 20);
     void release();
 
 private:
     ModelDev* dev_ = nullptr;
     void* dev_base_ = nullptr;
     uint64_t dev_bytes_ = 0;
+};
+
+/// The Engram table of a layer as DS1-D's `cuda::EngramTableView` ({base, rows}) or any struct with those two fields.
+template <class V> V engram_table_view(const LayerWeights& lw) {
+    V v;
+    v.base = lw.eng_table.p;
+    v.rows = lw.eng_table.rows();
+    return v;
+}
+
+/// The Engram constants of the file as DS1-D's `cuda::EngramConstants` (or any struct with these member names): layer ids, heads, n-gram size, pad token,
+/// compressed vocabulary, primes / offsets / multipliers, token_map (empty when the config was read without the big arrays) and the table sizes.
+template <class T> T engram_constants_as(const Ds41Config& c) {
+    T t;
+    t.layer_ids = c.engram.layers;
+    t.n_heads = c.engram.heads;
+    t.max_ngram_size = c.engram.ngram;
+    t.pad_token_id = c.engram.pad_id;
+    t.compressed_vocab_size = c.engram.cvocab;
+    t.primes = c.engram.primes;
+    t.offsets = c.engram.offsets;
+    t.multipliers = c.engram.multipliers;
+    t.token_map = c.engram.token_map;
+    t.num_embeddings = c.engram.num_embeddings;
+    return t;
+}
+
+/// RoPE cos / sin tables on the device for both layer kinds (plain theta, and theta + YaRN), FP32 [n_pos][rope_dim / 2] each, built on the host in double
+/// (ref/ds41/rope.py rope_table).  `cos(l)` / `sin(l)` give the tables of layer l's kind (config.hpp `rope_of`).  n_pos * rope_dim / 2 * 4 B * 4 tables:
+/// 131,072 positions = 268 MB.
+class DeviceRope {
+public:
+    DeviceRope() = default;
+    DeviceRope(ModelDev& dev, const Ds41Config& c, int n_pos);
+    ~DeviceRope() { release(); }
+    DeviceRope(const DeviceRope&) = delete;
+    DeviceRope& operator=(const DeviceRope&) = delete;
+    DeviceRope(DeviceRope&& o) noexcept { *this = std::move(o); }
+    DeviceRope& operator=(DeviceRope&& o) noexcept;
+    void release();
+    int n_pos() const { return n_pos_; }
+    const float* cos(int layer) const { return cos_[kind_[(size_t) layer]]; }
+    const float* sin(int layer) const { return sin_[kind_[(size_t) layer]]; }
+    uint64_t device_bytes() const { return bytes_; }
+
+private:
+    ModelDev* dev_ = nullptr;
+    float* cos_[2] = {nullptr, nullptr};               // [0] plain, [1] YaRN
+    float* sin_[2] = {nullptr, nullptr};
+    std::vector<int> kind_;                            // per layer: 0 / 1
+    int n_pos_ = 0;
+    uint64_t bytes_ = 0;
 };
 
 /// The weights of a model at geometry G.
@@ -246,7 +300,7 @@ public:
 private:
     struct Block {
         platform::NumaBuffer nb;                       // a mapping bound to a node, or unbound
-        std::unique_ptr<uint8_t, void (*)(void*)> plain{nullptr, [](void* p) { std::free(p); }};   // the fallback where mapping failed
+        std::unique_ptr<uint8_t[]> plain;              // the fallback where mapping failed (64-byte aligned `data` inside it)
         uint8_t* data = nullptr;
         uint64_t bytes = 0;
         int node = -1;
@@ -324,10 +378,11 @@ private:
 struct PlanInputs {
     int n_slots = 0;                                   ///< GPU cache slots asked for (the plan also says how many the budget holds)
     int numa_nodes = 2;                                ///< expert halves per socket: the arena is split over this many
-    uint64_t vram_total = 32ull << 30;
+    uint64_t vram_total = 34089730048ull;              ///< a V100 32 GB as nvidia-smi reports it (32,510 MiB, not 32 GiB); the engine passes the device's own total
     uint64_t ram_total = 384ull << 30;
     uint64_t ctx_tokens = 131072;                      ///< KV cache length to reserve
-    uint64_t kv_bytes_per_token = 3200;                ///< PLAN.md section 2
+    uint64_t kv_bytes_per_token = 6400;                ///< DS-1 keeps the caches in FP32 (DS1.md section 2): 3 ratio-2 FULL layers x (512 + 128) x 4 B / 2 + 1 ratio-1 layer x 640 x 4 B;
+                                                       ///< PLAN.md section 2's 3,200 is the FP16 figure
     uint64_t gpu_reserve = 3ull << 30;                 ///< activations, prompt buffers, CUDA context
     uint64_t os_reserve = 8ull << 30;
     uint64_t host_buffers = 3ull << 30;
@@ -359,6 +414,8 @@ struct LoadOptions {
     bool build_arena = true;                           ///< false: skip the CPU arena (tests, or a GPU-only run)
     ArenaOptions arena;                                ///< threads / NUMA / log are taken from here, `log` below overrides its log
     bool drop_page_cache = true;                       ///< drop the expert tensors' pages after they were copied (keeps the page cache for Engram)
+    uint64_t upload_piece_bytes = 64ull << 20;         ///< dense tensors go to the device in pieces of at most this size (a test sets it small)
+    int prefetch_layers = 2;                           ///< while the arena is built, ask the kernel to read this many layers of expert tensors ahead (madvise WILLNEED); 0: off
     bool allow_unexpected_tensors = false;
     PlanInputs plan;                                   ///< the box described to the memory plan (n_slots is filled from the field above)
     LogFn log;                                         ///< progress and the memory plan; null: stderr

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <exception>
 #include <mutex>
+#include <new>
 #include <set>
 #include <thread>
 
@@ -134,11 +135,10 @@ ExpertArena ExpertArena::build(const ExpertDims& d, const std::vector<ExpertSlic
             b.note = std::string(platform::page_kind_name(b.nb.page_kind())) + "; " + b.nb.note();
         } else {
             const std::string why = b.nb.note();
-            void* p = std::aligned_alloc(4096, (size_t) round_up(bytes, 4096));
-            if (!p)
+            b.plain.reset(new (std::nothrow) uint8_t[(size_t) bytes + 64]);
+            if (!b.plain)
                 throw ModelError("cannot allocate " + std::to_string(bytes >> 20) + " MiB for CPU expert half " + std::to_string(h) + " (out of memory; mapping said: " + why + ")");
-            b.plain.reset(static_cast<uint8_t*>(p));
-            b.data = b.plain.get();
+            b.data = reinterpret_cast<uint8_t*>(round_up(reinterpret_cast<uintptr_t>(b.plain.get()), 64));
             b.node = -1;
             b.bound = false;
             b.note = "plain memory (" + why + ")";
@@ -259,7 +259,7 @@ std::vector<ExpertId> parse_expert_list(const std::string& spec, int n_layer, in
         if (!parse_range(item.substr(colon + 1), n_expert, e0, e1, err)) throw ModelError("expert list item `" + item + "`, expert: " + err);
         for (int l = l0; l <= l1; ++l)
             for (int e = e0; e <= e1; ++e)
-                if (seen.insert({l, e}).second) out.push_back({l, e});
+                { out.push_back({l, e}); seen.insert({l, e}); }
     }
     return out;
 }
@@ -328,18 +328,13 @@ void GpuExpertCache::set_owner(ModelDev& dev, int slot, int layer, int expert, b
     const size_t idx = (size_t) layer * (size_t) d_.n_expert + (size_t) expert;
     const int prev = res_[idx];
     const ExpertId now{layer, expert};
-    if (prev >= 0 && prev != slot) {                    // already resident in another slot: that slot is free from now on (one table entry, one slot)
+    if (owner_[(size_t) slot].layer >= 0)                // the callers evict the slot's previous tenant before its bytes change
+        throw ModelError("internal: GpuExpertCache::set_owner on a slot that still has a tenant");
+    if (prev >= 0) {                                     // already resident in another slot: that slot is free from now on (one table entry, one slot)
         owner_[(size_t) prev] = ExpertId{};
         --n_resident_;
     }
-    const ExpertId old = owner_[(size_t) slot];
-    if (old.layer >= 0 && !(old == now)) {              // the slot's previous tenant is evicted
-        const size_t oi = (size_t) old.layer * (size_t) d_.n_expert + (size_t) old.expert;
-        res_[oi] = -1;
-        write(oi, -1);
-        --n_resident_;
-    }
-    if (prev != slot) ++n_resident_;
+    ++n_resident_;
     owner_[(size_t) slot] = now;
     res_[idx] = slot;
     write(idx, slot);

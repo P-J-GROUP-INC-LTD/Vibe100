@@ -1,9 +1,10 @@
-// src/ds41/cuda/engram_emu_test.cpp - DS1-D: Engram.  The host side (the n-gram hasher, the row gather) runs natively; the device side (MXFP4 row dequantisation,
-// the combine kernel; src/ds41/cuda/engram_impl.cuh, the SAME source nvcc compiles for sm_70) runs on the CPU through the thread-model emulation (ds41_emu.hpp).
+// src/ds41/cuda/engram_test.cpp - DS1-D: Engram.  The host side (the n-gram hasher, the row gather) runs natively; the device side (MXFP4 row dequantisation,
+// the combine kernel; src/ds41/cuda/engram_impl.cuh, the SAME source nvcc compiles for sm_70) runs on the CPU through the thread-model emulation (ds41_emu.hpp), or on the V100.
 // The oracle is the NumPy one: golden data from src/ds41/engram/golden/gen_golden.py (ref/ds41/engram.py NgramHasher / engram_layer, quant.dequant_mxfp4), at MiniGeom's
-// and RealGeom's shapes, with the mini GGUF's constants and with the REAL model's constants (the saved shard header and the extracted token map).  No GPU needed.
+// and RealGeom's shapes, with the mini GGUF's constants and with the REAL model's constants (the saved shard header and the extracted token map).  One test source, two programs:
 //
-//   ds41_engram_emu_test --golden DIR [--suite NAME ...] [--order forward|reverse|shuffle[:SEED]]
+//   ds41_engram_emu_test --golden DIR [--suite NAME ...] [--order forward|reverse|shuffle[:SEED]]     CPU emulation of the kernels, Mini + Real shapes, no GPU needed
+//   ds41_engram_gpu_test --golden DIR [--suite NAME ...]        (-DDS1D_ON_GPU) the sm_70 kernels on the V100, RealGeom only, plus a `perf` suite (information); not in ctest
 //
 // Suites (default: all):
 //   hasher    NgramHasher EXACTLY equals the oracle's int64 rows: whole stream in one call, one token at a time (decode), chunked, after reset(); mini and REAL constants; the
@@ -25,9 +26,13 @@
 #include <string>
 #include <vector>
 
-#include "ds41_emu.hpp"
 #include "mhc_test_util.hpp"
 #include "strata/ds41/cuda/engram.hpp"
+#ifdef DS1D_ON_GPU
+#include "strata/ds41/cuda/ds41_cuda_runtime.hpp"
+#else
+#include "ds41_emu.hpp"
+#endif
 
 using namespace strata::ds41;
 using namespace strata::ds41::cuda;
@@ -35,8 +40,16 @@ using namespace ds1d;
 
 namespace {
 
+#ifdef DS1D_ON_GPU
+using TestDev = CudaDev;
+#define DS1D_GEOMS(fn, c) fn<RealGeom>(c)
+#else
+using TestDev = HostDev;
+#define DS1D_GEOMS(fn, c) do { fn<MiniGeom>(c); fn<RealGeom>(c); } while (0)
+#endif
+
 struct Ctx {
-    HostDev dev;
+    TestDev dev;
     Report rep;
     Golden* gold = nullptr;
 };
@@ -255,7 +268,7 @@ void suite_dequant(Ctx& c) {
 // ---------------------------------------------------------------------------------------------------------------------------------
 // combine
 // ---------------------------------------------------------------------------------------------------------------------------------
-double tol_of(const Err& oracle32, double floor_abs) { return std::max(4.0 * oracle32.max_abs, floor_abs); }
+double tol_exp(const Err& oracle32, double floor_abs) { return std::max(4.0 * oracle32.max_abs, kLibmFactor * floor_abs); }       // the gate goes through expf
 
 uint16_t bf16_bits(float v) {                           // round to nearest even (finite inputs)
     uint32_t u = bits_of(v);
@@ -286,7 +299,7 @@ void suite_combine(Ctx& c) {
         const int T = (int) x.dim(0);
         const auto got = run_combine<G>(c, x.v, kv.v, qb.v, kb.v, T);
         const Err e = compare(got.data(), o64.data(), got.size()), e32 = compare(o32.data(), o64.data(), got.size());
-        const double tol = tol_of(e32, 2e-7 * e.max_ref);
+        const double tol = tol_exp(e32, 2e-7 * e.max_ref);
         c.rep.check(e.nan_mismatch == 0 && e.max_abs <= tol, fmt("combine %s/%s  T=%d vs the oracle's engram_layer (float64)", gname<G>(), cs, T),
                     fmt("%s  (tol %.2e; oracle fp32 %.2e)", describe(e).c_str(), tol, e32.max_abs));
         // T-invariance: every token alone gives the bits it has in the batch
@@ -297,6 +310,7 @@ void suite_combine(Ctx& c) {
             same = first_bit_diff(one.data(), got.data() + (size_t) t * HC * H, one.size()) == one.size();
         }
         c.rep.check(same, fmt("combine %s/%s  T-invariant: each token alone == in the batch (bit-identical)", gname<G>(), cs));
+#ifndef DS1D_ON_GPU
         // the scheduling order changes no bit
         const auto saved = ds41_emu::g_order;
         bool ord = true;
@@ -307,6 +321,10 @@ void suite_combine(Ctx& c) {
         }
         ds41_emu::g_order = saved;
         c.rep.check(ord, fmt("combine %s/%s  bit-identical in reverse and shuffled block / thread order", gname<G>(), cs));
+#else
+        const auto again = run_combine<G>(c, x.v, kv.v, qb.v, kb.v, T);              // on the card: the same call twice gives the same bits (no atomics, fixed order)
+        c.rep.check(first_bit_diff(again.data(), got.data(), got.size()) == got.size(), fmt("combine %s/%s  repeatable (bit-identical on a second call)", gname<G>(), cs));
+#endif
     }
 }
 
@@ -339,7 +357,7 @@ void suite_combine_edge(Ctx& c) {
         gates[cp] = 1.0 / (1.0 + std::exp(-s));
         for (int d = 0; d < H; ++d) worst = std::max(worst, std::fabs((double) got[(size_t) cp * H + d] - ((double) x[(size_t) cp * H + d] + gates[cp] * (double) kv[(size_t) HC * H + d])));
     }
-    c.rep.check(worst < 2e-6, fmt("combine %s  dot = 0 -> gate sigmoid(+1e-3); |dot| < 1e-6 keeps its sign; large dot", gname<G>()),
+    c.rep.check(worst < kLibmFactor * 2e-6, fmt("combine %s  dot = 0 -> gate sigmoid(+1e-3); |dot| < 1e-6 keeps its sign; large dot", gname<G>()),
                 fmt("gates %.9f %.9f %.9f %.9f, max err %.2e", gates[0], gates[1], gates[2], gates[3], worst));
     c.rep.check(gates[0] > 0.5 && gates[1] < 0.5 && gates[2] > 0.5 && gates[3] > 0.9, fmt("combine %s  (the cases really are the clamp: gate of copy 1 < 0.5 < gate of copy 2)", gname<G>()));
 
@@ -393,7 +411,7 @@ void suite_combine_edge(Ctx& c) {
 // runner
 // ---------------------------------------------------------------------------------------------------------------------------------
 // Host stand-in for DS1-B's Q8_0 GEMV with int8 activations (docs/deepseek/DS1.md section 2): the activation quantiser of CONTRACTS.md (ggml's x86 q8_0 arithmetic with an FP32
-// scale), acc += (d_w * d_x) * (integer sum of the int8 products).  Reads and writes "device" pointers directly: valid because the emulation's device memory is host memory.
+// scale), acc += (d_w * d_x) * (integer sum of the int8 products).  Copies through the Dev (d2h / h2d), so it runs the same on the emulation and on a card.
 float half_to_float(uint16_t h) {
     const uint32_t s = (uint32_t) (h & 0x8000u) << 16;
     uint32_t e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -428,33 +446,50 @@ void quantize_block_contract(const float* x, int8_t* q, float& d) {
     }
 }
 
-struct HostWkv {
-    const uint8_t* q8;      // [out][K / 32][34]: fp16 d, 32 x int8
-    int out, K;
-    void operator()(const float* rows, int T, float* kv, Stream) const {
-        const int nb = K / 32;
-        std::vector<int8_t> qx((size_t) nb * 32);
-        std::vector<float> dx((size_t) nb);
-        for (int t = 0; t < T; ++t) {
-            for (int b = 0; b < nb; ++b) quantize_block_contract(rows + (size_t) t * K + 32 * b, qx.data() + 32 * b, dx[(size_t) b]);
-            for (int o = 0; o < out; ++o) {
+// The two calls a dense-ops provider offers (DS1-C's AttnDenseOps now, DS1-B's dense.hpp later), as host code: engram_wkv_via_ops<G> binds the wkv hook to them.
+struct MockDenseOps {
+    Dev& dev;
+    int quantize_calls = 0, gemv_calls = 0;
+    explicit MockDenseOps(Dev& d) : dev(d) {}
+    void quantize_acts(const float* x, int T, int k, int8_t* xq, float* xs, Stream) {      // all pointers are device pointers: copied down, computed, copied up
+        ++quantize_calls;
+        std::vector<float> hx((size_t) T * k), hs((size_t) T * (k / 32));
+        std::vector<int8_t> hq((size_t) T * k);
+        dev.d2h(hx.data(), x, hx.size() * sizeof(float));
+        for (int t = 0; t < T; ++t)
+            for (int b = 0; b < k / 32; ++b) quantize_block_contract(hx.data() + (size_t) t * k + 32 * b, hq.data() + (size_t) t * k + 32 * b, hs[(size_t) t * (k / 32) + b]);
+        dev.h2d(xq, hq.data(), hq.size());
+        dev.h2d(xs, hs.data(), hs.size() * sizeof(float));
+    }
+    void gemv_q8(const void* w, int n, int k, const int8_t* xq, const float* xs, int T, float* y, Stream) {
+        ++gemv_calls;
+        const int nb = k / 32;
+        std::vector<uint8_t> q8((size_t) n * nb * 34);
+        std::vector<int8_t> hq((size_t) T * k);
+        std::vector<float> hs((size_t) T * nb), hy((size_t) T * n);
+        dev.d2h(q8.data(), w, q8.size());
+        dev.d2h(hq.data(), xq, hq.size());
+        dev.d2h(hs.data(), xs, hs.size() * sizeof(float));
+        for (int t = 0; t < T; ++t)
+            for (int o = 0; o < n; ++o) {
                 float acc = 0.0f;
                 for (int b = 0; b < nb; ++b) {
-                    const uint8_t* blk = q8 + ((size_t) o * nb + b) * 34;
+                    const uint8_t* blk = q8.data() + ((size_t) o * nb + b) * 34;
                     uint16_t hd;
                     std::memcpy(&hd, blk, 2);
                     int isum = 0;
-                    for (int j = 0; j < 32; ++j) isum += (int) (int8_t) blk[2 + j] * (int) qx[(size_t) 32 * b + j];
-                    volatile float term = (half_to_float(hd) * dx[(size_t) b]) * (float) isum;
+                    for (int j = 0; j < 32; ++j) isum += (int) (int8_t) blk[2 + j] * (int) hq[(size_t) t * k + 32 * b + j];
+                    volatile float term = (half_to_float(hd) * hs[(size_t) t * nb + b]) * (float) isum;
                     volatile float nacc = acc + term;
                     acc = nacc;
                 }
-                kv[(size_t) t * out + o] = acc;
+                hy[(size_t) t * n + o] = acc;
             }
-        }
+        dev.h2d(y, hy.data(), hy.size() * sizeof(float));
     }
 };
 
+#ifndef DS1D_ON_GPU
 void suite_runner_mini(Ctx& c) {
     using G = MiniGeom;
     constexpr int HC = G::kHc, H = G::kHidden, IN = Derived<G>::kEngramIn, OUT = Derived<G>::kEngramOut;
@@ -483,7 +518,9 @@ void suite_runner_mini(Ctx& c) {
         EngramRunner<G> runner(c.dev, S);
         Up<uint16_t> dq(c.dev, qb), dk(c.dev, kb);
         EngramLayerWeights w{EngramTableView{table.data(), (int64_t) table.dim(0)}, dq.p(), dk.p()};
-        const HostWkv host_wkv{wkv.data(), OUT, IN};
+        Up<uint8_t> dwkv(c.dev, wkv);
+        MockDenseOps ops(c.dev);
+        const EngramWkvFn host_wkv = engram_wkv_via_ops<G>(ops, dwkv.p(), runner.xq(), runner.xs());
 
         // prefill: T = S in one call, with the stand-in wkv
         DevBuf<float> dx(c.dev, x.size());
@@ -506,7 +543,7 @@ void suite_runner_mini(Ctx& c) {
         // the combine alone, fed the oracle's own kv: only the combine's arithmetic is left
         DevBuf<float> dx2(c.dev, x.size());
         dx2.up(x.v);
-        const auto inject = [&](const float*, int T, float* kv, Stream) { std::memcpy(kv, kv_int8.data(), (size_t) T * OUT * sizeof(float)); };
+        const auto inject = [&](const float*, int T, float* kv, Stream) { c.dev.h2d(kv, kv_int8.data(), (size_t) T * OUT * sizeof(float)); };
         runner.run(w, hr.data() + (size_t) j * cols, S, (int64_t) L * cols, dx2.p, inject, 1e-20f);
         const auto got2 = dx2.down();
         const Err e2 = compare(got2.data(), out_int8.data(), got2.size());
@@ -523,10 +560,13 @@ void suite_runner_mini(Ctx& c) {
         }
         const auto got3 = dx3.down();
         c.rep.check(first_bit_diff(got3.data(), got.data(), got.size()) == got.size(), tag + fmt("  decode (T=1, incremental hasher) == prefill (T=%d): bit-identical", S));
+        c.rep.check(ops.quantize_calls == 1 + S && ops.gemv_calls == 1 + S, tag + fmt("  the wkv hook called the provider's quantiser and Q8_0 GEMV once per run (%d + %d)", ops.quantize_calls, ops.gemv_calls));
         // the runner refuses what it cannot hold
         c.rep.check(throws_invalid([&] { runner.upload_rows(w.table, hr.data(), S + 1, (int64_t) L * cols); }), tag + "  refuses T > t_max");
     }
 }
+
+#endif
 
 void suite_runner_real(Ctx& c) {
     using G = RealGeom;
@@ -542,7 +582,7 @@ void suite_runner_real(Ctx& c) {
     EngramLayerWeights w{EngramTableView{table.data(), (int64_t) table.dim(0)}, dq.p(), dk.p()};
     DevBuf<float> dx(c.dev, x.size());
     dx.up(x.v);
-    const auto inject = [&](const float*, int Tn, float* kvd, Stream) { std::memcpy(kvd, kv.data(), (size_t) Tn * OUT * sizeof(float)); };
+    const auto inject = [&](const float*, int Tn, float* kvd, Stream) { c.dev.h2d(kvd, kv.data(), (size_t) Tn * OUT * sizeof(float)); };
     runner.run(w, idx.data(), T, G::kEngramRows, dx.p, inject, 1e-20f);
     std::vector<float> got_rows((size_t) T * IN);
     c.dev.d2h(got_rows.data(), runner.rows_f32(), got_rows.size() * sizeof(float));
@@ -551,8 +591,41 @@ void suite_runner_real(Ctx& c) {
                     (long long) table.dim(0)));
     const auto got = dx.down();
     const Err e = compare(got.data(), o64.data(), got.size());
-    c.rep.check(e.nan_mismatch == 0 && e.max_abs <= 4e-6 * e.max_ref + 1e-6, "runner real  combine on the real-shape stream vs the oracle (float64)", describe(e));
+    c.rep.check(e.nan_mismatch == 0 && e.max_abs <= kLibmFactor * (4e-6 * e.max_ref + 1e-6), "runner real  combine on the real-shape stream vs the oracle (float64)", describe(e));
 }
+
+#ifdef DS1D_ON_GPU
+template <class G>
+void suite_perf(Ctx& c) {
+    constexpr int H = G::kHidden, HC = G::kHc, OUT = Derived<G>::kEngramOut, ROWS = G::kEngramRows;
+    constexpr size_t RB = Derived<G>::kEngramRowBytes;
+    for (int i = 0; i < 2; ++i) {
+        const EngramKernelInfo ki = ds41_engram_kernel_info<G>(i);
+        c.rep.info(fmt("engram kernel %d (%s): %d registers, %d B static shared memory", i, i == 0 ? "MXFP4 dequantise" : "combine", ki.regs, ki.static_smem));
+    }
+    Rng rng(4);
+    for (const int T : {1, 8}) {
+        std::vector<uint8_t> raw((size_t) T * ROWS * RB);
+        for (auto& b : raw) b = (uint8_t) rng.next();
+        for (size_t i = 0; i < raw.size(); i += 17) raw[i] = (uint8_t) rng.range(110, 130);          // scale bytes (the buffer is a multiple of 17 only per row; the values do not matter here)
+        std::vector<float> xv((size_t) T * HC * H), kvv((size_t) T * OUT);
+        for (auto& v : xv) v = (float) rng.normal();
+        for (auto& v : kvv) v = (float) rng.normal();
+        std::vector<uint16_t> qk((size_t) HC * H, bf16_bits(1.0f));
+        Up<uint8_t> draw(c.dev, raw);
+        Up<float> dkv(c.dev, kvv);
+        Up<uint16_t> dq(c.dev, qk), dk(c.dev, qk);
+        DevBuf<float> rows(c.dev, (size_t) T * ROWS * G::kEngramHeadDim), dx(c.dev, xv.size());
+        dx.up(xv);
+        auto line = [&](const char* what, double bytes, const std::function<void()>& fn_) {
+            const double us = c.dev.time_us(fn_, 200);
+            c.rep.info(fmt("perf   T=%d  %-34s %8.2f us   %7.1f GB/s effective (%.2f MB moved)", T, what, us, bytes / us * 1e-3, bytes * 1e-6));
+        };
+        line("engram dequantise (MXFP4 -> f32)", (double) T * ROWS * (RB + (double) G::kEngramHeadDim * 4), [&] { ds41_engram_dequant_rows<G>(c.dev, draw.p(), T * ROWS, rows.p); });
+        line("engram combine (in place)", (double) T * ((2 * HC + 1) * H + (double) HC * H) * 4 + (double) HC * H * 4, [&] { ds41_engram_combine<G>(c.dev, dx.p, dkv.p(), dq.p(), dk.p(), T, 1e-20f); });
+    }
+}
+#endif
 
 }  // namespace
 
@@ -563,13 +636,20 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--golden" && i + 1 < argc) golden = argv[++i];
         else if (a == "--suite" && i + 1 < argc) suites.push_back(argv[++i]);
+#ifndef DS1D_ON_GPU
         else if (a == "--order" && i + 1 < argc) {
             if (!ds41_emu::set_order_from_string(argv[++i])) {
                 std::fprintf(stderr, "bad --order\n");
                 return 2;
             }
-        } else {
+        }
+#endif
+        else {
+#ifdef DS1D_ON_GPU
+            std::fprintf(stderr, "usage: %s --golden DIR [--suite hasher|gather|dequant|combine|runner|perf]...\n", argv[0]);
+#else
             std::fprintf(stderr, "usage: %s --golden DIR [--suite hasher|gather|dequant|combine|runner]... [--order forward|reverse|shuffle[:SEED]]\n", argv[0]);
+#endif
             return 2;
         }
     }
@@ -582,18 +662,31 @@ int main(int argc, char** argv) {
         Golden g(golden);
         Ctx c;
         c.gold = &g;
+#ifdef DS1D_ON_GPU
+        std::printf("ds41_engram_gpu_test: the sm_70 kernels, golden %s\n", golden.c_str());
+#else
         std::printf("ds41_engram_emu_test: scheduling order %s, golden %s\n", ds41_emu::order_name(), golden.c_str());
+#endif
         if (want("hasher")) { suite_hasher(c, "mini"); suite_hasher(c, "real"); }
-        if (want("gather")) { suite_gather<MiniGeom>(c); suite_gather<RealGeom>(c); }
-        if (want("dequant")) { suite_dequant<MiniGeom>(c); suite_dequant<RealGeom>(c); }
+        if (want("gather")) DS1D_GEOMS(suite_gather, c);
+        if (want("dequant")) DS1D_GEOMS(suite_dequant, c);
         if (want("combine")) {
-            suite_combine<MiniGeom>(c);
-            suite_combine<RealGeom>(c);
-            suite_combine_edge<MiniGeom>(c);
-            suite_combine_edge<RealGeom>(c);
+            DS1D_GEOMS(suite_combine, c);
+            DS1D_GEOMS(suite_combine_edge, c);
         }
-        if (want("runner")) { suite_runner_mini(c); suite_runner_real(c); }
+        if (want("runner")) {
+#ifndef DS1D_ON_GPU
+            suite_runner_mini(c);
+#endif
+            suite_runner_real(c);
+        }
+#ifdef DS1D_ON_GPU
+        if (suites.empty() || want("perf")) suite_perf<RealGeom>(c);
+        c.dev.sync();
+        return c.rep.finish("ds41_engram_gpu_test");
+#else
         return c.rep.finish("ds41_engram_emu_test");
+#endif
     } catch (const std::exception& e) {
         std::printf("FAIL  exception: %s\n", e.what());
         return 1;

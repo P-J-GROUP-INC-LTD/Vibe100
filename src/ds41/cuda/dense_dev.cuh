@@ -1,4 +1,5 @@
-// src/ds41/cuda/dense_dev.cuh - DS1-B: the small device helpers the dense kernels share (GEMV, norm, RoPE, vocabulary ops).
+// src/ds41/cuda/dense_dev.cuh - DS1-B: the small device helpers the dense kernels share (GEMV, norm, RoPE, vocabulary ops): the half -> float
+// conversion, the pinned FP32 arithmetic, the warp butterfly, the natural-order activation quantiser, the total order of the vocabulary ops.
 //
 // The dense kernels are written once and compiled twice, as DS-D's are (ds41_dev.cuh): by nvcc for sm_70 and by the host compiler with
 // -DDS41_EMU against the CPU emulation of the thread model (ds41_emu.hpp).  They use only the names of ds41_dev.cuh for intrinsics.
@@ -86,8 +87,76 @@ DS41_FI void quantize_block_nat(float v, int lane, int8_t* DS41_RESTRICT dst, fl
 }
 
 // ---- a total order for the vocabulary ops -----------------------------------------------------------------------------------------------
-/// (value descending, index ascending) is a total order on distinct indices; a NaN value must be mapped to -inf by the caller.
-DS41_FI bool better(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }
+// numpy / torch semantics: a NaN is LARGER than every number (so a failure upstream is visible as the argmax / top-1), -0 == +0, ties go to the LOWER index.
+// f2key maps a float to a uint32 whose unsigned order is that order (the classic sign-flip of the bit pattern, with the two canonicalisations).
+DS41_FI uint32_t f2key(float v) {
+    if (v != v) return 0xFFFFFFFFu;                                     // every NaN (any sign / payload) above +inf
+    const uint32_t b = dev::f2u(v == 0.0f ? 0.0f : v);                  // -0 -> +0
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+/// Inverse of f2key (a NaN key gives a quiet NaN, a zero key the +0).
+DS41_FI float key2f(uint32_t k) { return dev::u2f((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k); }
+/// (key descending, index ascending) is a total order on distinct indices.  The "absent" element is key 0 with index INT_MAX: below every real one.
+DS41_FI bool key_better(uint32_t k, int i, uint32_t bk, int bi) { return k > bk || (k == bk && i < bi); }
+inline constexpr int kNoIndex = 0x7FFFFFFF;
+
+// ---- more pinned arithmetic ------------------------------------------------------------------------------------------------------------
+/// a * b + c with ONE rounding (FFMA).  The emulator's std::fmaf is the same correctly rounded operation, so both builds agree to the bit.
+DS41_FI float fma_rn(float a, float b, float c) {
+#if defined(DS41_EMU)
+    return std::fmaf(a, b, c);
+#else
+    return __fmaf_rn(a, b, c);
+#endif
+}
+/// IEEE square root (round to nearest): __fsqrt_rn on the device, the host's correctly rounded sqrtf in the emulator.
+DS41_FI float sqrt_rn(float a) {
+#if defined(DS41_EMU)
+    return std::sqrt(a);
+#else
+    return __fsqrt_rn(a);
+#endif
+}
+/// expf (the accurate one: this project never builds with --use_fast_math); device and host libm may differ in the last bit, which no test pins.
+DS41_FI float exp_f(float a) { return expf(a); }
+/// Signed byte `i` (0..3) of a packed word, sign-extended: one BFE on the device.
+DS41_FI int sext8(uint32_t w, int i) { return (int) (int8_t) (uint8_t) ((w >> (8 * i)) & 0xFFu); }
+/// SwiGLU's sigmoid of ops.py (the split form: no overflow, a NaN stays a NaN): e = exp(-|x|); x >= 0 ? 1 / (1 + e) : e / (1 + e).
+DS41_FI float sigmoid_split(float x) {
+    const float e = exp_f(-fabsf(x));
+    const float d = dev::fadd_rn(1.0f, e);
+    return x >= 0.0f ? dev::fdiv_rn(1.0f, d) : dev::fdiv_rn(e, d);
+}
+
+// ---- loads and stores with the alignment the access needs (the emulator asserts it) ---------------------------------------------------------
+/// A 16-bit global load (the Q8_0 block scale and quants are only 2-byte aligned: 34-byte blocks).
+DS41_FI uint32_t ldg16(const void* p) {
+#if defined(DS41_EMU)
+    dev::emu_check_align(p, 2, "ldg16 (LDG.U16)");
+    uint16_t v;
+    std::memcpy(&v, p, 2);
+    return v;
+#else
+    return (uint32_t) __ldg(reinterpret_cast<const unsigned short*>(p));
+#endif
+}
+/// Plain (coherent) 16-byte load / store: for data a kernel may overwrite itself (in-place norm / RoPE) and for shared memory.
+DS41_FI uint4 ld16b(const void* p) {
+    DS41_ASSERT_ALIGNED(p, 16);
+    return *reinterpret_cast<const uint4*>(p);
+}
+DS41_FI void st16b(void* p, uint4 v) {
+    DS41_ASSERT_ALIGNED(p, 16);
+    *reinterpret_cast<uint4*>(p) = v;
+}
+DS41_FI float4 ldf4(const void* p) {
+    DS41_ASSERT_ALIGNED(p, 16);
+    return *reinterpret_cast<const float4*>(p);
+}
+DS41_FI void stf4(void* p, float4 v) {
+    DS41_ASSERT_ALIGNED(p, 16);
+    *reinterpret_cast<float4*>(p) = v;
+}
 
 // ---- the card ---------------------------------------------------------------------------------------------------------------------------
 /// Streaming multiprocessors of the current device (the launch heuristics only: how many rows one block takes).  80 in the emulation.

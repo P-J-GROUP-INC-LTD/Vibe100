@@ -6,6 +6,10 @@
 #   ds41_mhc_emu_test         the SAME kernel sources (src/ds41/cuda/mhc_impl.cuh, engram_impl.cuh) compiled for the host with -DDS41_EMU (mhc_emu_impl.cpp,
 #   ds41_engram_emu_test      engram_emu_impl.cpp) and run on the CPU through the thread-model emulation (ds41_emu.hpp), at MiniGeom and RealGeom shapes, in
 #                             forward / reverse / shuffled scheduling order, against the NumPy oracle's golden data.  POSIX only (ucontext).
+#   ds41_mhc_gpu_test         the SAME test sources (mhc_test.cpp, engram_test.cpp, -DDS1D_ON_GPU) against the kernels nvcc built for sm_70, on the V100, RealGeom only, plus
+#   ds41_engram_gpu_test      a `perf` suite (time and effective bandwidth of every op: information).  Needs the card, so NOT registered with ctest; defined when CUDA is
+#                             enabled, in `all` with STRATA_BUILD_TESTS or STRATA_DS41_CUDA_PARITY.  Run: <prog> --golden <build>/ds1d_golden (after the ds1d_golden fixture ran:
+#                             ctest -R ds1d_golden, or python3 src/ds41/engram/golden/gen_golden.py --out DIR).
 #   ds1d_golden               a CTest FIXTURE: src/ds41/engram/golden/gen_golden.py runs the oracle (ref/ds41) and the mini-GGUF generator and writes the golden .npy
 #                             files into <build>/ds1d_golden (needs python3 with numpy; a failure fails every test that requires it, none is skipped).
 #
@@ -27,14 +31,32 @@ if(STRATA_ENABLE_CUDA)
   # product and sum that must not be contracted (fmul_rn / fadd_rn, ds41_dev.cuh).
 endif()
 
+# ---- the V100 programs: the same test sources against the sm_70 kernels (RealGeom) ----------------------------------------------------
+if(STRATA_ENABLE_CUDA)
+  set(_ds1d_gpu_all EXCLUDE_FROM_ALL)
+  if(STRATA_BUILD_TESTS OR STRATA_DS41_CUDA_PARITY)
+    set(_ds1d_gpu_all "")
+  endif()
+  add_executable(ds41_mhc_gpu_test ${_ds1d_gpu_all} ${_ds41m_cuda}/mhc_test.cpp)
+  add_executable(ds41_engram_gpu_test ${_ds1d_gpu_all} ${_ds41m_cuda}/engram_test.cpp)
+  foreach(_t ds41_mhc_gpu_test ds41_engram_gpu_test)
+    target_compile_definitions(${_t} PRIVATE DS1D_ON_GPU=1)
+    target_include_directories(${_t} PRIVATE ${PROJECT_SOURCE_DIR}/include ${_ds41m_cuda} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(${_t} PRIVATE strata_ds41_mhc CUDA::cudart)
+    if(NOT MSVC)
+      target_compile_options(${_t} PRIVATE -ffp-contract=off)
+    endif()
+  endforeach()
+endif()
+
 # ---- the emulator tests (no CUDA toolchain needed) ----------------------------------------------------------------------------------
 if(NOT WIN32)
   set(_ds1d_all EXCLUDE_FROM_ALL)
   if(STRATA_BUILD_TESTS)
     set(_ds1d_all "")
   endif()
-  add_executable(ds41_mhc_emu_test ${_ds1d_all} ${_ds41m_cuda}/mhc_emu_test.cpp ${_ds41m_cuda}/mhc_emu_impl.cpp)
-  add_executable(ds41_engram_emu_test ${_ds1d_all} ${_ds41m_cuda}/engram_emu_test.cpp ${_ds41m_cuda}/engram_emu_impl.cpp)
+  add_executable(ds41_mhc_emu_test ${_ds1d_all} ${_ds41m_cuda}/mhc_test.cpp ${_ds41m_cuda}/mhc_emu_impl.cpp)
+  add_executable(ds41_engram_emu_test ${_ds1d_all} ${_ds41m_cuda}/engram_test.cpp ${_ds41m_cuda}/engram_emu_impl.cpp)
   foreach(_t ds41_mhc_emu_test ds41_engram_emu_test)
     target_include_directories(${_t} PRIVATE ${PROJECT_SOURCE_DIR}/include ${_ds41m_cuda})
     if(NOT MSVC)

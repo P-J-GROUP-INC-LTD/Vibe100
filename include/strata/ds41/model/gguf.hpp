@@ -166,6 +166,8 @@ public:
     /// madvise(MADV_RANDOM) over the tensor: a table read by 136-byte rows at random (the Engram tables, 52 GB each) must not be
     /// read ahead.  Returns false where the platform has no madvise (a no-op there).
     bool advise_random(const TensorLoc& t) const;
+    /// madvise(MADV_WILLNEED) over the tensor: the kernel starts reading it now (the loader asks for the next layer's expert tensors while it copies this one's).
+    bool prefetch(const TensorLoc& t) const;
     /// Drops the pages of [off, off + len) of the tensor from this process and from the page cache (clean file pages only):
     /// the experts were read once into the arena and must not push the Engram tables out.  A no-op where unsupported.
     void drop_cache(const TensorLoc& t, uint64_t off = 0, uint64_t len = ~0ull) const;

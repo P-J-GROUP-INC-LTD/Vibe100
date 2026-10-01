@@ -69,6 +69,12 @@ struct HcWeights {
     const float* base;   // [kHcMixes]
 };
 
+/// HcWeights from the loader's tensors (DS1-A's `DevTensor`, or anything with `template <class T> const T* as() const`): fn = hc_{attn,ffn}_fn, scale = ..._scale, base = ..._base.
+template <class Tensor>
+HcWeights hc_weights_of(const Tensor& fn, const Tensor& scale, const Tensor& base) {
+    return HcWeights{fn.template as<float>(), scale.template as<float>(), base.template as<float>()};
+}
+
 /// Number of K-slices hc_mixes splits the flattened stream into (one thread block each, 256 floats of K per block).
 template <class G> constexpr int hc_slices() { return Derived<G>::kHcFlat / 256; }
 

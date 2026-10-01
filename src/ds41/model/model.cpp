@@ -11,7 +11,6 @@ namespace strata::ds41::model {
 
 namespace {
 
-constexpr uint64_t kUploadPiece = 64ull << 20;     // a dense tensor goes up in pieces of this size, straight from the mapping
 constexpr uint64_t kDevAlign = 256;                // every tensor starts on a 256-byte boundary of the device block
 
 uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
@@ -118,8 +117,10 @@ void WeightsCore::release() {
     token_embd = HostTensor{};
 }
 
-void WeightsCore::load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& c, const std::vector<TensorSpec>& specs, const TensorDir& dir, const LogFn& log) {
+void WeightsCore::load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& c, const std::vector<TensorSpec>& specs, const TensorDir& dir, const LogFn& log,
+                       uint64_t piece_bytes) {
     release();
+    if (piece_bytes == 0) throw ModelError("WeightsCore::load: an upload piece of 0 bytes");
     dev_ = &dev;
     cfg = &c;
     layer.assign((size_t) c.n_layer, LayerWeights{});
@@ -151,8 +152,8 @@ void WeightsCore::load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& c, 
     uint64_t done = 0;
     for (const Item& it : items) {
         const uint8_t* src = gguf.data(*it.loc);
-        for (uint64_t pos = 0; pos < it.loc->nbytes; pos += kUploadPiece)
-            dev.h2d(base + it.off + pos, src + pos, (size_t) std::min<uint64_t>(kUploadPiece, it.loc->nbytes - pos));
+        for (uint64_t pos = 0; pos < it.loc->nbytes; pos += piece_bytes)
+            dev.h2d(base + it.off + pos, src + pos, (size_t) std::min<uint64_t>(piece_bytes, it.loc->nbytes - pos));
         done += it.loc->nbytes;
         const DevTensor dt = make_dev(*it.loc, base + it.off);
         if (it.spec->lt == LT::OutputNorm) output_norm = dt;
@@ -198,6 +199,58 @@ void WeightsCore::load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& c, 
         default: throw ModelError("internal: tensor `" + s.name + "` has no home");
         }
     }
+}
+
+// ================================================================================================ RoPE tables on the device
+DeviceRope::DeviceRope(ModelDev& dev, const Ds41Config& c, int n_pos) : dev_(&dev), n_pos_(n_pos) {
+    if (n_pos <= 0) throw ModelError("DeviceRope: " + std::to_string(n_pos) + " positions");
+    if (c.rope_dim <= 0 || c.rope_dim % 2) throw ModelError("DeviceRope: rope dimension " + std::to_string(c.rope_dim));
+    try {
+        for (int kind = 0; kind < 2; ++kind) {
+            const RopeTable t = build_rope_table(kind ? c.rope_csa : c.rope_swa, c.rope_dim, n_pos);
+            const size_t n = t.cos.size() * sizeof(float);
+            cos_[kind] = static_cast<float*>(dev.alloc(n));
+            sin_[kind] = static_cast<float*>(dev.alloc(n));
+            dev.h2d(cos_[kind], t.cos.data(), n);
+            dev.h2d(sin_[kind], t.sin.data(), n);
+            bytes_ += 2 * n;
+        }
+    } catch (...) {
+        release();
+        throw;
+    }
+    kind_.resize((size_t) c.n_layer);
+    for (int l = 0; l < c.n_layer; ++l) kind_[(size_t) l] = c.layer(l).ratio ? 1 : 0;
+}
+
+DeviceRope& DeviceRope::operator=(DeviceRope&& o) noexcept {
+    if (this != &o) {
+        release();
+        dev_ = o.dev_;
+        for (int k = 0; k < 2; ++k) {
+            cos_[k] = o.cos_[k];
+            sin_[k] = o.sin_[k];
+            o.cos_[k] = o.sin_[k] = nullptr;
+        }
+        kind_ = std::move(o.kind_);
+        n_pos_ = o.n_pos_;
+        bytes_ = o.bytes_;
+        o.dev_ = nullptr;
+        o.n_pos_ = 0;
+        o.bytes_ = 0;
+    }
+    return *this;
+}
+
+void DeviceRope::release() {
+    for (int k = 0; k < 2; ++k) {
+        if (dev_ && cos_[k]) dev_->release(cos_[k]);
+        if (dev_ && sin_[k]) dev_->release(sin_[k]);
+        cos_[k] = sin_[k] = nullptr;
+    }
+    kind_.clear();
+    n_pos_ = 0;
+    bytes_ = 0;
 }
 
 // ================================================================================================ the load sequence
@@ -254,7 +307,7 @@ void load_parts(ModelDev& dev, const GgufSet& gguf, const Ds41Config& cfg, const
             throw ModelError("initial fill names expert " + std::to_string(e.layer) + ":" + std::to_string(e.expert) + ", outside the model");
 
     // ---- the dense weights go to the device; the big tables are mapped
-    weights.load(dev, gguf, cfg, specs, dir, log);
+    weights.load(dev, gguf, cfg, specs, dir, log, opt.upload_piece_bytes);
     if (opt.drop_page_cache) {
         for (const TensorSpec& s : specs)
             if (on_device(s.lt)) gguf.drop_cache(dir.at(s.name));      // the device has its copy; the page cache need not keep the file's
@@ -272,9 +325,16 @@ void load_parts(ModelDev& dev, const GgufSet& gguf, const Ds41Config& cfg, const
     if (opt.build_arena) {
         ArenaOptions ao = opt.arena;
         ao.log = log;
+        const auto prefetch_layer = [&](int l) {
+            if (l < 0 || l >= cfg.n_layer) return;
+            for (const TensorLoc* t : {slices[(size_t) l].loc_gate, slices[(size_t) l].loc_up, slices[(size_t) l].loc_down})
+                if (t) gguf.prefetch(*t);
+        };
+        for (int l = 0; l < std::min(opt.prefetch_layers, cfg.n_layer); ++l) prefetch_layer(l);
         const std::function<void(int)> user_done = opt.arena.layer_done;
         int n_done = 0;
         ao.layer_done = [&, user_done](int l) {
+            if (opt.prefetch_layers > 0) prefetch_layer(l + opt.prefetch_layers);
             if (opt.drop_page_cache) {
                 if (slices[(size_t) l].loc_gate) gguf.drop_cache(*slices[(size_t) l].loc_gate);
                 if (slices[(size_t) l].loc_up) gguf.drop_cache(*slices[(size_t) l].loc_up);

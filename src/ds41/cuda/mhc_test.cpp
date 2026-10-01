@@ -1,10 +1,14 @@
-// src/ds41/cuda/mhc_emu_test.cpp - DS1-D: the mHC kernels (src/ds41/cuda/mhc_impl.cuh, the SAME source nvcc compiles for sm_70) run on the CPU through the
-// thread-model emulation (ds41_emu.hpp), against the NumPy oracle's golden data (src/ds41/engram/golden/gen_golden.py: ref/ds41/mhc.py run in FLOAT64 and in
-// FLOAT32) at MiniGeom's and RealGeom's shapes.  No GPU needed.
+// src/ds41/cuda/mhc_test.cpp - DS1-D: the mHC kernels (src/ds41/cuda/mhc_impl.cuh, the SAME source nvcc compiles for sm_70) against the NumPy oracle's golden data
+// (src/ds41/engram/golden/gen_golden.py: ref/ds41/mhc.py run in FLOAT64 and in FLOAT32).  One test source, two programs:
+//
+//   ds41_mhc_emu_test   the kernels run on the CPU through the thread-model emulation (ds41_emu.hpp), at MiniGeom's and RealGeom's shapes, in any scheduling order.  No GPU needed.
+//   ds41_mhc_gpu_test   (-DDS1D_ON_GPU) the kernels as nvcc built them for sm_70, on the V100, RealGeom only; the suites that are about the emulator's scheduling orders are not run, and a
+//                       `perf` suite prints the time and effective bandwidth of every op (information, no threshold).  Not registered with ctest: needs the GPU.
 //
 //   ds41_mhc_emu_test --golden DIR [--suite NAME ...] [--order forward|reverse|shuffle[:SEED]]
+//   ds41_mhc_gpu_test --golden DIR [--suite NAME ...]
 //
-// Suites (default: all):
+// Suites (default: all; `perf` only on the GPU):
 //   mixes    hc_mixes (GEMV over the flattened stream, rsqrt scale, split + Sinkhorn) against the FLOAT64 oracle, two parameter regimes, T = 5 tokens.
 //   split    the split / Sinkhorn alone on mixes of every magnitude (saturated sigmoids and softmaxes, zeros, +-80 patterns).
 //   prepost  hc_pre / hc_post: bit-identical to the oracle's FLOAT32 evaluation (both evaluate in the same order) and close to FLOAT64; in-place == out of place.
@@ -21,9 +25,13 @@
 #include <string>
 #include <vector>
 
-#include "ds41_emu.hpp"
 #include "mhc_test_util.hpp"
 #include "strata/ds41/cuda/mhc.hpp"
+#ifdef DS1D_ON_GPU
+#include "strata/ds41/cuda/ds41_cuda_runtime.hpp"
+#else
+#include "ds41_emu.hpp"
+#endif
 
 using namespace strata::ds41;
 using namespace strata::ds41::cuda;
@@ -31,8 +39,16 @@ using namespace ds1d;
 
 namespace {
 
+#ifdef DS1D_ON_GPU
+using TestDev = CudaDev;
+#define DS1D_GEOMS(fn, c) fn<RealGeom>(c)
+#else
+using TestDev = HostDev;
+#define DS1D_GEOMS(fn, c) do { fn<MiniGeom>(c); fn<RealGeom>(c); } while (0)
+#endif
+
 struct Ctx {
-    HostDev dev;
+    TestDev dev;
     Report rep;
     Golden* gold = nullptr;
 };
@@ -50,6 +66,7 @@ const char* geom_name(const RealGeom*) { return "real"; }
 template <class G> const char* gname() { return geom_name((const G*) nullptr); }
 
 double tol_of(const Err& oracle32, double floor_abs) { return std::max(4.0 * oracle32.max_abs, floor_abs); }
+double tol_exp(const Err& oracle32, double floor_abs) { return std::max(4.0 * oracle32.max_abs, kLibmFactor * floor_abs); }       // for results that went through expf
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 template <class G>
@@ -69,7 +86,7 @@ void suite_mixes(Ctx& c) {
         const auto gm = mixes.down(), gc = coef.down();
         const Err em = compare(gm.data(), m64.data(), gm.size()), em32 = compare(m32.data(), m64.data(), gm.size());
         const Err ec = compare(gc.data(), c64.data(), gc.size()), ec32 = compare(c32.data(), c64.data(), gc.size());
-        const double tm = tol_of(em32, 4e-7 * em.max_ref), tc = tol_of(ec32, 1e-6);
+        const double tm = tol_of(em32, 4e-7 * em.max_ref), tc = tol_exp(ec32, 1e-6);
         c.rep.check(em.nan_mismatch == 0 && em.max_abs <= tm, fmt("mixes  %s/%s  T=%d K=%d", gname<G>(), cs, T, K),
                     fmt("%s  (tol %.2e; oracle fp32 %.2e)", describe(em).c_str(), tm, em32.max_abs));
         c.rep.check(ec.nan_mismatch == 0 && ec.max_abs <= tc, fmt("coef   %s/%s  pre/post/comb", gname<G>(), cs),
@@ -98,10 +115,27 @@ void suite_split(Ctx& c) {
     DevBuf<float> coef(c.dev, (size_t) N * NR);
     ds41_hc_split<G>(c.dev, dm.p(), dsc.p(), dba.p(), N, HcParams{}, coef.p);
     const auto got = coef.down();
-    const Err e = compare(got.data(), c64.data(), got.size()), e32 = compare(c32.data(), c64.data(), got.size());
-    const double tol = tol_of(e32, 2e-6);
-    c.rep.check(e.nan_mismatch == 0 && e.max_abs <= tol, fmt("split  %s  %d rows of mixes (|m| up to 1000, zeros, +-80)", gname<G>(), N),
-                fmt("%s  (tol %.2e; oracle fp32 %.2e)", describe(e).c_str(), tol, e32.max_abs));
+    // per row and per part (pre, post, comb): within max(4 * the oracle's own float32 error on that part of that row, 1.5e-7) of the float64 value - tight enough to see a missing eps
+    // (1e-6) in `pre` or in one Sinkhorn denominator
+    bool ok_all = true;
+    std::string worst_row;
+    double worst_ratio = 0;
+    const int parts[3][2] = {{0, G::kHc}, {G::kHc, 2 * G::kHc}, {2 * G::kHc, NR}};
+    const char* part_name[3] = {"pre", "post", "comb"};
+    for (int t = 0; t < N; ++t)
+        for (int pi = 0; pi < 3; ++pi) {
+            const size_t off = (size_t) t * NR + parts[pi][0], n = (size_t) (parts[pi][1] - parts[pi][0]);
+            const Err e = compare(got.data() + off, c64.data() + off, n), e32 = compare(c32.data() + off, c64.data() + off, n);
+            const double tol = tol_exp(e32, 1.5e-7);
+            const bool ok = e.nan_mismatch == 0 && e.max_abs <= tol;
+            if (e.max_abs / tol > worst_ratio) {
+                worst_ratio = e.max_abs / tol;
+                worst_row = fmt("row %d %s: err %.2e (tol %.2e, oracle fp32 %.2e)", t, part_name[pi], e.max_abs, tol, e32.max_abs);
+            }
+            ok_all = ok_all && ok;
+        }
+    c.rep.check(ok_all, fmt("split  %s  %d rows of mixes (|m| up to 1000, zeros, +-80): every part of every row within 4x the oracle's float32 error", gname<G>(), N),
+                "worst: " + worst_row);
     // every row finite, pre in (0, 1 + eps], post in [0, 2], comb in [0, 1]
     bool ok = true;
     for (int t = 0; t < N; ++t)
@@ -149,13 +183,16 @@ void suite_prepost(Ctx& c) {
 // ---------------------------------------------------------------------------------------------------------------------------------
 // chain: model.py Model.block order through the per-sub-layer API, with elementwise toy sub-layers (exact in binary: the oracle runs the same functions)
 template <class G>
-void toy(float* y, size_t n, float a, float b) {
-    for (size_t i = 0; i < n; ++i) y[i] = a * y[i] + b;           // a, b powers of two: exact; the emulation's device memory is host memory
+void toy(Dev& dev, float* y, size_t n, float a, float b) {
+    std::vector<float> v(n);
+    dev.d2h(v.data(), y, n * sizeof(float));
+    for (size_t i = 0; i < n; ++i) v[i] = a * v[i] + b;           // a, b powers of two: exact in float32 and float64 alike
+    dev.h2d(y, v.data(), n * sizeof(float));
 }
 
 template <class G>
 std::vector<float> run_chain(Ctx& c, const Arr<float>& x0, const Arr<float>& fn, const Arr<float>& scale, const Arr<float>& base, int L, int T, std::vector<float>* final_out,
-                             std::vector<float>* pre_trace = nullptr) {
+                             std::vector<float>* pre_trace = nullptr, int broken = 0) {
     constexpr int NR = G::kHcMixes, H = G::kHidden, HC = G::kHc, K = Derived<G>::kHcFlat;
     Up<float> dx(c.dev, x0);
     DevBuf<float> y(c.dev, (size_t) T * H), h(c.dev, (size_t) T * H);
@@ -171,13 +208,18 @@ std::vector<float> run_chain(Ctx& c, const Arr<float>& x0, const Arr<float>& fn,
             dsc.up(std::vector<float>(scale.v.begin() + 3 * i, scale.v.begin() + 3 * i + 3));
             dba.up(std::vector<float>(base.v.begin() + (size_t) NR * i, base.v.begin() + (size_t) NR * (i + 1)));
             HcWeights w{dfn.p, dsc.p, dba.p};
-            if (sub == 0) {
+            if (sub == 0 && broken == 1) {                      // NEGATIVE CONTROL: the attention collapses with its OWN pre instead of the lag (a "no lag" implementation)
+                ds41_hc_mixes<G>(c.dev, dx.p(), w, T, HcParams{}, rec.a, ws.p, hc_scratch_bytes<G>(T));
+                ds41_hc_pre<G>(c.dev, dx.p(), rec.a, T, y.p);
+                toy<G>(c.dev, y.p, (size_t) T * H, 0.5f, 0.0f);
+                ds41_hc_attn_out<G>(c.dev, y.p, dx.p(), T, rec);
+            } else if (sub == 0) {
                 ds41_hc_attn_in<G>(c.dev, dx.p(), w, T, HcParams{}, rec, y.p, ws.p, hc_scratch_bytes<G>(T));
-                toy<G>(y.p, (size_t) T * H, 0.5f, 0.0f);
+                toy<G>(c.dev, y.p, (size_t) T * H, 0.5f, 0.0f);
                 ds41_hc_attn_out<G>(c.dev, y.p, dx.p(), T, rec);
             } else {
                 ds41_hc_ffn_in<G>(c.dev, dx.p(), w, T, HcParams{}, rec, y.p, ws.p, hc_scratch_bytes<G>(T));
-                toy<G>(y.p, (size_t) T * H, 0.25f, 0.5f);
+                toy<G>(c.dev, y.p, (size_t) T * H, 0.25f, 0.5f);
                 ds41_hc_ffn_out<G>(c.dev, y.p, dx.p(), T, rec);
             }
         }
@@ -188,7 +230,8 @@ std::vector<float> run_chain(Ctx& c, const Arr<float>& x0, const Arr<float>& fn,
                 for (int k = 0; k < HC; ++k) pre_trace->push_back(rv[(size_t) t * NR + k]);
         }
     }
-    ds41_hc_head_fold<G>(c.dev, dx.p(), rec, T, h.p);
+    if (broken == 2) ds41_hc_pre<G>(c.dev, dx.p(), rec.f, T, h.p);      // NEGATIVE CONTROL: the head fold with the wrong record (the one before the last FFN's)
+    else ds41_hc_head_fold<G>(c.dev, dx.p(), rec, T, h.p);
     if (final_out) *final_out = h.down();
     std::vector<float> xs((size_t) T * HC * H);
     c.dev.d2h(xs.data(), dx.p(), xs.size() * sizeof(float));
@@ -207,13 +250,21 @@ void suite_chain(Ctx& c) {
     const auto xs = run_chain<G>(c, x0, fn, scale, base, L, T, &fin, &pre_trace);
     const Err es = compare(xs.data(), s64.data(), xs.size()), es32 = compare(s32.data(), s64.data(), xs.size());
     const Err ef = compare(fin.data(), f64.data(), fin.size()), ef32 = compare(f32.data(), f64.data(), fin.size());
-    c.rep.check(es.nan_mismatch == 0 && es.max_abs <= tol_of(es32, 1e-6 * es.max_ref), fmt("chain  %s  %d blocks x 2 sub-layers, T=%d: stream after the last block", gname<G>(), L, T),
+    c.rep.check(es.nan_mismatch == 0 && es.max_abs <= tol_exp(es32, 1e-6 * es.max_ref), fmt("chain  %s  %d blocks x 2 sub-layers, T=%d: stream after the last block", gname<G>(), L, T),
                 fmt("%s  (oracle fp32 %.2e)", describe(es).c_str(), es32.max_abs));
-    c.rep.check(ef.nan_mismatch == 0 && ef.max_abs <= tol_of(ef32, 1e-6 * ef.max_ref), fmt("chain  %s  final head fold (the last FFN's pre)", gname<G>()),
+    c.rep.check(ef.nan_mismatch == 0 && ef.max_abs <= tol_exp(ef32, 1e-6 * ef.max_ref), fmt("chain  %s  final head fold (the last FFN's pre)", gname<G>()),
                 fmt("%s  (oracle fp32 %.2e)", describe(ef).c_str(), ef32.max_abs));
     c.rep.check((int) pre_trace.size() == L * T * G::kHc, fmt("chain  %s  pre_mix trace has %d blocks", gname<G>(), L));
-    // the lag is what the chain tests: with the lag broken (block 0 attention collapsing with an FFN pre, or the head fold with the attention's pre) the result differs by far more
-    // than the tolerance; check that the tolerance is tight enough to see it by comparing against the float32 oracle of a block-0-only run
+    // negative controls: the same chain with the lag wrong (every attention collapsing with its own pre; the head fold with the wrong record) must be REJECTED by the tolerance that
+    // accepted the real one - a pass above that could not fail would prove nothing
+    for (int mode = 1; mode <= 2; ++mode) {
+        std::vector<float> finb;
+        const auto xb = run_chain<G>(c, x0, fn, scale, base, L, T, &finb, nullptr, mode);
+        const Err eb = mode == 1 ? compare(xb.data(), s64.data(), xb.size()) : compare(finb.data(), f64.data(), finb.size());
+        const double tol = mode == 1 ? tol_exp(es32, 1e-6 * es.max_ref) : tol_exp(ef32, 1e-6 * ef.max_ref);
+        c.rep.check(eb.max_abs > 100.0 * tol, fmt("chain  %s  negative control %d (%s) is rejected: error %.3e vs tolerance %.3e", gname<G>(), mode,
+                                                  mode == 1 ? "attention without the lag" : "head fold with the wrong record", eb.max_abs, tol));
+    }
     // T-invariance of the whole chain: every token alone gives the same bits as in the batch
     bool same = true;
     for (int t = 0; t < T && same; ++t) {
@@ -264,6 +315,7 @@ void suite_tinv(Ctx& c) {
     c.rep.check(all, fmt("tinv   %s  hc_mixes: coefficients of a token are bit-identical for T = 2..9, 17 and alone", gname<G>()), bad);
 }
 
+#ifndef DS1D_ON_GPU
 template <class G>
 void suite_order(Ctx& c) {
     // the same call under the three scheduling orders of the emulator must give the same bits (no atomics, fixed reduction order)
@@ -298,6 +350,7 @@ void suite_order(Ctx& c) {
     ds41_emu::g_order = saved_order;
     c.rep.check(ok, fmt("order  %s  hc_mixes / hc_pre / hc_post bit-identical in forward, reverse and two shuffled schedules", gname<G>()), bad);
 }
+#endif
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 template <class G>
@@ -309,6 +362,14 @@ void suite_edge(Ctx& c) {
     for (auto& v : ba) v = (float) (0.5 * rng.normal());
     Up<float> dfn(c.dev, fnv), dsc(c.dev, sc), dba(c.dev, ba);
     HcWeights w{dfn.p(), dsc.p(), dba.p()};
+    {   // hc_weights_of: the order of (fn, scale, base) and the float views of the loader's tensors
+        struct FakeTensor {
+            const void* p;
+            template <class T> const T* as() const { return static_cast<const T*>(p); }
+        };
+        const HcWeights w2 = hc_weights_of(FakeTensor{dfn.p()}, FakeTensor{dsc.p()}, FakeTensor{dba.p()});
+        c.rep.check(w2.fn == w.fn && w2.scale == w.scale && w2.base == w.base, fmt("edge   %s  hc_weights_of(fn, scale, base) maps the loader's tensors", gname<G>()));
+    }
 
     // zero stream: mixes = 0 * rsqrt(0 + 1e-20) = 0 -> pre = sigmoid(base) + eps, post = 2 sigmoid(base), exactly the formulas of mhc.py
     {
@@ -321,7 +382,7 @@ void suite_edge(Ctx& c) {
             const double pre = 1.0 / (1.0 + std::exp(-(double) ba[k])) + 1e-6, post = 2.0 / (1.0 + std::exp(-(double) ba[HC + k]));
             worst = std::max({worst, std::fabs(coef[k] - pre), std::fabs(coef[HC + k] - post)});
         }
-        c.rep.check(finite && worst < 2e-7, fmt("edge   %s  zero stream: finite, pre = sigmoid(base) + eps, post = 2 sigmoid(base)", gname<G>()), fmt("max err %.2e", worst));
+        c.rep.check(finite && worst < kLibmFactor * 2e-7, fmt("edge   %s  zero stream: finite, pre = sigmoid(base) + eps, post = 2 sigmoid(base)", gname<G>()), fmt("max err %.2e", worst));
     }
     // NaN / Inf in the stream propagate (a failure upstream is not laundered into a finite coefficient): the sum of squares is NaN, so every mixes lane is NaN
     {
@@ -395,6 +456,43 @@ void suite_edge(Ctx& c) {
     }
 }
 
+#ifdef DS1D_ON_GPU
+// information only (no threshold): what the kernels cost on this card, per call, in the decode shape (T = 1) and a verify window (T = 8)
+template <class G>
+void suite_perf(Ctx& c) {
+    constexpr int NR = G::kHcMixes, H = G::kHidden, HC = G::kHc, K = Derived<G>::kHcFlat;
+    const std::string d = std::string("mhc_") + gname<G>() + "/b/";
+    const auto x = c.gold->get<float>(d + "x"), fn = c.gold->get<float>(d + "fn"), scale = c.gold->get<float>(d + "scale"), base = c.gold->get<float>(d + "base"),
+               f = c.gold->get<float>(d + "f"), cf = c.gold->get<float>(d + "coef32");
+    for (int i = 0; i < 4; ++i) {
+        const HcKernelInfo ki = ds41_hc_kernel_info<G>(i);
+        c.rep.info(fmt("hc kernel %d (%s): %d registers, %d B static shared memory", i, i == 0 ? "partial GEMV" : i == 1 ? "finalize / Sinkhorn" : i == 2 ? "hc_pre" : "hc_post", ki.regs, ki.static_smem));
+    }
+    for (const int T : {1, 8}) {
+        std::vector<float> xs, fs, cs;
+        for (int t = 0; t < T; ++t) {
+            xs.insert(xs.end(), x.v.begin() + (size_t) (t % 5) * K, x.v.begin() + (size_t) (t % 5 + 1) * K);
+            fs.insert(fs.end(), f.v.begin() + (size_t) (t % 5) * H, f.v.begin() + (size_t) (t % 5 + 1) * H);
+            cs.insert(cs.end(), cf.v.begin() + (size_t) (t % 5) * NR, cf.v.begin() + (size_t) (t % 5 + 1) * NR);
+        }
+        Up<float> dx(c.dev, xs), df(c.dev, fs), dcf(c.dev, cs), dfn(c.dev, fn), dsc(c.dev, scale), dba(c.dev, base);
+        DevBuf<float> coef(c.dev, (size_t) T * NR), y(c.dev, (size_t) T * H), out(c.dev, (size_t) T * HC * H), stream(c.dev, (size_t) T * HC * H);
+        DevBuf<unsigned char> ws(c.dev, hc_scratch_bytes<G>(T));
+        const HcWeights w{dfn.p(), dsc.p(), dba.p()};
+        auto line = [&](const char* what, double bytes, const std::function<void()>& fn_) {
+            const double us = c.dev.time_us(fn_, 200);
+            c.rep.info(fmt("perf   T=%d  %-34s %8.2f us   %7.1f GB/s effective (%.2f MB moved)", T, what, us, bytes / us * 1e-3, bytes * 1e-6));
+        };
+        line("hc_mixes (partial + finalize)", (double) NR * K * 4 + (double) T * K * 4, [&] { ds41_hc_mixes<G>(c.dev, dx.p(), w, T, HcParams{}, coef.p, ws.p, hc_scratch_bytes<G>(T)); });
+        line("hc_pre", (double) T * (HC + 1) * H * 4, [&] { ds41_hc_pre<G>(c.dev, dx.p(), dcf.p(), T, y.p); });
+        line("hc_post (out of place)", (double) T * (2 * HC + 1) * H * 4, [&] { ds41_hc_post<G>(c.dev, df.p(), dx.p(), dcf.p(), T, out.p); });
+        c.dev.d2d_async(stream.p, dx.p(), (size_t) T * HC * H * sizeof(float), nullptr);
+        line("hc_post (in place)", (double) T * (2 * HC + 1) * H * 4, [&] { ds41_hc_post<G>(c.dev, df.p(), stream.p, dcf.p(), T, stream.p); });
+        line("hc_expand", (double) T * (HC + 1) * H * 4, [&] { ds41_hc_expand<G>(c.dev, y.p, T, out.p); });
+    }
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -404,13 +502,20 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--golden" && i + 1 < argc) golden = argv[++i];
         else if (a == "--suite" && i + 1 < argc) suites.push_back(argv[++i]);
+#ifndef DS1D_ON_GPU
         else if (a == "--order" && i + 1 < argc) {
             if (!ds41_emu::set_order_from_string(argv[++i])) {
                 std::fprintf(stderr, "bad --order\n");
                 return 2;
             }
-        } else {
+        }
+#endif
+        else {
+#ifdef DS1D_ON_GPU
+            std::fprintf(stderr, "usage: %s --golden DIR [--suite mixes|split|prepost|chain|tinv|edge|perf]...\n", argv[0]);
+#else
             std::fprintf(stderr, "usage: %s --golden DIR [--suite mixes|split|prepost|chain|tinv|order|edge]... [--order forward|reverse|shuffle[:SEED]]\n", argv[0]);
+#endif
             return 2;
         }
     }
@@ -423,15 +528,26 @@ int main(int argc, char** argv) {
         Golden g(golden);
         Ctx c;
         c.gold = &g;
+#ifdef DS1D_ON_GPU
+        std::printf("ds41_mhc_gpu_test: the sm_70 kernels, golden %s\n", golden.c_str());
+#else
         std::printf("ds41_mhc_emu_test: scheduling order %s, golden %s\n", ds41_emu::order_name(), golden.c_str());
-        if (want("mixes")) { suite_mixes<MiniGeom>(c); suite_mixes<RealGeom>(c); }
-        if (want("split")) { suite_split<MiniGeom>(c); suite_split<RealGeom>(c); }
-        if (want("prepost")) { suite_prepost<MiniGeom>(c); suite_prepost<RealGeom>(c); }
-        if (want("chain")) { suite_chain<MiniGeom>(c); suite_chain<RealGeom>(c); }
-        if (want("tinv")) { suite_tinv<MiniGeom>(c); suite_tinv<RealGeom>(c); }
-        if (want("order")) { suite_order<MiniGeom>(c); suite_order<RealGeom>(c); }
-        if (want("edge")) { suite_edge<MiniGeom>(c); suite_edge<RealGeom>(c); }
+#endif
+        if (want("mixes")) DS1D_GEOMS(suite_mixes, c);
+        if (want("split")) DS1D_GEOMS(suite_split, c);
+        if (want("prepost")) DS1D_GEOMS(suite_prepost, c);
+        if (want("chain")) DS1D_GEOMS(suite_chain, c);
+        if (want("tinv")) DS1D_GEOMS(suite_tinv, c);
+        if (want("edge")) DS1D_GEOMS(suite_edge, c);
+#ifdef DS1D_ON_GPU
+        if (want("order")) c.rep.info("order: the emulator's scheduling orders do not exist on the GPU: not run");
+        if (suites.empty() || want("perf")) suite_perf<RealGeom>(c);
+        c.dev.sync();
+        return c.rep.finish("ds41_mhc_gpu_test");
+#else
+        if (want("order")) DS1D_GEOMS(suite_order, c);
         return c.rep.finish("ds41_mhc_emu_test");
+#endif
     } catch (const std::exception& e) {
         std::printf("FAIL  exception: %s\n", e.what());
         return 1;

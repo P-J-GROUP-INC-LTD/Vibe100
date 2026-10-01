@@ -146,6 +146,19 @@ template <class G> EngramKernelInfo ds41_engram_kernel_info(int which);
 /// [T][kEngramOut].  The session binds it to DS1-B's GEMV after DS1-G's activation quantiser; enqueue on `stream`.
 using EngramWkvFn = std::function<void(const float* rows, int T, float* kv, Stream stream)>;
 
+/// The wkv hook for any dense-ops provider with the two calls DS1-C's `AttnDenseOps` (attn.hpp) already has and DS1-B's dense.hpp will have:
+///     ops.quantize_acts(const float* x, int T, int k, int8_t* xq, float* xs, Stream)                              CONTRACTS.md's int8-per-32 quantiser
+///     ops.gemv_q8(const void* w, int n, int k, const int8_t* xq, const float* xs, int T, float* y, Stream)         Q8_0 rows x int8 activations (dp4a)
+/// `wkv_q8` = the layer's Q8_0 weight [kEngramOut][kEngramIn] (device), `xq` / `xs` = scratch int8 [t_max][kEngramIn] and float [t_max][kEngramIn / 32]
+/// (EngramRunner::xq() / xs()).  `ops` is held by reference: it must outlive the returned function.
+template <class G, class Ops>
+EngramWkvFn engram_wkv_via_ops(Ops& ops, const void* wkv_q8, int8_t* xq, float* xs) {
+    return [&ops, wkv_q8, xq, xs](const float* rows, int T, float* kv, Stream s) {
+        ops.quantize_acts(rows, T, Derived<G>::kEngramIn, xq, xs, s);
+        ops.gemv_q8(wkv_q8, Derived<G>::kEngramOut, Derived<G>::kEngramIn, xq, xs, T, kv, s);
+    };
+}
+
 /// One Engram layer's weights: the host table and the two BF16 device vectors (the Q8_0 wkv belongs to the hook).
 struct EngramLayerWeights {
     EngramTableView table;
@@ -153,7 +166,7 @@ struct EngramLayerWeights {
     const uint16_t* k_bf16 = nullptr;    // device [kHc][kHidden] BF16 bits
 };
 
-/// Owns the staging memory: a pinned host buffer for the gathered rows and three device buffers (raw rows, FP32 rows, kv), sized for t_max tokens.  Not
+/// Owns the staging memory: a pinned host buffer for the gathered rows and device buffers (raw rows, FP32 rows, kv, int8 scratch for the wkv hook), sized for t_max tokens.  Not
 /// thread-safe; one per session.  DS-1 is synchronous: the h2d copy is blocking (Dev::h2d), so the staging buffer is free again when run() returns its upload.
 template <class G>
 class EngramRunner {
@@ -164,8 +177,12 @@ class EngramRunner {
         raw_ = static_cast<uint8_t*>(dev_.alloc(raw_bytes(t_max)));
         rows_ = static_cast<float*>(dev_.alloc((size_t) t_max * Derived<G>::kEngramIn * sizeof(float)));
         kv_ = static_cast<float*>(dev_.alloc((size_t) t_max * Derived<G>::kEngramOut * sizeof(float)));
+        xq_ = static_cast<int8_t*>(dev_.alloc((size_t) t_max * Derived<G>::kEngramIn));
+        xs_ = static_cast<float*>(dev_.alloc((size_t) t_max * (Derived<G>::kEngramIn / 32) * sizeof(float)));
     }
     ~EngramRunner() {
+        dev_.release(xs_);
+        dev_.release(xq_);
         dev_.release(kv_);
         dev_.release(rows_);
         dev_.release(raw_);
@@ -177,6 +194,8 @@ class EngramRunner {
     int t_max() const { return t_max_; }
     float* rows_f32() const { return rows_; }        // device [t_max][kEngramIn]: the dequantised rows of the last run (tests, tracing)
     float* kv() const { return kv_; }                // device [t_max][kEngramOut]: wkv's output of the last run
+    int8_t* xq() const { return xq_; }               // device [t_max][kEngramIn] / [t_max][kEngramIn / 32]: scratch for the wkv hook's activation quantiser
+    float* xs() const { return xs_; }                // (engram_wkv_via_ops)
 
     /// Gather the kEngramRows rows of each of T tokens (row_idx[t * token_stride + r], from NgramHasher: token_stride = n_layers * rows_per_layer when the
     /// pointer is `out + layer_index * rows_per_layer`) into the staging buffer and copy them to the device.  Blocking.
@@ -208,6 +227,8 @@ class EngramRunner {
     uint8_t* raw_ = nullptr;
     float* rows_ = nullptr;
     float* kv_ = nullptr;
+    int8_t* xq_ = nullptr;
+    float* xs_ = nullptr;
 };
 
 }  // namespace strata::ds41::cuda
