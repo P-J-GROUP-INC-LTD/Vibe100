@@ -25,8 +25,9 @@ One directory per run. `trace.json` plus one little-endian `.npy` (version 1.0, 
 
 `POS` is the 0-based position (5 digits; more are accepted), `LL` the layer (2 digits). **One position per file**, not one file per stage: the engine produces one
 token at a time (prefill in DS-1 is the decode path), a crashed run leaves every finished position readable, and the replay reads single positions. A `.npy` is
-what `numpy.save` writes; the C++ writer needs only the 128-byte-aligned header `{'descr': '<f4', 'fortran_order': False, 'shape': (n,), }` + raw data
-(`tests`: `test_files_are_plain_little_endian_npy`). Integer stages are `int32`.
+what `numpy.save` writes; the C++ writer needs only the 10-byte preamble `\x93NUMPY\x01\x00` + a 2-byte header length + the header text
+`{'descr': '<f4', 'fortran_order': False, 'shape': (n,), }` space-padded and newline-terminated to a multiple of 64 bytes, then the raw data
+(`test_files_are_plain_little_endian_npy`). Integer stages are `int32`.
 
 `trace.json` (required: `format`, `tokens`, `quant`; the rest is documentation and cross-checks):
 
@@ -152,11 +153,14 @@ Relative error (rms over outputs / rms of the result) of a float32 dot product o
 | 20480 | 2.7e-6 | 5.0e-7 | 4.5e-7 |
 
 The naive sum grows as `1.8e-8 sqrt(K)`; the engine's lane-strided sums and numpy's BLAS are 3–6x better. The soft tolerance is set from the **naive** sum (the worst
-reasonable engine) with a factor 2.2: `soft_rms = max(2e-6, 4e-8 sqrt(K))`, K the longest float32 sum feeding the stage (`dim` for the norm/hc stages and the
-BF16 router/compressor GEMVs, `hc*dim` = 20480 for `pre_mix`, `heads*head_dim/o_groups` = 4096 for `wo_a`, ...); `soft_max = 2.5 x soft_rms` (measured
-max/rms of a sum error: 1.2–1.6); the indexer's scores (`index_scores`, `block_scores`: sums of terms of both signs, they cancel) get 6x that (measured 8.5e-7 / 1.4e-6 rms on the mini model). The **float32 oracle against the float64 oracle**, stage-isolated, on three mini models x 64 tokens x three quantiser presets
-(`ds1_noise.py mini`, 28 000 stage samples): the worst stage error without a flip is **5.2e-7 rms** (`attn_out`), 1e-7 .. 4e-7 for most stages, i.e. the soft tolerance
-(2e-6 on the mini model) sits 5x (`attn_out`) to 20x above the measured noise and 1.4x–4x above even the naive-sum worst case.
+reasonable engine) with a factor 2.2: `soft_rms = max(2e-6, 4e-8 sqrt(K))`, K the longest float32 sum feeding the stage (`dim` for the norm/hc stages and the BF16
+router/compressor GEMVs, `hc*dim` = 20480 for `pre_mix`, `heads*head_dim/o_groups` = 4096 for `wo_a`, ...); `soft_max = 2.5 x soft_rms` (measured max/rms of a sum error: 1.2–1.6).
+The indexer's scores (`index_scores`, `block_scores`) get 30x that: they are sums of terms of both signs over a short vector at the first positions, and measured up to 1.0e-5 rms on the
+mini model; their only consumer, the selection, has its own near-tie window.
+
+The **float32 oracle against the float64 oracle**, stage-isolated, on three mini models x 64 tokens x three quantiser presets (`ds1_noise.py mini`; 9 runs of 6 943 stage samples): the
+worst stage error without a flip is **5.2e-7 rms** (`attn_out`), 1e-7 .. 4e-7 for most stages (`q` 2.6e-7, `attn_in` 1.2e-7, `ffn_out` 3.0e-7), so the soft tolerance (2e-6 on the mini
+model) sits 5x (`attn_out`) to 36x above the measured noise and 1.4x–4x above even the naive-sum worst case.
 
 ### 3.3 Quantiser flips (`ds1_noise.py flips`)
 
@@ -170,8 +174,8 @@ Monte Carlo with the engine's quantisers on Gaussian (and 1 %-outlier "heavy") a
 
 **Cross-check from DS1-C** (the C++ attention against the oracle, MiniGeom, int8 activations, KV fake-quant on and off, 4 800 layer-steps): the only deviations were quantiser rounding flips,
 8 events (1 fp8 flip in a SWA KV row, 7 int8-code flips), each 2.5e-3 … 6.2e-3 relative to the row max in `q`, `o` or the layer output, everything else to ~2e-6 with top-k identical and block scores
-exact: 1 per ~800 layer-steps. The stage-isolated oracle-against-oracle measurement of this package agrees: the attention stages (`q`, `attn_o`, `attn_out`) flip in 0.1 – 0.2 % of samples with
-sizes 2.6e-3 … 6.7e-3. Both are classified FLIP (reported with position, layer and stage under "quantiser flips", counted against a budget with a floor of 3 per stage), not FAIL. DS1-C re-syncs
+exact: 1 per ~800 layer-steps. The stage-isolated oracle-against-oracle measurement of this package agrees: the attention stages (`q`, `attn_o`, `attn_out`) flip in 0.07 – 0.4 % of samples with
+sizes 1.4e-3 … 6.7e-3. Both are classified FLIP (reported with position, layer and stage under "quantiser flips", counted against a budget with a floor of 3 per stage), not FAIL. DS1-C re-syncs
 the engine's cache row to the oracle's after a flip so trajectories do not diverge; **the replay needs no re-sync**: the state the oracle replays from IS the engine's dumped rows.
 
 The consequences for the tolerance model (class `Tolerances`, constants at the top of its section in `ds1_compare.py`):
@@ -179,16 +183,16 @@ The consequences for the tolerance model (class `Tolerances`, constants at the t
 * `hard_rms` of a stage with int8 sites = `max(5e-3, 8 x 1.9e-2 / sqrt(K_min))` (eight single flips); with a fp8/fp4 row = `2 x KV_FLIP_RMS / sqrt(K)`; a stage with no quantiser
   inside has no excuse above `hard = 50 x soft`. `hard_max = 2 x hard_rms` (rows: the per-element figures above x 2).
 * **budget** (fraction of a stage's samples allowed in the FLIP band, and never fewer than 3 samples per stage) = `0.02 + 2 x (1 - exp(-lambda))`, `lambda = 2.2e-5 x (sum of the stage's
-  int8 sites' K) + 1e-5 x K_row` flips per sample, capped at 0.9. The mini model's `ffn_out` has `lambda = 0.017` (budget 5 %); the real one `lambda = 0.36` (budget 62 %): at K = 2304 x 7, **a third
-  of all `ffn_out` samples legitimately contain a flip**.
+  int8 sites' K) + 1e-5 x K_row` flips per sample, capped at 0.9. The mini model's `ffn_out` has `lambda = 0.017` (budget 5 %); the real one `lambda = 0.36` (budget 62 %): at K = 2304 x 7, **about a third
+  of all `ffn_out` samples may legitimately contain a flip** at the model's noise level (eps ~ 5.5e-7; a tenth of that at the oracle's own float64-vs-float32 noise).
 * A near-tie window of `2e-5` of the score scale for the router (float noise only); for the indexer's top-k / candidate blocks the largest of `2e-5`, `4 x 1.9e-2 / sqrt(q_lora)` when
   int8 activations are on (one flip of the shared int8 `q_lora` site: 9.5e-3 on the mini model, 2.1e-3 real) and `5e-2` when `index` is on (a flip in the fp4 fake-quant of the indexer's
   `q` moves its scores by 1–4 % of their scale), with at most 10 % (top-k) / 20 % (router) / 25 % (candidate blocks) of the selection differing.
 
-Measured on the mini model (3 seeds x 64 tokens, stage-isolated, float64 oracle replaying the float32 oracle's inputs, `ds1_noise.py mini`; 6 016 samples per run):
-every stage within the tolerances in all 9 runs (0 FAIL); flips: `int8-kv` 3 per run (q 1, attn_out 2, ffn_out 6 over the three seeds), `int8` 2–5, `exact` 0. Worst flip
-`attn_out` 6.7e-3 (hard 1.9e-2), `ffn_out` 3.0e-3 (hard 9.5e-3), `q` 2.7e-3 (hard 1.9e-2): 2.9x–7x below hard. The measured flip frequency of `ffn_out` (0.4 % of samples) is the
-model's prediction at the oracle's own noise (eps ~ 1.5e-7).
+Measured on the mini model (3 seeds x 3 presets x 64 tokens, stage-isolated, float64 oracle replaying the float32 oracle's inputs, `ds1_noise.py mini`): every stage within the tolerances in
+all 9 runs (0 FAIL, 9 x 6 943 samples). FLIP-level samples per run: `int8-kv` 3 / 3 / 4, `int8` 2 / 5 / 9, `exact` 0 (after the scores' soft tolerance was set; they are the stages of §3.1). Worst
+flips against their hard tolerance: `attn_out` 6.7e-3 (1.9e-2), `ffn_out` 3.0e-3 (9.5e-3), `block_scores` 4.9e-3 (1.9e-2), `q` 2.7e-3 (1.9e-2), `attn_o` 2.5e-3 (1.9e-2), `index_scores`
+2.1e-3 (1.9e-2): 2.9x–9x below hard. The measured flip frequency of `ffn_out` (0.4 % of samples) is the model's prediction at the oracle's own noise (eps ~ 1.5e-7).
 
 ### 3.4 Why the whole run diverges (and what the "64 tokens identical" gate can mean)
 
@@ -213,7 +217,7 @@ Mini model (the C++ MiniGeom end-to-end test; `ds1_noise.py tolerances`), flags 
 | kv_win | 2.0e-6 | 5.0e-6 | 6.2e-2 | 2.0e-1 | 0.001 | 0.02 |
 | latent | 2.0e-6 | 5.0e-6 | 1.6e-1 | 5.0e-1 | 0.001 | 0.02 |
 | index_k | 2.0e-6 | 5.0e-6 | 1.6e-1 | 3.0e-1 | 0.000 | 0.02 |
-| index_scores, block_scores | 1.2e-5 | 3.0e-5 | 8.0e-2 | 3.0e-1 | 0.003 | 0.03 |
+| index_scores, block_scores | 6.0e-5 | 1.5e-4 | 8.0e-2 | 3.0e-1 | 0.003 | 0.03 |
 | attn_out | 2.0e-6 | 5.0e-6 | 1.9e-2 | 3.8e-2 | 0.003 | 0.03 |
 | ffn_out | 2.0e-6 | 5.0e-6 | 9.5e-3 | 1.9e-2 | 0.017 | 0.05 |
 | router_idx | near-tie window 2e-5 of the score scale; <= 20 % of the selection may differ; budget 0.02 | | | | | |
@@ -231,7 +235,7 @@ Real model (`ds1_noise.py tolerances --real`; the tolerance object is built from
 | kv_win | 2.0e-6 | 5.0e-6 | 2.2e-2 | 2.0e-1 | 0.005 | 0.03 |
 | latent | 2.9e-6 | 7.2e-6 | 5.7e-2 | 5.0e-1 | 0.005 | 0.03 |
 | index_k | 2.9e-6 | 7.2e-6 | 8.0e-2 | 3.0e-1 | 0.001 | 0.02 |
-| index_scores, block_scores | 1.7e-5 | 4.3e-5 | 1.4e-2 | 3.0e-1 | 0.069 | 0.15 |
+| index_scores, block_scores | 8.6e-5 | 2.1e-4 | 1.4e-2 | 3.0e-1 | 0.069 | 0.15 |
 | attn_out | 2.6e-6 | 6.4e-6 | 5.0e-3 | 1.0e-2 | 0.208 | 0.40 |
 | ffn_out | 2.0e-6 | 5.0e-6 | 5.0e-3 | 1.0e-2 | 0.355 | 0.62 |
 | router_idx / topk / cand_blocks | as above (the top-k window on the real model: 5e-2, set by the fp4 index flips) | | | | | |
@@ -282,8 +286,9 @@ oracle's own functions: fed the oracle's own trace as the engine, every stage of
 ### 4.2 What the engine must dump: the per-position trace of §1, no cache snapshots
 
 The replay protocol is the trace itself: the engine writes each cache row once, when it produces it, and the oracle rebuilds the state of layer L at position p from the
-rows of earlier positions. The files layer L at position p reads (`needed_files` in `test_ds1_replay.py`; the test replays from **exactly** these files and shows each is
-necessary):
+rows of earlier positions. Every dumped array must be the values the engine actually consumed (the bytes it hands to the next kernel), not a recomputation: the replay relies on the
+oracle's quantisers seeing the same input bits as the engine's. The files layer L at position p reads (`needed_files` in `test_ds1_replay.py`; the test replays from **exactly** these
+files and shows each is necessary):
 
 * the inputs: `embed.p` (L = 0) or `block_out.p.L-1` and `pre_mix.p.L-1`; `engram_out.p.L` on an Engram layer;
 * the layer's own state: `attn_in.p.L`; `kv_win.q.L` for the `window-1` positions before p (the sliding window ring); on a FULL layer the owner's `latent.q` and
@@ -315,7 +320,7 @@ So a replay of any subset of (layer, position) needs the trace of **all earlier 
 
 1. Tokens: `ds1_tokenizer.py chat --gguf SHARD1 --messages @msgs.json --ids` (or `encode`).
 2. `strata-ds41 --gguf SHARD1 --tokens <ids> --max-new 8 --trace DIR` (the real prompt, 32 positions).
-3. `ds1_compare.py layers --engine DIR --gguf SHARD1 --positions 0,3,15,31 --layers 0,1,2,14,20,24,39,head --baseline` (about 10 minutes), then all layers at the
+3. `ds1_compare.py layers --engine DIR --gguf SHARD1 --positions 0,3,15,31 --layers 0,1,2,14,20,24,39,head --baseline` (a few minutes), then all layers at the
    positions that matter; the first failure is printed as `FIRST FAILURE: position P, layer L, stage S`.
 4. Log the numbers in `docs/volta/BOX_LOG.md`.
 
