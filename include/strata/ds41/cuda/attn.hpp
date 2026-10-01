@@ -70,6 +70,18 @@ struct Ds41LayerRoles {
     std::string validate() const;
 };
 
+/// The roles from DS1-A's Ds41Config (model/config.hpp) or anything with the same member names (compress_ratios holding exactly n_layers entries, kv_source,
+/// index_source, cand_source): the four vectors the loader read from the GGUF metadata.
+template <class Cfg>
+Ds41LayerRoles ds41_attn_roles(const Cfg& c) {
+    Ds41LayerRoles r;
+    r.compress_ratio.assign(c.compress_ratios.begin(), c.compress_ratios.end());
+    r.kv_source_layers.assign(c.kv_source.begin(), c.kv_source.end());
+    r.index_source_layers.assign(c.index_source.begin(), c.index_source.end());
+    r.candidate_source_layer = c.cand_source;
+    return r;
+}
+
 /// The three KV fake-quantisations (QuantConfig.window_kv / compressed_kv / index); default all on (DS1.md section 2).
 struct AttnQuantFlags {
     bool window_kv = true;       // fp8 e4m3, power-of-two scale per 32, over the whole post-RoPE SWA KV vector
