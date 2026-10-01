@@ -62,6 +62,23 @@ can run without a GPU, commit, push.
 Candidate Phase-3 kernel work, only if the profile shows it: Volta HMMA version of the QSA block-score select
 (currently FP32 warp kernel on sm_70), tile/occupancy retune of decode GEMVs for 80 SMs / 6 MB L2.
 
+### The target box's CPU side (from the user, 2026-10-01)
+
+Dual Intel Xeon **Cascade Lake**, 24 DIMM slots, **384 GB DDR4-2666** (Cascade Lake-SP has 6 channels per socket:
+12 channels, 2 DIMMs each, ≈ 256 GB/s theoretical, ~100 GB/s per socket in practice — to be measured). Two facts
+from the source that matter on this box, both CPU-side and independent of the GPU port:
+
+1. **Strata's own AVX-512 expert kernels are off on Cascade Lake.** `cpu_avx512_ok()` requires AVX512-VBMI
+   (`vpmultishiftqb` unpacks the 2-bit codes), which arrived with Ice Lake; Cascade Lake has AVX512-VNNI but not
+   VBMI. The engine falls back to its AVX2 kernels (and ggml's for the i-quant packs), and setup never offers the
+   canonical Q2_0 pack (AVX-512-only — the fastest model). Candidate: an AVX512-VNNI kernel variant that unpacks
+   with shifts and masks instead of `vpmultishiftqb`. Measure the AVX2 path in Phase 0 first.
+2. **The CPU expert pool is not NUMA-aware.** Workers are pinned to cores (`kernels/cpu/pool.cpp`) but the expert
+   arena is placed by first touch, so half the workers read it across UPI. Quick fix for Phase 0:
+   `numactl --interleave=all` (or BIOS node interleaving). Real fix: split every expert's rows between the two
+   sockets and let each socket's workers compute only local rows (balanced, no remote reads; a few-µs exchange of
+   the 640-float intermediate per layer) — shared design with the DeepSeek port (`docs/deepseek/PLAN.md` §2).
+
 ## 4. Honest limits
 
 * Nothing here has run on a V100. The integrator can compile for sm_70, inspect SASS, check resource usage and

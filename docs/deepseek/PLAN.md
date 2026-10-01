@@ -38,15 +38,32 @@ Q4_K / Q2_K / i-quant experts are out of scope.
 | RAM / SSD | Engram tables (mmapped in place from the shards; rows prefetched from token ids) | 202.8 GB |
 | CPU | computes missed experts in place (AVX-512/AVX2 MXFP4 kernels), overlapped with the GPU | |
 
-With less RAM than ~520 GB, the routed experts use Strata 0.1.31's RAM-budget + file tier with routing prefetch
-(`--resident-budget-gib`) and Engram stays on SSD. MXFP4 fixes the expert footprint at 288.8 GB, so RAM below
-~300 GB means some experts are read from the SSD on a miss. **Needed from you: RAM size, CPU model (AVX-512?
-VNNI?), SSD, and whether the weights come from the official safetensors or an MXFP4 GGUF (which one).**
+**The target box (from the user, 2026-10-01):** dual Xeon Cascade Lake, 384 GB DDR4-2666 in 24 slots (6 channels
+per socket on Cascade Lake-SP → 12 channels, ≈ 256 GB/s theoretical, ~200 GB/s if both sockets read locally — to
+be measured), one V100 32 GB, weights from an **MXFP4 GGUF**. Consequences:
+
+- **RAM: the 288.8 GB of MXFP4 experts fit; Engram does not fit beside them.** Experts resident in RAM (split
+  across the two NUMA nodes, see below); Engram's 202.8 GB stay on the SSD, mapped, with the ~70 GB of RAM left
+  over acting as page cache for hot rows. Per token Engram reads 48 rows (~200 KB of 4 KB pages, ~2,400 IOPS at
+  50 tok/s — easy for NVMe). Layer 1's rows are needed right after sampling, so the reads are issued the moment a
+  token is known (and for the prompt, all at once). Only a small staging pool is page-locked for GPU fills, not the
+  whole 289 GB.
+- **CPU kernels: AVX-512 + VNNI (`vpdpbusd`), no VBMI** (Cascade Lake). MXFP4 needs a nibble → int8 lookup
+  (`vpshufb` on 4-bit indices), which AVX-512BW has; AVX2 fallback for other machines.
+- **NUMA from day one.** Each expert's rows are split between the sockets (w1/w3: 1152 rows each, w2: 2560 rows
+  each), each socket's workers compute only their local half, and the 2304-float intermediate is exchanged once
+  per expert. Every miss is then computed by both sockets in parallel at local bandwidth, with no load imbalance
+  from which experts a token routes to. `numactl --interleave=all` is the measured baseline it has to beat.
+- **Which GGUF:** DS-B reads GGUF (Strata already has a reader) as the primary input and the official safetensors
+  as the reference. MXFP4 experts are GGML MXFP4 in every published GGUF, but tensor names and the Engram table's
+  format differ between them (Q8_0, FP8, Q5_K...). **Needed from you: the Hugging Face repo (or file names) of
+  your GGUF, and how much free SSD space you have.**
 
 Decode budget [estimate, from RESEARCH §6-7]: GPU reads ≈ 7.2 GB of dense weights + 240·h × 18.8 MB of hit
-experts per token (≈ 10-11 ms at 900 GB/s); CPU reads 240·(1-h) × 18.8 MB (h = 0.5 → 2.26 GB → 16.5 ms at
-137 GB/s). Overlapped, the ceiling is ~50 tok/s at h = 0.5; expect 40-60 % of it before speculation. That is the
-case for the port versus the 4-5 tok/s measured today; it is not a prediction.
+experts per token (≈ 10-11 ms at 900 GB/s); CPU reads 240·(1-h) × 18.8 MB (h = 0.5 → 2.26 GB → ~11 ms at
+~200 GB/s NUMA-local on the target box, ~23 ms if half of it crosses UPI). Overlapped, the bandwidth ceiling is
+~60-90 tok/s at h = 0.5; expect well under half of it in practice (kernel efficiency, synchronisation, attention,
+Engram). That is the case for the port versus the 4-5 tok/s measured today; it is not a prediction.
 
 ## 3. Architecture of the port
 
