@@ -90,6 +90,9 @@ layer keeps its own Q and its own 128-token SWA KV.
   positions; reindex layers mask outside it (no effect below 16,384 compressed positions). An entry is visible
   once its whole group is complete.
 - Global KV = 890 B/token at the trained precisions [DERIVED, matches the paper]; fp16 ≈ 3.2 KB/token.
+- **Reference bug (found by the port's oracle):** on decode steps where a ratio-2 owner's group is incomplete, the
+  official code scores against the last-published index-K cache (layer 20's) instead of its own; the port follows the
+  intent — see `docs/deepseek/CONTRACTS.md`.
 
 ## 3. Engram [PRIMARY: engram.py, model.py; PAPER 2.4.2]
 

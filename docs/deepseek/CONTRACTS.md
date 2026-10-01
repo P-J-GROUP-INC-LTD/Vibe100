@@ -52,3 +52,17 @@ Layouts:
   Xeon Gold 6226; 4 vCPUs, one socket, numbers are indicative only).
 - GPU code is compiled for sm_70 with `tools/volta/compile_one.py` and gated with `tools/volta/sass_audit.py`;
   its parity programs run on the V100.
+
+## Decided: the index-K cache a ratio-2 indexer scores against (2026-10-01)
+
+DS-A found that the official reference (`model.py` `Indexer.forward`, lines 537-554) publishes an owner layer's
+index-K cache to `shared_attn.index_k` only on steps where its compressor completed a group. On the other
+decode steps of the ratio-2 owners (layers 2, 8, 14 — every other token) the layer scores against whatever was
+published last: layer 20's ratio-1 cache from the previous token, sliced to `end_pos // 2` entries. This
+contradicts the class's own invariant ("every source writes before its consumers read"), breaks prefill(N) ≡
+prefill + decode, and does not occur in prefill or training (full sequences). It changes the top-512 selection only
+once a layer has more than 512 compressed positions (context above ~1,024 tokens).
+
+**The port follows the intent: each owner always scores against its own cache.** The oracle implements both
+(`ref/ds41`: default = intent; `stale_index_k=True` reproduces the shipped reference bit for bit), so either can be
+compared against. To revisit if DeepSeek or llama.cpp PR #28696 show their production decode does otherwise.
