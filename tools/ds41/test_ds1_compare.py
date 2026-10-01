@@ -268,9 +268,21 @@ class Injection(unittest.TestCase):
         ff = C.compare_traces(eng, self.ref).first_failure()
         self.assertEqual((ff.stage, ff.layer, ff.pos), ("index_scores", 6, 12))
         self.assertIn("reachability", ff.note)
-        # a score that is -inf in both (masked out of the candidate pool) is not an error
-        self.assertTrue(np.isneginf(self.ref.get("index_scores", 12, 6)).any())
-        self.assertTrue(C.compare_traces(self.ref, self.ref, stages=["index_scores"]).ok)
+        # a score that is -inf in both (masked out of the candidate pool) is not an error; the finite ones are compared as floats
+        tols = C.Tolerances(MINI, ENGINE_QUANT)
+        o = np.array([0.5, -np.inf, 1.25, -np.inf, 0.1], dtype=np.float32)
+        self.assertEqual(C.compare_one("index_scores", 6, 12, o, o, T.oracle_trace(), tols).level, C.Level.OK)
+        e = o.copy()
+        e[2] *= 1.5
+        self.assertEqual(C.compare_one("index_scores", 6, 12, e, o, T.oracle_trace(), tols).level, C.Level.FAIL)
+        e = o.copy()
+        e[1] = 0.0                                                                  # reachable in the engine, not in the oracle
+        self.assertIn("reachability", C.compare_one("index_scores", 6, 12, e, o, T.oracle_trace(), tols).note)
+        b = np.array([0.5, np.inf, -0.25], dtype=np.float32)                        # block scores pin the newest block at +inf
+        self.assertEqual(C.compare_one("block_scores", 4, 12, b, b, T.oracle_trace(), tols).level, C.Level.OK)
+        e = b.copy()
+        e[1] = 3.0
+        self.assertEqual(C.compare_one("block_scores", 4, 12, e, b, T.oracle_trace(), tols).level, C.Level.FAIL)
 
     def test_nan_and_inf_always_fail(self):
         def poison(a):

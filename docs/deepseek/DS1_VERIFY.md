@@ -267,7 +267,7 @@ input to layer L, for each requested (layer, position); one layer's tensors plus
 | `embed` | the token id | `embed` |
 | `engram_out` | `block_out.L-1` (or the embedded token), the token ids → hashed Engram rows | `engram_out.L` |
 | `attn_in` | the stream entering the block (`engram_out.L` / `block_out.L-1`) and `pre_mix.L-1` | `attn_in.L` |
-| `q`, `kv_win`, `latent`, `index_k`, `topk`, `attn_out` | `attn_in.L` (the engine's), the layer's cache rows of earlier positions (`kv_win`, `latent`, `index_k` of the engine), the compressor's open group (`attn_in` of the earlier tokens), the engine's `topk` for REUSE layers, the candidate pool for REINDEX layers | the engine's own |
+| `q`, `kv_win`, `latent_pre`, `latent`, `index_k`, `index_scores`, `block_scores`, `topk`, `cand_blocks`, `attn_o`, `attn_out` | `attn_in.L` (the engine's), the layer's cache rows of earlier positions (`kv_win`, `latent`, `index_k` of the engine), the compressor's open group (`attn_in` of the earlier tokens), the engine's `topk` for REUSE layers, the candidate pool for REINDEX layers | the engine's own |
 | `ffn_in` | the stream, the engine's `attn_out.L`, the attention mHC mixes | `ffn_in.L` |
 | `router_idx`, `router_w`, `ffn_out` | the engine's `ffn_in.L` (the oracle's router, routed + shared experts) | the engine's own |
 | `block_out`, `pre_mix` | the engine's `ffn_out.L`, the stream after attention, the FFN mHC mixes | the engine's own |
@@ -290,7 +290,8 @@ necessary):
   `index_k.q` for every published group before p (`(j+1)*ratio-1`), and for a ratio > 1 compressor `attn_in.q.L` of the earlier tokens of the open group; on a REUSE layer
   `topk.p.L`; on a REINDEX layer the owner's `latent` / `index_k` rows up to and including p and `cand_blocks.p.<candidate source>` (without it the oracle re-runs the candidate source's indexer from that layer's own
   state: more files, same answer, tested);
-* the values it is compared with: `attn_out`, `ffn_in`, `ffn_out`, `router_idx`, `router_w`, `block_out`, `pre_mix`, `kv_win.p`, `q.p`, and `latent.p`/`index_k.p`/`topk.p` where they exist.
+* the values it is compared with: `attn_out`, `ffn_in`, `ffn_out`, `router_idx`, `router_w`, `block_out`, `pre_mix`, `kv_win.p`, `q.p`, `latent.p` / `index_k.p` / `topk.p` where they exist, and
+  every optional stage the engine chose to write (`attn_o`, `latent_pre`, `index_scores`, `block_scores`, `cand_blocks`).
 
 So a replay of any subset of (layer, position) needs the trace of **all earlier positions' state stages** and of the checked positions' other stages. A missing file is reported as
 `cannot replay ... the engine trace has no <file>` and the run fails (a layer that could not be checked is not a pass).
