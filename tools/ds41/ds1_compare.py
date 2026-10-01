@@ -247,7 +247,7 @@ def _softmax_kl(o_logits, e_logits) -> float:
 def compare_one(stage: str, layer, pos: int, e, o, ref: Source, mode: str, tol_scale: float = 1.0) -> Sample:
     """One (stage, layer, position): engine array e against oracle array o."""
     st = STAGE[stage]
-    if st.kind in ("float", "kvq", "logits"):
+    if st.kind in ("float", "kvq", "logits", "weights"):
         tol = tolerance(mode, stage, tol_scale)
         try:
             m = float_metrics(e, o)
