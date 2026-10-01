@@ -79,7 +79,7 @@ Environment variables unless noted; defaults checked in the source.
 
 | Switch | Default | Effect |
 |---|---|---|
-| `STRATA_VOLTA_ATTN` | unset = on | cc 7.0 / 7.2: the WMMA prompt attention. `0`: the FP32 kernel (the reference for the checks). `2` / `force` (code only): the WMMA kernel on any sm_70+ card |
+| `STRATA_VOLTA_ATTN` | unset = on | cc 7.0 / 7.2: the WMMA prompt attention. `0` / `off` / `false` / `no`: the FP32 kernel (the reference for the checks). `2` / `force`: the WMMA kernel on any sm_70+ card (a test aid). Case-insensitive; anything else warns once and means on |
 | `STRATA_PREFILL_F16_GEMM` | `auto` | `auto`: the FP16 tensor-core route on Volta (7.0 <= cc < 7.5). `0`: upstream's bf16 cuBLAS call. `1`: the FP16 route on any card (how an RTX 20 opts in) |
 | `--numa auto\|mirror\|off` (engine and `setup.py`) | `auto` | `mirror` asks for it (the engine still says why when it cannot); `off` keeps one copy |
 | `STRATA_NUMA_MIRROR` | unset | `0` / `1` overrides `--numa` for one run: the A/B switch |

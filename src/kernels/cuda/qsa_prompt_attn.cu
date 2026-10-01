@@ -7,10 +7,14 @@
 #include <cuda_runtime.h>
 #include <cmath>
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 // The Volta kernel (further down) is written with nvcuda::wmma, which HIP does not have: AMD builds compile it out
 // (the host returns false there before anything is launched).
@@ -30,11 +34,14 @@ constexpr int CH = D1_CH;         // cells per chunk
 constexpr int THREADS = 128;      // 4 warps: scores by cell (8 each), p.v by dimension (64 each = one int8 scale group)
 constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free fragment loads)
 
-// The MMA below needs sm_75 or newer (Turing runs it as two k=8 steps); cp.async needs sm_80. Builds for pre-sm_75
-// cards compile the MMA to a trap (that includes Volta, sm_70/72: its m8n8k4 tensor cores have no m16n8k8 / m16n8k16
-// form); qsa_prompt_attn_batch never launches these kernels there - Volta has its own WMMA kernel below and every
-// older card runs the old FP32 kernel.  Turing compiles cp_async16 to a trap as well and takes the v1 kernel instead
-// of launch_i8.
+// The MMA below needs sm_75 or newer (Turing runs it as two k=8 steps); cp.async needs sm_80. Code compiled for a
+// virtual arch below sm_75 compiles the MMA to a trap (that includes Volta, sm_70/72: its m8n8k4 tensor cores have no
+// m16n8k8 / m16n8k16 form), and code for sm_75 compiles cp_async16 to a trap as well.  What decides whether a kernel
+// here is usable is therefore the arch of the CODE the driver runs on the card, not the card's compute capability: a
+// -DCMAKE_CUDA_ARCHITECTURES=70 build (sm_70 SASS + compute_70 PTX) runs its sm_70 cubin natively on a cc 7.5 card and
+// JIT-compiles the compute_70 PTX on cc 8.x, and in both the v1 / cp.async kernels are traps.  select_impl (below)
+// asks the runtime which code each kernel got (cudaFuncGetAttributes: ptxVersion) and takes the Volta WMMA kernel,
+// which exists in any code >= sm_70, wherever the MMA kernels are not real; pre-Volta cards run the old FP32 kernel.
 #if defined(__HIPCC__)          // AMD: no mma.sync / cp.async; the host keeps the old kernel (below)
 #define STRATA_PA_SM80 0
 #elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
@@ -98,6 +105,20 @@ __device__ __forceinline__ uint32_t pack_h2(float lo_k, float hi_k) {   // eleme
 // KV_MODE 1: int8 codes + fp16 scale per 64 values. KV_MODE 0: fp16 values (scales 1).
 // KV_MODE 3 (hybrid K8V4): K as mode 1, V as mode 0 - the row's q4_0 blocks are dequantized to fp16 at
 // gather, so everything downstream of the load is the mode-0 V path; the caller un-rotates the output.
+//
+// K8V4's V is the ONE stored value that does not enter exactly.  (n - 8) * d is exact in FP32 (a 4-bit integer times
+// the 11-bit significand of the fp16 scale d: at most 15 bits), but the gather rounds it to fp16 (11 bits), here and
+// in the v1 kernel (upstream) and in the Volta kernel alike, whereas the FP32 fallback (qsa_decode_attn.cu,
+// attn_chunk_kernel: `(float) nibble * d`) keeps it in FP32.  Round to nearest: |v^ - v| <= 2^-11 |v|, or 2^-25
+// absolute where |v| < 2^-14 (fp16 subnormals); with d = k / 1024 (k <= 31) the product has <= 8 bits and nothing is
+// lost, with a real scale up to half an fp16 ulp is.  An output element is sum_c p_c v_c over the softmax weights
+// (sum 1), so it moves by at most  sum_c p_c (2^-11 |v_c| + 2^-25)  <=  2^-11 max_c |v_c| + 2^-25,  about 5e-4 of
+// the V magnitude: a hard bound (every rounding aligned with its weight's sign).  It is nearly reached when one cell
+// dominates the softmax (an element is then one rounding, and the largest of many is close to 2^-11 |v|), and the
+// shift is ~1/sqrt(N_eff) of it when N_eff cells share the weight (independent roundings).  Up to 2-3 orders above
+// the ~1e-6 FP32-level difference between this kernel and the old one in the int8 and fp16 modes.  (The caller's
+// un-rotation, a 256-wide +-1 sum / 16, turns the per-element bound into at most 16x it in the worst case and ~1x for
+// independent roundings.)  qsa_prompt_attn_parity checks K8V4 against this bound, and the exact-scale case without it.
 template <int KV_MODE>
 struct Smem {
     using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
@@ -189,6 +210,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                 *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.k[c][0]) + pc * 16) = kx;
             }
             if constexpr (KV_MODE == 3) {   // V: dequantize the row's q4_0 blocks straight into the fp16 V row
+                                            // (rounded to fp16: NOT exact, bound in the comment above Smem)
                 constexpr int BLKS = HD / QK4_0;
                 constexpr int BYTES = BLKS * (int) sizeof(block_q4_0);
                 for (int i = t; i < CH * BLKS; i += THREADS) {
@@ -648,21 +670,76 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
     }
 }
 
+// ---- per-device state --------------------------------------------------------------------------------------------
+// A layer split runs these kernels on several devices, which may differ in architecture, so everything that depends on
+// the device - its compute capability, the code the binary has for it, the shared-memory opt-in below - is kept per
+// device ordinal.  The tables grow with the highest ordinal seen (they used to be fixed 64-entry arrays, and the
+// launchers refused a device >= 64 where the dispatcher did not); one mutex per table, taken once per launch.
+template <typename T>
+class PerDevice {
+public:
+    T get(int dev) const {   // T() (0) for a device nothing was stored for
+        std::lock_guard<std::mutex> g(mu_);
+        return dev >= 0 && dev < (int) v_.size() ? v_[(size_t) dev] : T();
+    }
+    void set(int dev, T x) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (dev >= (int) v_.size()) v_.resize((size_t) dev + 1);
+        v_[(size_t) dev] = x;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::vector<T> v_;
+};
+
+bool current_device(int& dev) {
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0) {
+        cudaGetLastError();   // ours: the call that just failed
+        return false;
+    }
+    return true;
+}
+
+// The dynamic shared memory above 48 KB has to be opted into per kernel and device, once.  max_shared_carveout also
+// asks for the biggest shared-memory carve-out (a hint).  Only a failure of OUR OWN call is cleared from the runtime's
+// last-error slot: an earlier launch's pending error must stay there for whoever checks after it.  False: the opt-in
+// failed (nothing launched, the dispatcher then offers no kernel for this device).
+template <typename Kernel>
+bool prepare_kernel(PerDevice<char>& ready, Kernel kernel, int bytes, bool max_shared_carveout = false) {
+    int dev = 0;
+    if (!current_device(dev)) return false;
+    if (ready.get(dev)) return true;
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+#if STRATA_PA_VOLTA
+    if (max_shared_carveout &&
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             (int) cudaSharedmemCarveoutMaxShared) != cudaSuccess)
+        cudaGetLastError();   // a hint: failure is harmless
+#else
+    (void) max_shared_carveout;
+#endif
+    ready.set(dev, 1);
+    return true;
+}
+
+bool prepare_i8() {
+    static PerDevice<char> ready;
+    return prepare_kernel(ready, prompt_attn_i8_kernel, (int) sizeof(Smem2));
+}
+template <int KV_MODE>
+bool prepare_v1() {
+    static PerDevice<char> ready;
+    return prepare_kernel(ready, prompt_attn_kernel<KV_MODE>, (int) sizeof(Smem<KV_MODE>));
+}
+
 bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs this on several)
-    int dev = 0;
-    cudaGetDevice(&dev);
+    if (!prepare_i8()) return false;   // a cache hit after select_impl
     const int bytes = (int) sizeof(Smem2);
-    if (dev < 0 || dev >= 64) return false;
-    if (!attr[dev]) {
-        if (cudaFuncSetAttribute(prompt_attn_i8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
-            cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-        attr[dev] = true;
-    }
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
@@ -681,19 +758,8 @@ bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
 template <int KV_MODE>
 bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
             const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    static bool attr[64] = {};   // per device, as above
-    int dev = 0;
-    cudaGetDevice(&dev);
+    if (!prepare_v1<KV_MODE>()) return false;   // a cache hit after select_impl
     const int bytes = (int) sizeof(Smem<KV_MODE>);
-    if (dev < 0 || dev >= 64) return false;
-    if (!attr[dev]) {
-        if (cudaFuncSetAttribute(prompt_attn_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
-            cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-        attr[dev] = true;
-    }
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
@@ -712,6 +778,10 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
 #if STRATA_PA_VOLTA
 // ---- Volta (sm_70/72): prompt_attn_volta_kernel - the v1 kernel's math on nvcuda::wmma ----------------------------
 //
+// It also runs on every newer card (any code >= sm_70 has the real body): select_impl picks it there when the binary's
+// code for the card has no MMA kernels (a -DCMAKE_CUDA_ARCHITECTURES=70 build on Turing / Ampere / Ada, e.g. a layer
+// split pairing a V100 with such a card) and under STRATA_VOLTA_ATTN=force.
+//
 // Volta's tensor cores only do m8n8k4 (HMMA.884): the m16n8k8 / m16n8k16 forms the kernels above use do not exist
 // there (on sm_70 they are BPT.TRAP stubs).  There are two ways to drive m8n8k4: raw `mma.sync.aligned.m8n8k4` with
 // Volta's quad-pair fragment layout (hand-permuted - llama.cpp's mma.cuh shows how much care that takes), or
@@ -724,11 +794,13 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
 // not assumed.
 //
 // Same math as v1, FP32 wherever v1 is FP32: q is split into FP16 hi + lo parts (after the same power-of-two
-// prescale, so q.k keeps ~22 bits), K and V enter exactly (fp16 as is; int8 codes are exact in FP16; K8V4's q4_0 V
-// is dequantized to fp16 at gather, as in v1), the int8 scales are applied in FP32 (to the q.k partial of each
-// 64-dim group: sc = fma(tg[g], ks[g], sc) in the order g = 0..3; folded into p, times 2^14 / the chunk's largest,
-// for p.v), p' is split into hi + lo, and the online softmax is v1's (scale_log2, exp2f, running max and sum,
-// alpha = exp2(m_old - m_new), acc = fma(acc, alpha, tmp * vdown), out = acc * (1 / l)).  Two deliberate differences.
+// prescale, so q.k keeps ~22 bits), K and V enter exactly (fp16 as is; int8 codes are exact in FP16) except K8V4's V:
+// its q4_0 values (n - 8) * d are dequantized to fp16 at gather, as in v1, which ROUNDS them (relative error <= 2^-11
+// per element; the FP32 fallback keeps them FP32 - the bound is derived above Smem), the int8 scales are applied in
+// FP32 (to the q.k partial of each 64-dim group: sc = fma(tg[g], ks[g], sc) in the order g = 0..3; folded into p,
+// times 2^14 / the chunk's largest, for p.v), p' is split into hi + lo, and the online softmax is v1's (scale_log2,
+// exp2f, running max and sum, alpha = exp2(m_old - m_new), acc = fma(acc, alpha, tmp * vdown), out = acc * (1 / l)).
+// Two deliberate differences.
 // (1) The FP32 accumulation INSIDE a tensor-core product is re-associated: Volta's HMMA adds four products per step
 // and truncates, so the hi part of each 16-wide k-step gets its own accumulator (summed with fp32 adds) and the lo
 // parts one chain of their own - see q.k and p.v below.  On the CPU, with a model of that truncation (round toward
@@ -765,7 +837,7 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
 // one 32 x 72 FP16 tile that holds, in turn, the Q staging (start), K (scores), V (p.v) and the output staging (end);
 // the K tile is dead by the first barrier, so V reuses it.  V is only loaded into REGISTERS together with K (its
 // global latency hides under the q.k, the barriers and the softmax) and written to the tile after the second barrier.
-// ~39 KB: two blocks per SM on a V100 (96 KB), where the carve-out is asked for explicitly by the launcher.
+// ~39 KB: two blocks per SM on a V100 (96 KB), where the carve-out is asked for explicitly (prepare_volta).
 //
 // Hazards, per chunk (B = block barrier, W = __syncwarp): ks, vw, valid and the K tile are written by the owning
 // warp(s) after B2 of the previous chunk (everyone is done reading them); part is written before B1 and read between
@@ -864,8 +936,8 @@ __device__ __forceinline__ void vg_store(__half* tile, const uint4* x, int lane)
         for (int k = 0; k < 9; ++k) w[j][k] = rr >= 0 ? (uint32_t) __ldg(bp + k) : 0u;
     }
 }
-// ... dequantized as v1 does: fp16((nibble - 8) * d), element j of a block in the low nibble of byte j, j + 16 in
-// the high one
+// ... dequantized as v1 does: fp16((nibble - 8) * d) - the product is exact in FP32 and ROUNDED to fp16 here (relative
+// error <= 2^-11, see Smem) - element j of a block in the low nibble of byte j, j + 16 in the high one
 [[maybe_unused]] __device__ __forceinline__ void vg_store_q4(__half* tile, const uint32_t (&w)[2][9], int lane) {
 #pragma unroll
     for (int j = 0; j < 2; ++j) {
@@ -1171,26 +1243,19 @@ __global__ void __launch_bounds__(THREADS, 2) prompt_attn_volta_kernel(const flo
 #endif
 }
 
+// Two ~39 KB blocks per SM need the 96 KB shared-memory carve-out of a V100: asked for here, once per device, as a
+// hint (prepare_kernel clears only its own failure, not an earlier launch's pending error).
+template <int KV_MODE>
+bool prepare_volta() {
+    static PerDevice<char> ready;
+    return prepare_kernel(ready, prompt_attn_volta_kernel<KV_MODE>, (int) sizeof(SmemV), true);
+}
+
 template <int KV_MODE>
 bool launch_volta(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                   const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
-    static bool attr[64] = {};   // per device, as launch<>
-    int dev = 0;
-    cudaGetDevice(&dev);
+    if (!prepare_volta<KV_MODE>()) return false;   // a cache hit after select_impl
     const int bytes = (int) sizeof(SmemV);
-    if (dev < 0 || dev >= 64) return false;
-    if (!attr[dev]) {
-        if (cudaFuncSetAttribute(prompt_attn_volta_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 bytes) != cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-        // two ~39 KB blocks per SM need the 96 KB shared-memory carve-out; ask for it (a hint: failure is harmless)
-        cudaFuncSetAttribute(prompt_attn_volta_kernel<KV_MODE>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             (int) cudaSharedmemCarveoutMaxShared);
-        cudaGetLastError();
-        attr[dev] = true;
-    }
     const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
     for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
         const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
@@ -1215,58 +1280,117 @@ namespace {
 // qsa_prompt_attn_variant both go through select_impl, so a test can say what ran without guessing.
 enum class PaImpl {
     None,        // false: the caller keeps the old FP32 kernel (qsa_decode_attn_batch)
-    I8CpAsync,   // sm_80+, int8 KV: prompt_attn_i8_kernel (cp.async, q in registers)
-    V1,          // sm_75+: prompt_attn_kernel<KV_MODE> (m16n8k8 / m16n8k16 mma.sync)
-    Volta,       // sm_70/72: prompt_attn_volta_kernel<KV_MODE> (nvcuda::wmma m16n16k16)
+    I8CpAsync,   // code >= sm_80, int8 KV: prompt_attn_i8_kernel (cp.async, q in registers)
+    V1,          // code >= sm_75: prompt_attn_kernel<KV_MODE> (m16n8k8 / m16n8k16 mma.sync)
+    Volta,       // code >= sm_70: prompt_attn_volta_kernel<KV_MODE> (nvcuda::wmma m16n16k16)
 };
 
 // major * 10 + minor of the current device, cached per device (a layer split can mix architectures); 0 when it
 // cannot be read.  The minor matters: Volta (7.0, 7.2) and Turing (7.5) share a major version, and the Turing
 // kernels are BPT.TRAP stubs in the sm_70 code.
 int current_cc() {
-    static int cc[64] = {};
+    static PerDevice<int> cache;
     int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
-    if (cc[dev] == 0) {
-        int major = 0, minor = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
-            cudaGetLastError();
-            return 0;
-        }
-#if !defined(__HIPCC__)   // (the HIP compat header has no minor attribute; select_impl refuses AMD devices anyway)
-        if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
-            cudaGetLastError();
-            return 0;
-        }
-#endif
-        cc[dev] = major * 10 + minor;
+    if (!current_device(dev)) return 0;
+    int cc = cache.get(dev);
+    if (cc != 0) return cc;
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
     }
-    return cc[dev];
+#if !defined(__HIPCC__)   // (the HIP compat header has no minor attribute; select_impl refuses AMD devices anyway)
+    if (cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+#endif
+    cc = major * 10 + minor;
+    cache.set(dev, cc);
+    return cc;
 }
 
-// STRATA_VOLTA_ATTN, read once: unset / 1 = on (sm_70/72 run the WMMA kernel), 0 = off (they return false and the
-// caller's FP32 kernel runs: the pre-port behaviour minus the crash, and the reference the Volta kernel is checked
-// against), 2 / "force" = the WMMA kernel on ANY sm_70+ card (a test aid for a dev box without a V100; the default
-// behaviour of every other architecture is untouched without it).
-int volta_attn_mode() {
+#if !defined(__HIPCC__)
+// The virtual architecture (cudaFuncAttributes::ptxVersion = __CUDA_ARCH__ / 10 of the code that runs: CUB's
+// PtxVersion reads it the same way, util_device.cuh) of the code the driver runs `kernel` as on the CURRENT device -
+// the best code the binary has for it: a cubin the card can execute, else a JIT of the PTX.  That is what makes a
+// kernel's body real or a trap (mma16816, cp_async16 and the Volta body test __CUDA_ARCH__), and it is NOT the card's
+// compute capability: a -DCMAKE_CUDA_ARCHITECTURES=70 build (sm_70 + compute_70) gives 70 on a cc 7.0 card and on a
+// cc 7.5 card (the sm_70 cubin runs natively there) and on cc 8.x (the compute_70 PTX is JIT-compiled).  All kernels
+// of this file are built for one set of archs, so one kernel stands for its group.  Probed once per device and
+// kernel; 0 when the query fails (no code for this device, or the module could not be loaded), which is not cached,
+// and which select_impl reads as "unknown: believe the card" - the upstream rule - so that the new test can only ever
+// take a kernel AWAY on positive evidence that its code is a trap, never on an error (a launch of a kernel with no
+// code for the card fails loudly anyway).  The first call on a device loads the module (a JIT, where the binary has no
+// cubin for the card), which the first launch would have to do anyway.
+template <typename Kernel>
+int code_arch(PerDevice<int>& cache, Kernel kernel) {
+    int dev = 0;
+    if (!current_device(dev)) return 0;
+    int v = cache.get(dev);
+    if (v != 0) return v;
+    cudaFuncAttributes a{};
+    if (cudaFuncGetAttributes(&a, kernel) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    if (a.ptxVersion > 0) cache.set(dev, a.ptxVersion);
+    return a.ptxVersion;
+}
+int v1_code_arch() {   // prompt_attn_kernel<>: needs >= 75 (mma m16n8k8; m16n8k16 at 80)
+    static PerDevice<int> cache;
+    return code_arch(cache, prompt_attn_kernel<1>);
+}
+int i8_code_arch() {   // prompt_attn_i8_kernel: needs >= 80 (cp.async)
+    static PerDevice<int> cache;
+    return code_arch(cache, prompt_attn_i8_kernel);
+}
+#endif  // !__HIPCC__
+
+// STRATA_VOLTA_ATTN, read once: 0 = off (cc 7.0 / 7.2 return false and the caller's FP32 kernel runs: the pre-port
+// behaviour minus the crash, and the reference the Volta kernel is checked against; also what a card newer than Volta
+// gets when the binary has no MMA kernels for it), 1 = on (the default: sm_70/72 run the WMMA kernel), 2 = force (the
+// WMMA kernel on ANY sm_70+ card, a test aid for a dev box without a V100; the default behaviour of every other
+// architecture is untouched without it).  Case-insensitive, surrounding blanks ignored: 0 / off / false / no,
+// 1 / on / true / yes / empty, 2 / force.  Anything else warns once on stderr and means the default.
+[[maybe_unused]] int volta_attn_mode() {
     static const int mode = [] {
         const char* e = std::getenv("STRATA_VOLTA_ATTN");
-        if (e == nullptr || *e == 0) return 1;
-        if (std::strcmp(e, "0") == 0) return 0;
-        if (std::strcmp(e, "2") == 0 || std::strcmp(e, "force") == 0) return 2;
+        if (e == nullptr) return 1;
+        std::string v(e);
+        while (!v.empty() && std::isspace((unsigned char) v.back())) v.pop_back();
+        size_t b = 0;
+        while (b < v.size() && std::isspace((unsigned char) v[b])) ++b;
+        v.erase(0, b);
+        for (char& c : v) c = (char) std::tolower((unsigned char) c);
+        if (v.empty() || v == "1" || v == "on" || v == "true" || v == "yes") return 1;
+        if (v == "0" || v == "off" || v == "false" || v == "no") return 0;
+        if (v == "2" || v == "force") return 2;
+        std::fprintf(stderr,
+                     "qsa_prompt_attn: STRATA_VOLTA_ATTN=\"%s\" is not 0/off/false/no, 1/on/true/yes or 2/force; "
+                     "using the default (on)\n",
+                     e);
         return 1;
     }();
     return mode;
 }
 
+// The decision, shared by qsa_prompt_attn_batch and qsa_prompt_attn_variant.  It looks at (1) the device's compute
+// capability, (2) which code the binary carries for it (code_arch above - the MMA kernels are traps in code for a
+// virtual arch below 75 / 80, whatever the card is), (3) the pools and geometry, (4) STRATA_VOLTA_ATTN, and (5) whether
+// the chosen kernel's shared-memory opt-in succeeds on this device (prepare_*: part of the decision, so a kernel that
+// cannot be set up is never reported, and never half-chosen).  A kernel is returned only when it will really run.
+// On cc 7.0 / 7.2 nothing but (1), (3), (4) and (5) is asked: that path is the one the port was audited on.
 PaImpl select_impl(const QsaAttnPools& pools, const QsaShapes& s, int& kv_mode) {
     kv_mode = 0;
     const int cc = current_cc();
     if (cc < 70) return PaImpl::None;       // Pascal and older, or a device that cannot be queried: the old kernel
 #if defined(__HIPCC__)
+    (void) pools; (void) s;
     return PaImpl::None;   // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm)
-#endif
+#else
     if (pools.k_q4 != nullptr || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv) return PaImpl::None;
+    if (!pools.page_table) return PaImpl::None;   // (the batch call needs it as well: both answer the same)
     if (pools.k_q != nullptr && pools.v_q4 != nullptr) {   // hybrid K8V4: int8 K + dequantized-q4 V
         if (!pools.k_scale) return PaImpl::None;
         kv_mode = 3;
@@ -1277,22 +1401,40 @@ PaImpl select_impl(const QsaAttnPools& pools, const QsaShapes& s, int& kv_mode) 
         if (!pools.k_pool || !pools.v_pool) return PaImpl::None;
         kv_mode = 0;
     }
-    // sm_70/72: no m16n8k8 / m16n8k16, so none of the kernels above exist there (they are traps); the WMMA kernel
-    // does, unless STRATA_VOLTA_ATTN=0 asks for the FP32 fallback.
+    // The Volta WMMA kernel, where the MMA kernels do not exist for this card: sm_70/72 (no m16n8k8 / m16n8k16 in
+    // hardware), or a newer card whose code in this binary is older than the MMA kernels need.  STRATA_VOLTA_ATTN=0
+    // asks for the FP32 fallback instead.
     const int volta = volta_attn_mode();
-    if (cc < 75) return volta != 0 ? PaImpl::Volta : PaImpl::None;
-    if (volta == 2) return PaImpl::Volta;   // STRATA_VOLTA_ATTN=force
-    // sm_75 or newer: the MMA above compiles for both.  sm_80+ runs the cp.async kernel (launch_i8); Turing has
-    // no cp.async, so it runs the v1 kernel (launch<1>, same accuracy, another summation order).
-    if (cc < 80) return PaImpl::V1;
-    if (kv_mode == 1) {
+    auto wmma = [&]() {
+#if STRATA_PA_VOLTA
+        if (volta == 0) return PaImpl::None;
+        const bool ok = kv_mode == 3 ? prepare_volta<3>() : kv_mode == 1 ? prepare_volta<1>() : prepare_volta<0>();
+        return ok ? PaImpl::Volta : PaImpl::None;
+#else
+        return PaImpl::None;
+#endif
+    };
+    if (cc < 75) return wmma();
+    if (volta == 2) return wmma();   // STRATA_VOLTA_ATTN=force
+    // sm_75 or newer.  Which kernels exist depends on the code the driver runs here, not on the card: v1 needs code
+    // >= sm_75, the cp.async kernel code >= sm_80.  A binary built only up to sm_70 (cubin on cc 7.5, PTX JIT on cc
+    // 8.x) has trap stubs for both: the WMMA kernel.  (0 = the runtime could not say: believe the card.)
+    const int a1 = v1_code_arch();
+    if (a1 != 0 && a1 < 75) return wmma();
+    PaImpl impl = PaImpl::V1;   // Turing, or code of arch 75 on a newer card: the v1 kernel (no cp.async before sm_80)
+    if (cc >= 80 && kv_mode == 1) {
+        const int a8 = i8_code_arch();
         // STRATA_PROMPT_ATTN_V1=1 (debug): the first version, same accuracy, another summation order - the control
-        // for how far the model amplifies an FP32-level change.  Turing always takes it: v2's cp.async does not
-        // exist before sm_80.  (No effect on Volta, where the v1 kernel does not exist.)
+        // for how far the model amplifies an FP32-level change.  (No effect where the v1 kernel is a trap.)
         static const bool v1 = std::getenv("STRATA_PROMPT_ATTN_V1") != nullptr;
-        return v1 ? PaImpl::V1 : PaImpl::I8CpAsync;
+        if (!v1 && (a8 == 0 || a8 >= 80)) impl = PaImpl::I8CpAsync;
     }
-    return PaImpl::V1;
+    const bool ok = impl == PaImpl::I8CpAsync ? prepare_i8()
+                    : kv_mode == 3            ? prepare_v1<3>()
+                    : kv_mode == 1            ? prepare_v1<1>()
+                                              : prepare_v1<0>();
+    return ok ? impl : PaImpl::None;
+#endif
 }
 
 }  // namespace
@@ -1310,10 +1452,12 @@ const char* qsa_prompt_attn_variant(const QsaAttnPools& pools, const QsaShapes& 
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
-    if (n_q <= 0) return true;
+    if (n_q <= 0) return true;   // nothing to do: true whatever the variant is
     int kv_mode = 0;
     const PaImpl impl = select_impl(pools, s, kv_mode);
-    if (impl == PaImpl::None || cap <= 0 || !ids || !steps || !pools.page_table) return false;
+    // false = nothing launched: the variant is "fallback-fp32", or one of the arguments variant() never sees is
+    // unusable (cap, ids, steps).  Everything else select_impl looks at is in `pools` and `s`.
+    if (impl == PaImpl::None || cap <= 0 || !ids || !steps) return false;
     cudaStream_t st = (cudaStream_t) stream;
     switch (impl) {
         case PaImpl::Volta:

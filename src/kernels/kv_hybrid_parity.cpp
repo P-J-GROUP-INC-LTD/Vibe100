@@ -7,7 +7,9 @@
 //   2. V: after fwht256, Q4_0 blocks bitwise vs the host reference (kv_q4.hpp's rules, PR #21);
 //   3. the composed gathers bitwise vs the host dequantization of those codes;
 //   4. qsa_decode_attn<3> + output fwht vs a host attention over the SAME dequantized K/V (fp32 math), and
-//      bounded against the fp32-true attention from the unquantized K/V.
+//      bounded against the fp32-true attention from the unquantized K/V;
+//   5. the tensor-core prompt attention's mode 3 (qsa_prompt_attn_batch) vs the same reference, within a budget
+//      derived from the fp16 rounding of its V (see below); a deliberate fallback ("fallback-fp32") passes.
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -322,12 +324,21 @@ int main() {
         max_true = std::max(max_true, (double) std::fabs(h_attn[i] - ref_true[i]));
     }
     // The tensor-core prompt path (qsa_prompt_attn, 0.1.22+) takes hybrid pools as KV_MODE 3: INT8 K, and V
-    // dequantized from its q4_0 blocks to fp16 at gather. Its summation order differs from the old kernel's
-    // (accuracy-level, not bitwise - qsa_prompt_attn.hpp says the same of its int8 mode), so: tolerance check
-    // against the SAME dequant reference, output un-rotated exactly as prefill.cpp does.
+    // dequantized from its q4_0 blocks to fp16 at gather. Not bitwise equal to the old kernel (summation order), and its
+    // V is NOT exact: the kernel rounds (n - 8) * d to fp16 where the old kernel and the reference keep it FP32
+    // (qsa_prompt_attn.hpp), with the scales the real quantizer produced here (11 significant bits, so the products
+    // are not exact in fp16).  Round to nearest: |v^ - v| <= 2^-11 |v| (2^-25 absolute below 2^-14).  An element of
+    // the ROTATED attention is sum_c p_c v_c (softmax weights, sum 1), so it moves by at most 2^-11 sum_c p_c |v_c|;
+    // the output is then un-rotated (out_un[d] = sum_j +-out_rot[j] / 16), which adds up at most 256 such elements and
+    // divides by 16.  So for head h, with the host's weights p and the rotated dequantized V (Vdq):
+    //     B_h = 2^-11 / 16 * sum_c p_c ||Vdq_c||_1 + 16 * 2^-25      (a hard bound: all roundings aligned)
+    // bounds the fp16 rounding's share of |kernel - reference| on every element of head h, and what is left over
+    // is the kernel's FP32-level error (summation order, ~1e-6 at this size), for which 1e-3 is the slack.  On this
+    // data B_h is ~3e-3 and the roundings are independent, so the measured error is far below it (~1e-5).
     {
         float* d_at4 = dalloc<float>((size_t) QH * D);
         const bool took = k::qsa_prompt_attn_batch(d_q, pools, d_ids, d_step, cells, s, d_at4, 1, nullptr);
+        const char* variant = k::qsa_prompt_attn_variant(pools, s);
         if (!took) {
 #if defined(STRATA_USE_HIP)
             // AMD: the tensor-core prompt path is CUDA-only, so it refuses every pool and the old kernel runs
@@ -335,10 +346,10 @@ int main() {
 #else
             // A deliberate fallback (pre-Volta card, or a V100 with STRATA_VOLTA_ATTN=0) is the old kernel running,
             // which is what the caller does on false; refusing pools a kernel variant was chosen for is the failure.
-            if (std::strcmp(k::qsa_prompt_attn_variant(pools, s), "fallback-fp32") == 0) {
+            if (std::strcmp(variant, "fallback-fp32") == 0) {
                 std::printf("[5/5] qsa_prompt_attn mode 3: PASS (fallback-fp32 on this device - the old kernel runs)\n");
             } else {
-                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
+                std::printf("[5/5] qsa_prompt_attn mode 3 [%s]: FAIL (refused the hybrid pools)\n", variant);
                 g_fail = 1;
             }
 #endif
@@ -347,12 +358,39 @@ int main() {
             ck(cudaDeviceSynchronize(), "at4 sync");
             std::vector<float> h_at4((size_t) QH * D);
             ck(cudaMemcpy(h_at4.data(), d_at4, h_at4.size() * 4, cudaMemcpyDeviceToHost), "at4");
-            double max_p = 0.0;
-            for (size_t i = 0; i < h_at4.size(); ++i)
-                max_p = std::max(max_p, (double) std::fabs(h_at4[i] - ref_deq[i]));
-            const bool pok = max_p < 1e-2;
-            std::printf("[5/5] qsa_prompt_attn mode 3 (tensor cores): %s (vs dequant ref %.2e)\n",
-                        pok ? "PASS" : "FAIL", max_p);
+            constexpr double kRound16 = 1.0 / 2048.0, kSub16 = 1.0 / 33554432.0;   // 2^-11, 2^-25
+            double max_p = 0.0, max_bound = 0.0, max_excess = 0.0;
+            for (int h = 0; h < QH; ++h) {
+                const int kvh = h / PER;
+                std::vector<double> p(cells);
+                double mx = -1e300;
+                for (int c = 0; c < cells; ++c) {
+                    double a = 0.0;
+                    for (int t = 0; t < D; ++t)
+                        a += (double) q[(size_t) h * D + t] * Kdq[((size_t) c * H + kvh) * D + t];
+                    p[c] = a / std::sqrt((double) D);
+                    mx = std::max(mx, p[c]);
+                }
+                double l = 0.0;
+                for (int c = 0; c < cells; ++c) { p[c] = std::exp(p[c] - mx); l += p[c]; }
+                double l1 = 0.0;   // sum_c p_c ||Vdq_c||_1
+                for (int c = 0; c < cells; ++c) {
+                    double a = 0.0;
+                    for (int t = 0; t < D; ++t) a += std::fabs((double) Vdq[((size_t) c * H + kvh) * D + t]);
+                    l1 += p[c] / l * a;
+                }
+                const double bound = kRound16 / 16.0 * l1 + 16.0 * kSub16;
+                max_bound = std::max(max_bound, bound);
+                for (int t = 0; t < D; ++t) {
+                    const double e = (double) std::fabs(h_at4[(size_t) h * D + t] - ref_deq[(size_t) h * D + t]);
+                    max_p = std::max(max_p, e);
+                    max_excess = std::max(max_excess, e - bound);
+                }
+            }
+            const bool pok = max_excess < 1e-3;
+            std::printf("[5/5] qsa_prompt_attn mode 3 (tensor cores) [%s]: %s (vs dequant ref %.2e; q4_0 fp16 rounding "
+                        "bound %.2e, error beyond it %.2e, limit 1e-3)\n", variant, pok ? "PASS" : "FAIL", max_p,
+                        max_bound, max_excess);
             if (!pok) g_fail = 1;
         }
     }
