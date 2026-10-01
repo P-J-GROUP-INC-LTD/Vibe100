@@ -72,7 +72,8 @@ STAGES: tuple = (
     Stage("kv_win", True, "f4", "kvq", True, "state", "[head_dim] the sliding-window KV row written at the position (kv_norm, RoPE on the tail, fp8 fake-quant when window_kv)"),
     Stage("latent", True, "f4", "kvq", True, "state", "[head_dim] the compressed-KV cache row published at this position, i.e. when a group of `ratio` tokens completes (FULL layers only): "
                                                       "RMSNorm, RoPE at group*ratio, fp4 fake-quant when compressed_kv: exactly what the cache holds"),
-    Stage("index_k", True, "f4", "kvq", False, "state", "[index_head_dim] the index-K cache row published together with `latent` (FULL layers): RMSNorm, RoPE, fp4 fake-quant when index"),
+    Stage("index_k", True, "f4", "kvq", True, "state", "[index_head_dim] the index-K cache row published together with `latent` (FULL layers): RMSNorm of wk(PRE-RoPE latent), RoPE, fp4 fake-quant when index "
+                                                         "(not recoverable from `latent`, which is post-RoPE and fp4: the layer replay of every indexer layer needs it)"),
     Stage("topk", True, "i4", "set", True, "input", "int32 [<= index_topk] the compressed-cache positions this layer attends to (ratio>0 layers, REUSE layers included): "
                                                     "ascending, entries < 0 are padding and are ignored by the reader; order is irrelevant"),
     Stage("attn_out", True, "f4", "float", True, "check", "[dim] attention sub-layer output (after wo_b), before hc_post"),
@@ -443,6 +444,19 @@ def run_oracle_trace(model, ids, out_dir, *, mode: str = "token_by_token", n_pro
     return Trace(out_dir)
 
 
-def greedy_continue(model, prompt: Iterable[int], n_new: int) -> list:
-    """The oracle's greedy continuation of `prompt` (what `Model.generate_greedy` does, kept here so fixtures can reuse the same cache)."""
-    return [int(t) for t in model.generate_greedy([int(t) for t in prompt], n_new)]
+def greedy_continue(model, prompt: Iterable[int], n_new: int, *, token_by_token: bool = True) -> list:
+    """The oracle's greedy continuation of `prompt`.  token_by_token=True feeds the prompt one token at a time through the decode path (what the engine does in DS-1);
+    False is `Model.generate_greedy` (one prefill).  The two differ only by float round-off in the logits, which can flip an argmax near a tie."""
+    prompt = [int(t) for t in prompt]
+    if not token_by_token:
+        return [int(t) for t in model.generate_greedy(prompt, n_new)]
+    cache = model.new_cache()
+    logits = None
+    for p, t in enumerate(prompt):
+        logits = model.forward(np.array([t]), p, cache)
+    out = []
+    for _ in range(n_new):
+        t = int(np.argmax(logits))
+        out.append(t)
+        logits = model.forward(np.array([t]), cache.pos, cache)
+    return out

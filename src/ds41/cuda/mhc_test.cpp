@@ -353,6 +353,11 @@ void suite_order(Ctx& c) {
 #endif
 
 // ---------------------------------------------------------------------------------------------------------------------------------
+struct FakeTensor {                           // the shape of DS1-A's DevTensor::as<T>()
+    const void* p;
+    template <class T> const T* as() const { return static_cast<const T*>(p); }
+};
+
 template <class G>
 void suite_edge(Ctx& c) {
     constexpr int NR = G::kHcMixes, H = G::kHidden, HC = G::kHc, K = Derived<G>::kHcFlat;
@@ -363,10 +368,6 @@ void suite_edge(Ctx& c) {
     Up<float> dfn(c.dev, fnv), dsc(c.dev, sc), dba(c.dev, ba);
     HcWeights w{dfn.p(), dsc.p(), dba.p()};
     {   // hc_weights_of: the order of (fn, scale, base) and the float views of the loader's tensors
-        struct FakeTensor {
-            const void* p;
-            template <class T> const T* as() const { return static_cast<const T*>(p); }
-        };
         const HcWeights w2 = hc_weights_of(FakeTensor{dfn.p()}, FakeTensor{dsc.p()}, FakeTensor{dba.p()});
         c.rep.check(w2.fn == w.fn && w2.scale == w.scale && w2.base == w.base, fmt("edge   %s  hc_weights_of(fn, scale, base) maps the loader's tensors", gname<G>()));
     }

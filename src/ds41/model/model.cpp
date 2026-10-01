@@ -118,7 +118,7 @@ void WeightsCore::release() {
 }
 
 void WeightsCore::load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& c, const std::vector<TensorSpec>& specs, const TensorDir& dir, const LogFn& log,
-                       uint64_t piece_bytes) {
+                       uint64_t piece_bytes, bool drop_pages) {
     release();
     if (piece_bytes == 0) throw ModelError("WeightsCore::load: an upload piece of 0 bytes");
     dev_ = &dev;
@@ -152,8 +152,11 @@ void WeightsCore::load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& c, 
     uint64_t done = 0;
     for (const Item& it : items) {
         const uint8_t* src = gguf.data(*it.loc);
-        for (uint64_t pos = 0; pos < it.loc->nbytes; pos += piece_bytes)
-            dev.h2d(base + it.off + pos, src + pos, (size_t) std::min<uint64_t>(piece_bytes, it.loc->nbytes - pos));
+        for (uint64_t pos = 0; pos < it.loc->nbytes; pos += piece_bytes) {
+            const uint64_t n = std::min<uint64_t>(piece_bytes, it.loc->nbytes - pos);
+            dev.h2d(base + it.off + pos, src + pos, (size_t) n);
+            if (drop_pages) gguf.drop_cache(*it.loc, pos, n);        // the device has these bytes now: the file's pages go (resident memory stays one piece, not the model)
+        }
         done += it.loc->nbytes;
         const DevTensor dt = make_dev(*it.loc, base + it.off);
         if (it.spec->lt == LT::OutputNorm) output_norm = dt;
@@ -307,11 +310,7 @@ void load_parts(ModelDev& dev, const GgufSet& gguf, const Ds41Config& cfg, const
             throw ModelError("initial fill names expert " + std::to_string(e.layer) + ":" + std::to_string(e.expert) + ", outside the model");
 
     // ---- the dense weights go to the device; the big tables are mapped
-    weights.load(dev, gguf, cfg, specs, dir, log, opt.upload_piece_bytes);
-    if (opt.drop_page_cache) {
-        for (const TensorSpec& s : specs)
-            if (on_device(s.lt)) gguf.drop_cache(dir.at(s.name));      // the device has its copy; the page cache need not keep the file's
-    }
+    weights.load(dev, gguf, cfg, specs, dir, log, opt.upload_piece_bytes, opt.drop_page_cache);
 
     // ---- the CPU arena
     std::vector<ExpertSlices> slices;

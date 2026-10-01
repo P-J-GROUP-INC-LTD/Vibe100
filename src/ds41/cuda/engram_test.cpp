@@ -446,23 +446,14 @@ void quantize_block_contract(const float* x, int8_t* q, float& d) {
     }
 }
 
-// The two calls a dense-ops provider offers (DS1-C's AttnDenseOps now, DS1-B's dense.hpp later), as host code: engram_wkv_via_ops<G> binds the wkv hook to them.
-struct MockDenseOps {
+// The Q8_0 GEMV a session binds (DS1-B's / DS1-C's gemv_q8 later) as host code over the Dev: copied down, the integer sum per 32-block exact, acc += (d_w * d_x) * isum.  The activation
+// quantiser in front of it is DS1-G's ds41_quantize_acts (engram_wkv_q8 calls it); the test cross-checks its bytes against the CONTRACTS.md rule above.
+struct HostGemvQ8 {
     Dev& dev;
-    int quantize_calls = 0, gemv_calls = 0;
-    explicit MockDenseOps(Dev& d) : dev(d) {}
-    void quantize_acts(const float* x, int T, int k, int8_t* xq, float* xs, Stream) {      // all pointers are device pointers: copied down, computed, copied up
-        ++quantize_calls;
-        std::vector<float> hx((size_t) T * k), hs((size_t) T * (k / 32));
-        std::vector<int8_t> hq((size_t) T * k);
-        dev.d2h(hx.data(), x, hx.size() * sizeof(float));
-        for (int t = 0; t < T; ++t)
-            for (int b = 0; b < k / 32; ++b) quantize_block_contract(hx.data() + (size_t) t * k + 32 * b, hq.data() + (size_t) t * k + 32 * b, hs[(size_t) t * (k / 32) + b]);
-        dev.h2d(xq, hq.data(), hq.size());
-        dev.h2d(xs, hs.data(), hs.size() * sizeof(float));
-    }
-    void gemv_q8(const void* w, int n, int k, const int8_t* xq, const float* xs, int T, float* y, Stream) {
-        ++gemv_calls;
+    int calls = 0;
+    explicit HostGemvQ8(Dev& d) : dev(d) {}
+    void operator()(const void* w, int n, int k, const int8_t* xq, const float* xs, int T, float* y, Stream) {
+        ++calls;
         const int nb = k / 32;
         std::vector<uint8_t> q8((size_t) n * nb * 34);
         std::vector<int8_t> hq((size_t) T * k);
@@ -519,8 +510,9 @@ void suite_runner_mini(Ctx& c) {
         Up<uint16_t> dq(c.dev, qb), dk(c.dev, kb);
         EngramLayerWeights w{EngramTableView{table.data(), (int64_t) table.dim(0)}, dq.p(), dk.p()};
         Up<uint8_t> dwkv(c.dev, wkv);
-        MockDenseOps ops(c.dev);
-        const EngramWkvFn host_wkv = engram_wkv_via_ops<G>(ops, dwkv.p(), runner.xq(), runner.xs());
+        HostGemvQ8 gemv(c.dev);
+        const EngramWkvFn host_wkv = engram_wkv_q8<G>(c.dev, dwkv.p(), runner.xq(), runner.xs(),
+                                                      [&gemv](const void* w, int n, int k, const int8_t* xq, const float* xs, int T, float* y, Stream st) { gemv(w, n, k, xq, xs, T, y, st); });
 
         // prefill: T = S in one call, with the stand-in wkv
         DevBuf<float> dx(c.dev, x.size());
@@ -533,6 +525,14 @@ void suite_runner_mini(Ctx& c) {
         c.rep.check(bd == got_rows.size(), tag + fmt("  gather -> upload -> dequantise: the %d x %d rows are bit-identical to the oracle's dequantised table rows", S, G::kEngramRows));
         std::vector<float> got_kv((size_t) S * OUT);
         c.dev.d2h(got_kv.data(), runner.kv(), got_kv.size() * sizeof(float));
+        {   // DS1-G's ds41_quantize_acts (natural order) wrote runner.xq() / xs(): the same bytes as the CONTRACTS.md rule applied to the oracle's dequantised rows
+            std::vector<int8_t> hq((size_t) S * IN), eq((size_t) S * IN);
+            std::vector<float> hs((size_t) S * (IN / 32)), es((size_t) S * (IN / 32));
+            c.dev.d2h(hq.data(), runner.xq(), hq.size());
+            c.dev.d2h(hs.data(), runner.xs(), hs.size() * sizeof(float));
+            for (size_t b = 0; b < (size_t) S * (IN / 32); ++b) quantize_block_contract(rows.data() + 32 * b, eq.data() + 32 * b, es[b]);
+            c.rep.check(hq == eq && first_bit_diff(hs.data(), es.data(), hs.size()) == hs.size(), tag + "  ds41_quantize_acts (natural) on the Engram rows == the CONTRACTS.md quantiser (bit-identical)");
+        }
         const Err ek = compare(got_kv.data(), kv_int8.data(), got_kv.size());
         c.rep.check(ek.nan_mismatch == 0 && ek.max_abs <= 2e-5 * ek.max_ref, tag + "  wkv stand-in (int8 activations x Q8_0) vs the oracle's kv in int8 mode", describe(ek));
         const Err eo = compare(got.data(), out_int8.data(), got.size());
@@ -560,7 +560,7 @@ void suite_runner_mini(Ctx& c) {
         }
         const auto got3 = dx3.down();
         c.rep.check(first_bit_diff(got3.data(), got.data(), got.size()) == got.size(), tag + fmt("  decode (T=1, incremental hasher) == prefill (T=%d): bit-identical", S));
-        c.rep.check(ops.quantize_calls == 1 + S && ops.gemv_calls == 1 + S, tag + fmt("  the wkv hook called the provider's quantiser and Q8_0 GEMV once per run (%d + %d)", ops.quantize_calls, ops.gemv_calls));
+        c.rep.check(gemv.calls == 1 + S, tag + fmt("  the wkv hook called the Q8_0 GEMV once per run (%d)", gemv.calls));
         // the runner refuses what it cannot hold
         c.rep.check(throws_invalid([&] { runner.upload_rows(w.table, hr.data(), S + 1, (int64_t) L * cols); }), tag + "  refuses T > t_max");
     }

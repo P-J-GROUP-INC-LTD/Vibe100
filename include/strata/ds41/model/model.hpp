@@ -179,8 +179,10 @@ public:
     /// Uploads every dense tensor of `specs` (their LT slots) into ONE device allocation and maps the host tensors.  The files must have been
     /// validated against `specs` (validate_tensors).  `dir` / `gguf` outlive the weights.
     /// `piece_bytes`: a tensor goes up in pieces of at most this size (bounded staging: the driver pins and copies one piece at a time).
+    /// `drop_pages`: after each piece is uploaded its file pages are dropped from this process and the page cache (GgufSet::drop_cache), so the resident
+    /// memory of the upload is one piece, not the 8.9 GB of dense weights.
     void load(ModelDev& dev, const GgufSet& gguf, const Ds41Config& cfg, const std::vector<TensorSpec>& specs, const TensorDir& dir, const LogFn& log,
-              uint64_t piece_bytes = 64ull << 20);
+              uint64_t piece_bytes = 64ull << 20, bool drop_pages = false);
     void release();
 
 private:

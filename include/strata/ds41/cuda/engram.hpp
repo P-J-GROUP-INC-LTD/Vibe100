@@ -12,8 +12,7 @@
 //   device  ds41_engram_dequant_rows           MXFP4 -> FP32 rows [T][kEngramIn] (bit-exact: kvalues * 2^(e - 128))
 //   device  wkv (NOT here: Q8_0 GEMV, int8 activations: a `linear_act` site)    kv [T][kEngramOut] = [key (kHc * kHidden) | value (kHidden)]
 //   device  ds41_engram_combine                gate = sigmoid(signed sqrt of the normalised key . stream dot) per (token, copy); stream[c] += gate * value
-// The wkv hook is a std::function the session binds to DS1-B's Q8_0 GEMV (quantise the FP32 rows with DS1-G's ds41_quantize_acts first); this header does not
-// depend on either.  Everything FP32 except the Q8_0 weights of that GEMV and the BF16 q / k weights.
+// The wkv hook is a std::function: engram_wkv_q8<G> builds it from DS1-G's ds41_quantize_acts (natural order) and a Q8_0 GEMV callback (DS1-B's / DS1-C's gemv_q8).  Everything FP32 except the Q8_0 weights of that GEMV and the BF16 q / k weights.
 #pragma once
 
 #include <cstddef>
@@ -24,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "strata/ds41/cuda/ds41_cuda.hpp"       // ds41_quantize_acts, ActOrder (DS1-G)
 #include "strata/ds41/cuda/ds41_dev.hpp"
 #include "strata/ds41/geom.hpp"
 
@@ -146,16 +146,19 @@ template <class G> EngramKernelInfo ds41_engram_kernel_info(int which);
 /// [T][kEngramOut].  The session binds it to DS1-B's GEMV after DS1-G's activation quantiser; enqueue on `stream`.
 using EngramWkvFn = std::function<void(const float* rows, int T, float* kv, Stream stream)>;
 
-/// The wkv hook for any dense-ops provider with the two calls DS1-C's `AttnDenseOps` (attn.hpp) already has and DS1-B's dense.hpp will have:
-///     ops.quantize_acts(const float* x, int T, int k, int8_t* xq, float* xs, Stream)                              CONTRACTS.md's int8-per-32 quantiser
-///     ops.gemv_q8(const void* w, int n, int k, const int8_t* xq, const float* xs, int T, float* y, Stream)         Q8_0 rows x int8 activations (dp4a)
-/// `wkv_q8` = the layer's Q8_0 weight [kEngramOut][kEngramIn] (device), `xq` / `xs` = scratch int8 [t_max][kEngramIn] and float [t_max][kEngramIn / 32]
-/// (EngramRunner::xq() / xs()).  `ops` is held by reference: it must outlive the returned function.
-template <class G, class Ops>
-EngramWkvFn engram_wkv_via_ops(Ops& ops, const void* wkv_q8, int8_t* xq, float* xs) {
-    return [&ops, wkv_q8, xq, xs](const float* rows, int T, float* kv, Stream s) {
-        ops.quantize_acts(rows, T, Derived<G>::kEngramIn, xq, xs, s);
-        ops.gemv_q8(wkv_q8, Derived<G>::kEngramOut, Derived<G>::kEngramIn, xq, xs, T, kv, s);
+/// The Q8_0 GEMV a session binds: y[t][r] = sum over the k / 32 blocks of d_w[r][b] * xs[t][b] * (sum_j wq[r][b][j] * xq[t][b][j]) (the integer sum exact; DS1.md section 2), with
+/// w = GGML Q8_0 rows (fp16 d + int8 qs[32], 34 bytes, row r at w + r * (k / 32) * 34), xq / xs in the NATURAL layout of ds41_quantize_acts, y fp32 [T][n].  DS1-C's
+/// AttnDenseOps::gemv_q8 has this shape, and DS1-B's dense.hpp will.
+using EngramGemvQ8Fn = std::function<void(const void* w, int n, int k, const int8_t* xq, const float* xs, int T, float* y, Stream stream)>;
+
+/// The wkv hook of a layer: DS1-G's activation quantiser (`ds41_quantize_acts<G>`, ActOrder::kNatural: int8 per 32 + one FP32 scale, CONTRACTS.md's rule) on the dequantised rows,
+/// then `gemv` with the layer's Q8_0 weight `wkv_q8` [kEngramOut][kEngramIn] (device).  `xq` / `xs` = scratch int8 [t_max][kEngramIn] and float [t_max][kEngramIn / 32]
+/// (EngramRunner::xq() / xs()).  `dev` is held by reference: it must outlive the returned function.
+template <class G>
+EngramWkvFn engram_wkv_q8(Dev& dev, const void* wkv_q8, int8_t* xq, float* xs, EngramGemvQ8Fn gemv) {
+    return [&dev, wkv_q8, xq, xs, gemv = std::move(gemv)](const float* rows, int T, float* kv, Stream s) {
+        ds41_quantize_acts<G>(dev, rows, T, Derived<G>::kEngramIn, xq, xs, s, ActOrder::kNatural);
+        gemv(wkv_q8, Derived<G>::kEngramOut, Derived<G>::kEngramIn, xq, xs, T, kv, s);
     };
 }
 
@@ -195,7 +198,7 @@ class EngramRunner {
     float* rows_f32() const { return rows_; }        // device [t_max][kEngramIn]: the dequantised rows of the last run (tests, tracing)
     float* kv() const { return kv_; }                // device [t_max][kEngramOut]: wkv's output of the last run
     int8_t* xq() const { return xq_; }               // device [t_max][kEngramIn] / [t_max][kEngramIn / 32]: scratch for the wkv hook's activation quantiser
-    float* xs() const { return xs_; }                // (engram_wkv_via_ops)
+    float* xs() const { return xs_; }                // (engram_wkv_q8)
 
     /// Gather the kEngramRows rows of each of T tokens (row_idx[t * token_stride + r], from NgramHasher: token_stride = n_layers * rows_per_layer when the
     /// pointer is `out + layer_index * rows_per_layer`) into the staging buffer and copy them to the device.  Blocking.

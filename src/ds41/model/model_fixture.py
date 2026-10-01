@@ -16,6 +16,8 @@ Writes under <dir>:
         dequant.txt        name file n_floats [row,row,...]; dequant/NNN.f32 = the oracle's float32 decode (ref/ds41/weights.py)
         experts.txt        layer expert blob half0 half1; the three layouts (tools/ds41/expert_layout.py), files under experts/
     real_headers.txt     the REAL model's metadata and 1,006-tensor table from the saved headers JSON, as text (no weights needed)
+    real/*.gguf          (--sparse-real) the real model as 12 sparse shards: real metadata and tensor table, data a hole (411 GB apparent, a few MB on disk)
+    real_sparse.txt      their tensor offsets and sizes, written by Python
     real_expect.txt      byte totals of the real model computed here from the same table, for the C++ tally to match
 Everything is deterministic.  The C++ side parses these files with nothing but the standard library.
 """
@@ -26,6 +28,7 @@ import dataclasses
 import gzip
 import json
 import pathlib
+import struct
 import sys
 
 import numpy as np
@@ -201,16 +204,96 @@ def write_real(out: pathlib.Path) -> None:
     (out / "real_expect.txt").write_text("\n".join(exp) + "\n")
 
 
+# ------------------------------------------------------------------------------------------------ the real model as SPARSE files
+_GGUF_T = {"u32": 4, "i32": 5, "f32": 6, "bool": 7, "string": 8, "array": 9, "i64": 11, "f64": 12}
+_TYPE_ID = {"F32": 0, "Q8_0": 8, "BF16": 30, "MXFP4": 39}
+
+
+def _pstr(x: str) -> bytes:
+    b = x.encode("utf-8")
+    return struct.pack("<Q", len(b)) + b
+
+
+def _pscalar(v) -> bytes:
+    if isinstance(v, bool):
+        return struct.pack("<I", _GGUF_T["bool"]) + struct.pack("<?", v)
+    if isinstance(v, int):
+        return struct.pack("<I", _GGUF_T["i64"]) + struct.pack("<q", v) if abs(v) >= 2 ** 31 else struct.pack("<I", _GGUF_T["u32"]) + struct.pack("<I", v) if v >= 0 else struct.pack("<I", _GGUF_T["i32"]) + struct.pack("<i", v)
+    if isinstance(v, float):
+        if struct.unpack("<f", struct.pack("<f", v))[0] == v:
+            return struct.pack("<I", _GGUF_T["f32"]) + struct.pack("<f", v)
+        return struct.pack("<I", _GGUF_T["f64"]) + struct.pack("<d", v)
+    if isinstance(v, str):
+        return struct.pack("<I", _GGUF_T["string"]) + _pstr(v)
+    raise TypeError(type(v))
+
+
+def _parray(items: list) -> bytes:
+    if not items:
+        return struct.pack("<I", _GGUF_T["array"]) + struct.pack("<IQ", _GGUF_T["i32"], 0)
+    if isinstance(items[0], str):
+        return struct.pack("<I", _GGUF_T["array"]) + struct.pack("<IQ", _GGUF_T["string"], len(items)) + b"".join(_pstr(x) for x in items)
+    if isinstance(items[0], float):
+        return struct.pack("<I", _GGUF_T["array"]) + struct.pack("<IQ", _GGUF_T["f32"], len(items)) + struct.pack(f"<{len(items)}f", *items)
+    if max(abs(int(x)) for x in items) >= 2 ** 31:
+        return struct.pack("<I", _GGUF_T["array"]) + struct.pack("<IQ", _GGUF_T["i64"], len(items)) + struct.pack(f"<{len(items)}q", *items)
+    return struct.pack("<I", _GGUF_T["array"]) + struct.pack("<IQ", _GGUF_T["i32"], len(items)) + struct.pack(f"<{len(items)}i", *items)
+
+
+def write_sparse_real(out: pathlib.Path) -> None:
+    """The real model's 12 shards as GGUF files whose DATA is a hole: the real metadata (arrays the headers JSON only summarises are synthesised), the real
+    1,006-tensor table with the real offsets, and a data section of the real size that was never written (411 GB of apparent size, a few MB on disk)."""
+    d = out / "real"
+    d.mkdir(parents=True, exist_ok=True)
+    with gzip.open(HEADERS, "rt", encoding="utf-8") as fh:
+        raw = json.load(fh)
+    files = [k for k in raw if "-of-00012" in k]
+    vocab = 129280
+    lines = []
+    total = 0
+    for i, name in enumerate(files):
+        kv = dict(raw[name]["kv"])
+        if i == 0:
+            kv["tokenizer.ggml.tokens"] = [f"<tok{j}>" for j in range(vocab)]
+            kv["tokenizer.ggml.token_type"] = [1] * vocab
+            kv["deepseek41.engram.token_map"] = [(j * 7919) % 99092 for j in range(vocab)]
+            kv.pop("tokenizer.ggml.merges", None)
+            kv["split.tensors.count"] = sum(len(raw[f]["tensors"]) for f in files)
+        body = b"".join(_pstr(k) + (_parray(v) if isinstance(v, list) else _pscalar(v)) for k, v in kv.items())
+        tens = raw[name]["tensors"]
+        tbl = b""
+        data_end = 0
+        for tname, ty, dims, off in tens:
+            tbl += _pstr(tname) + struct.pack("<I", len(dims)) + struct.pack(f"<{len(dims)}Q", *dims) + struct.pack("<IQ", _TYPE_ID[ty], off)
+            nb = G.nbytes_for(ty, dims)
+            data_end = max(data_end, off + nb)
+            lines.append(f"{tname} {i} {off} {nb} {ty}")
+        header = struct.pack("<IIQQ", 0x46554747, 3, len(tens), len(kv)) + body + tbl
+        data_start = (len(header) + 31) // 32 * 32
+        path = d / name
+        with open(path, "wb") as f:
+            f.write(header)
+            f.write(b"\0" * (data_start - len(header)))
+            f.truncate(data_start + (data_end + 31) // 32 * 32)
+        total += path.stat().st_size
+        lines.append(f"#shard {i} {name} {path.stat().st_size} {data_start}")
+    (out / "real_sparse.txt").write_text("\n".join(lines) + "\n")
+    print(f"sparse real model: 12 shards, {total / 1e9:.1f} GB apparent")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--sparse-real", action="store_true", help="also write the real model as 12 sparse shards under <out>/real (411 GB apparent, no data)")
     a = ap.parse_args(argv)
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     paths = write_mini(out, a.seed)
     write_golden(out, paths)
     write_real(out)
+    if a.sparse_real:
+        write_sparse_real(out)
     print(f"fixture written to {out}: {len(paths)} shards")
     return 0
 
