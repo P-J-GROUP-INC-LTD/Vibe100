@@ -333,8 +333,14 @@ int main() {
             // AMD: the tensor-core prompt path is CUDA-only, so it refuses every pool and the old kernel runs
             std::printf("[5/5] qsa_prompt_attn mode 3: PASS (refused on HIP - the old kernel runs)\n");
 #else
-            std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
-            g_fail = 1;
+            // A deliberate fallback (pre-Volta card, or a V100 with STRATA_VOLTA_ATTN=0) is the old kernel running,
+            // which is what the caller does on false; refusing pools a kernel variant was chosen for is the failure.
+            if (std::strcmp(k::qsa_prompt_attn_variant(pools, s), "fallback-fp32") == 0) {
+                std::printf("[5/5] qsa_prompt_attn mode 3: PASS (fallback-fp32 on this device - the old kernel runs)\n");
+            } else {
+                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
+                g_fail = 1;
+            }
 #endif
         } else {
             k::fwht256_inplace_cuda(d_at4, QH, nullptr);
