@@ -98,7 +98,9 @@ void engram_gather_rows(const EngramTableView& table, const int64_t* idx, int64_
     for (int64_t i = 0; i < n; ++i) {
         const int64_t r = idx[i];
         if (r < 0 || r >= table.rows) throw std::out_of_range("engram_gather_rows: row " + std::to_string(r) + " outside [0, " + std::to_string(table.rows) + ")");
+#if defined(__GNUC__) || defined(__clang__)
         if (i + 1 < n && idx[i + 1] >= 0 && idx[i + 1] < table.rows) __builtin_prefetch(table.base + (size_t) idx[i + 1] * row_bytes);
+#endif
         std::memcpy(out + (size_t) i * row_bytes, table.base + (size_t) r * row_bytes, row_bytes);
     }
 }
