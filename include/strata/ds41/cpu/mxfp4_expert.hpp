@@ -86,10 +86,12 @@
 // target Xeon Gold 6226 is Cascade Lake).  Requesting an unsupported ISA is a programming error and aborts.
 #pragma once
 
+#include "strata/ds41/geom.hpp"
 #include "strata/ds41/geometry.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace strata::ds41::cpu {
 
@@ -177,6 +179,79 @@ ExpertView view_blob(const uint8_t* blob);
 /// Copy half `h` of a GPU-layout blob into the CPU-half layout (what DS-B's tool and the engine's loader produce).
 void pack_cpu_half(const uint8_t* blob, int h, uint8_t* out);
 
+// ---- the same views for any geometry G (include/strata/ds41/geom.hpp: RealGeom, MiniGeom) ------------------------------------------
+// The four functions above are RealGeom's.  The engine (and the MiniGeom end-to-end test) calls the templates: `view_cpu_half<G>(half)`, ... with the
+// geometry the model was loaded at.  Header-only; the kernels behind the views (expert_gate_up / expert_down / mxfp4_dot_rows) take their shapes from
+// the ExpertView, so they run at any G whose hidden and half-ff are multiples of 128 and at most 5120 (HalfLayout checks it).
+/// The byte layout of one routed expert at G, as a blob (the GPU cache slot / the GGUF slices concatenated) and as the two CPU halves (RealGeom: 18,800,640 and
+/// 2 x 9,400,320 B; MiniGeom: 104,448 and 2 x 52,224 B).
+template <class G> struct HalfLayout {
+    static_assert(geom_ok<G>(), "G violates the kernel constraints of geom.hpp");
+    static constexpr int kHiddenW = G::kHidden, kFFW = G::kFF;
+    static constexpr int kHalfFFW = G::kFF / kHalves;                                           // intermediate rows of one half (1152)
+    static constexpr int kGateRowBlocksW = G::kHidden / kQK;                                    // 160
+    static constexpr int kDownRowBlocksW = G::kFF / kQK;                                        // 72
+    static constexpr int kHalfDownRowBlocksW = kDownRowBlocksW / kHalves;                       // 36
+    static constexpr size_t kGateRowBytesW = (size_t) kGateRowBlocksW * kBlockBytes;            // 2,720
+    static constexpr size_t kDownRowBytesW = (size_t) kDownRowBlocksW * kBlockBytes;            // 1,224
+    static constexpr size_t kHalfGateBytesW = (size_t) kHalfFFW * kGateRowBytesW;               // 3,133,440
+    static constexpr size_t kHalfDownBytesW = (size_t) kHiddenW * kHalfDownRowBlocksW * kBlockBytes;   // 3,133,440
+    static constexpr size_t kHalfGateOff = 0, kHalfUpOff = kHalfGateBytesW, kHalfDownOff = 2 * kHalfGateBytesW;
+    static constexpr size_t kHalfBytesW = 2 * kHalfGateBytesW + kHalfDownBytesW;                // 9,400,320
+    static constexpr size_t kBlobGateOff = 0, kBlobUpOff = (size_t) kFFW * kGateRowBytesW, kBlobDownOff = 2 * (size_t) kFFW * kGateRowBytesW;
+    static constexpr size_t kBlobBytesW = 2 * (size_t) kFFW * kGateRowBytesW + (size_t) kHiddenW * kDownRowBytesW;   // 18,800,640
+    static_assert(kFFW % (kHalves * 128) == 0, "a CPU half's intermediate width must be a multiple of 128 (the kernels' group of four blocks), i.e. kFF % 256 == 0");
+    static_assert(kHiddenW % kGroupValues == 0, "the activation width must be a multiple of 128 (the kernels' group of four blocks)");
+    static_assert(kHiddenW <= kActMaxBlocks * kQK && kFFW <= kActMaxBlocks * kQK, "ActQ holds at most kActMaxBlocks blocks (5120 values)");
+    static_assert(2 * kHalfBytesW == kBlobBytesW && kBlobBytesW == Derived<G>::kExpertBlobBytes, "the two halves hold exactly one expert (geom.hpp's blob)");
+};
+
+/// A CPU half of G (HalfLayout<G>::kHalfBytesW): rows of down are kFF / 64 blocks, kFF / 64 * 17 B apart.
+template <class G> inline ExpertView view_cpu_half(const uint8_t* half) {
+    using L = HalfLayout<G>;
+    ExpertView v;
+    v.gate = half + L::kHalfGateOff;
+    v.up = half + L::kHalfUpOff;
+    v.down = half + L::kHalfDownOff;
+    v.down_row_stride = (size_t) L::kHalfDownRowBlocksW * kBlockBytes;
+    v.hidden = L::kHiddenW;
+    v.ff = L::kHalfFFW;
+    return v;
+}
+/// Half `h` (0 or 1) of a GPU-layout blob of G, in place: down rows are the half's blocks of the whole row, kFF / 32 * 17 B apart.
+template <class G> inline ExpertView view_blob_half(const uint8_t* blob, int h) {
+    using L = HalfLayout<G>;
+    ExpertView v;
+    v.gate = blob + L::kBlobGateOff + (size_t) h * L::kHalfGateBytesW;
+    v.up = blob + L::kBlobUpOff + (size_t) h * L::kHalfGateBytesW;
+    v.down = blob + L::kBlobDownOff + (size_t) h * L::kHalfDownRowBlocksW * kBlockBytes;
+    v.down_row_stride = L::kDownRowBytesW;
+    v.hidden = L::kHiddenW;
+    v.ff = L::kHalfFFW;
+    return v;
+}
+/// The whole expert of a GPU-layout blob of G: ff = kFF, down rows of kFF / 32 blocks.
+template <class G> inline ExpertView view_blob(const uint8_t* blob) {
+    using L = HalfLayout<G>;
+    ExpertView v;
+    v.gate = blob + L::kBlobGateOff;
+    v.up = blob + L::kBlobUpOff;
+    v.down = blob + L::kBlobDownOff;
+    v.down_row_stride = L::kDownRowBytesW;
+    v.hidden = L::kHiddenW;
+    v.ff = L::kFFW;
+    return v;
+}
+/// Copy half `h` of a GPU-layout blob of G into the CPU-half layout (HalfLayout<G>::kHalfBytesW bytes at `out`).
+template <class G> inline void pack_cpu_half(const uint8_t* blob, int h, uint8_t* out) {
+    using L = HalfLayout<G>;
+    const ExpertView v = view_blob_half<G>(blob, h);
+    std::memcpy(out + L::kHalfGateOff, v.gate, L::kHalfGateBytesW);
+    std::memcpy(out + L::kHalfUpOff, v.up, L::kHalfGateBytesW);
+    const size_t piece = (size_t) L::kHalfDownRowBlocksW * kBlockBytes;
+    for (int r = 0; r < L::kHiddenW; ++r) std::memcpy(out + L::kHalfDownOff + (size_t) r * piece, v.down + (size_t) r * v.down_row_stride, piece);
+}
+
 // ---- the expert, in row ranges ---------------------------------------------------------------------------------
 /// The quantised intermediate of one expert for up to kMaxTokens tokens.  Shared by all threads working on the
 /// same expert (phase 1 writes disjoint blocks of it, phase 2 reads all of it); one per concurrently running expert.
@@ -213,6 +288,10 @@ void expert_run(Isa isa, const ExpertView& v, const ActQ* x, int T, const float*
 /// halves' partials equals this up to the order of FP32 additions.
 void expert_run_blob(Isa isa, const uint8_t* blob, const ActQ* x, int T, const float* route_w, ExpertScratch& s,
                      float* y);
+/// The same for a blob of any geometry G (view_blob<G> + expert_run).
+template <class G> inline void expert_run_blob(Isa isa, const uint8_t* blob, const ActQ* x, int T, const float* route_w, ExpertScratch& s, float* y) {
+    expert_run(isa, view_blob<G>(blob), x, T, route_w, s, y);
+}
 
 // ---- the primitive under both phases (exposed for the tests and the benchmark) -------------------------------------
 /// out[t * out_stride + r] (= or +=) dot(row r of W, x_t) for r < nrows, t < T:

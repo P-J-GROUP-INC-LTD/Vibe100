@@ -22,23 +22,22 @@
 //
 // THE ONE-BLOCK LAG (what the session keeps; docs of Model.block): a block's attention sub-layer collapses the stream with the `pre` that the
 // PREVIOUS block's FFN mixes produced (block 0: pre = [1, 0, 0, 0]); its FFN sub-layer collapses with the `pre` of its OWN attention mixes;
-// after the last block the head fold is hc_pre with the last block's FFN `pre`.  The caller keeps three records (HcRecords) per forward pass:
+// after the last block the head fold is hc_pre with the last block's FFN `pre`.  The caller keeps three records (HcRecords) per forward pass and
+// calls the per-sub-layer functions below, which do the bookkeeping (which record hc_pre reads, which one hc_mixes writes, when the lag moves):
 //
-//     HcRecords<G> rec(carve of hc_records_bytes<G>(T));  ds41_hc_set_identity_pre<G>(dev, rec.lag, T);          // once per token batch
+//     HcRecords<G> rec(carve of hc_records_bytes<G>(T), T);      ds41_hc_begin<G>(dev, rec, T);                 // once per token batch: lag = [1, 0, 0, 0]
 //     for each block l:
-//         [Engram, on its layers, rewrites the stream in place: pre is untouched by it]
-//         // ---- attention sub-layer: mixes of x, collapsed with the LAG record
-//         ds41_hc_mixes<G>(dev, x, attn_hc, T, prm, rec.a, ws, ws_bytes);
-//         ds41_hc_pre<G>(dev, x, rec.lag, T, y);                         // y = sum_c lag.pre[c] x[c]
+//         [Engram, on its layers, rewrites the stream x in place: the records are untouched by it]
+//         ds41_hc_attn_in<G>(dev, x, attn_hc, T, prm, rec, y, ws, ws_bytes);   // mixes(x) -> rec.a ;  y = sum_c rec.lag.pre[c] x[c]   (the LAG)
 //         ... y = attn_norm(y); y = attention(y) ...
-//         ds41_hc_post<G>(dev, y, x, rec.a, T, x);                       // x <- post_a * y + comb_a^T x   (in place is allowed)
-//         // ---- FFN sub-layer: mixes of the NEW x, collapsed with the attention's OWN pre
-//         ds41_hc_mixes<G>(dev, x, ffn_hc, T, prm, rec.f, ws, ws_bytes);
-//         ds41_hc_pre<G>(dev, x, rec.a, T, y);                           // y = sum_c a.pre[c] x[c]
+//         ds41_hc_attn_out<G>(dev, y, x, T, rec);                              // x <- post_a * y + comb_a^T x                    (in place)
+//         ds41_hc_ffn_in<G>(dev, x, ffn_hc, T, prm, rec, y, ws, ws_bytes);     // mixes(NEW x) -> rec.f ; y = sum_c rec.a.pre[c] x[c]  (the attention's OWN pre)
 //         ... y = ffn_norm(y); y = moe(y) ...
-//         ds41_hc_post<G>(dev, y, x, rec.f, T, x);
-//         rec.next_block();                                              // lag <- f (swap of two pointers; no copy)
-//     ds41_hc_pre<G>(dev, x, rec.lag, T, h);                             // the final head fold, then norm -> head
+//         ds41_hc_ffn_out<G>(dev, y, x, T, rec);                               // x <- post_f * y + comb_f^T x ;  then lag <- f (two pointers swap; no copy)
+//     ds41_hc_head_fold<G>(dev, x, rec, T, h);                                 // the final fold with the last FFN's pre, then norm -> head
+//
+// (Each is two or one launch of the primitives below; the primitives stay public for tests and tracing.)  After ds41_hc_ffn_out the record `rec.lag`
+// holds this block's FFN mixes: its first kHc floats per token are the trace stage `pre_mix.L`.
 //
 // Tokens are independent: T tokens (a prompt chunk, a verify window) go through the same calls; a token's results are bit-identical for every
 // T (the per-token reduction order is fixed) and for every block / thread scheduling order (no atomics anywhere).  DS-1 prefill feeds one
@@ -140,6 +139,43 @@ void ds41_hc_set_identity_pre(Dev& dev, float* coef, int T, Stream stream = null
 /// Embedding -> stream: out[t][c][d] = emb[t][d] for every copy c (model.py: np.repeat(h[:, None, :], hc_mult, axis=1)).
 template <class G>
 void ds41_hc_expand(Dev& dev, const float* emb, int T, float* x_out, Stream stream = nullptr);
+
+// ---- the per-sub-layer API: the primitives above in the order of the one-block lag (header comment) -------------------------------------
+/// Start of a token batch: the lag record becomes pre = [1, 0, 0, 0] (model.py make_identity_pre_mix).
+template <class G>
+void ds41_hc_begin(Dev& dev, HcRecords<G>& rec, int T, Stream stream = nullptr) {
+    ds41_hc_set_identity_pre<G>(dev, rec.lag, T, stream);
+}
+/// Attention sub-layer input: mixes of x -> rec.a; y = hc_pre(x, the LAG record's pre).
+template <class G>
+void ds41_hc_attn_in(Dev& dev, const float* x, const HcWeights& w, int T, const HcParams& prm, HcRecords<G>& rec, float* y, void* ws, size_t ws_bytes,
+                     Stream stream = nullptr) {
+    ds41_hc_mixes<G>(dev, x, w, T, prm, rec.a, ws, ws_bytes, nullptr, stream);
+    ds41_hc_pre<G>(dev, x, rec.lag, T, y, stream);
+}
+/// Attention sub-layer output: x <- hc_post(f, x, rec.a), in place.
+template <class G>
+void ds41_hc_attn_out(Dev& dev, const float* f, float* x, int T, const HcRecords<G>& rec, Stream stream = nullptr) {
+    ds41_hc_post<G>(dev, f, x, rec.a, T, x, stream);
+}
+/// FFN sub-layer input: mixes of the NEW x -> rec.f; y = hc_pre(x, the attention's OWN pre: rec.a).
+template <class G>
+void ds41_hc_ffn_in(Dev& dev, const float* x, const HcWeights& w, int T, const HcParams& prm, HcRecords<G>& rec, float* y, void* ws, size_t ws_bytes,
+                    Stream stream = nullptr) {
+    ds41_hc_mixes<G>(dev, x, w, T, prm, rec.f, ws, ws_bytes, nullptr, stream);
+    ds41_hc_pre<G>(dev, x, rec.a, T, y, stream);
+}
+/// FFN sub-layer output: x <- hc_post(f, x, rec.f), in place; then the lag moves on (rec.lag = this block's FFN record).
+template <class G>
+void ds41_hc_ffn_out(Dev& dev, const float* f, float* x, int T, HcRecords<G>& rec, Stream stream = nullptr) {
+    ds41_hc_post<G>(dev, f, x, rec.f, T, x, stream);
+    rec.next_block();
+}
+/// After the last block: h = hc_pre(x, the last FFN's pre) (the head fold); h [T][kHidden] feeds the final RMSNorm and the head.
+template <class G>
+void ds41_hc_head_fold(Dev& dev, const float* x, const HcRecords<G>& rec, int T, float* h, Stream stream = nullptr) {
+    ds41_hc_pre<G>(dev, x, rec.lag, T, h, stream);
+}
 
 // ---- test / tooling hooks -----------------------------------------------------------------------------------------------------------
 /// What the compiler made of the mHC kernels (registers per thread, static smem); zeros in the emulator build.  Which: 0 = partial GEMV, 1 = finalize,

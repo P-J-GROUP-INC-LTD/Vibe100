@@ -378,7 +378,8 @@ def replay_compare(model, eng: Trace, layers, positions, *, tol_scale: float = 1
         except ReplayError as e:
             notes.append(f"head: cannot replay: {e}")
     keys.sort(key=lambda k: C.exec_key(*k))
-    rep = C.compare_sources(eng, ref, keys, "layer", tol_scale=tol_scale, strict=strict,
+    tols = C.Tolerances(C.Dims.from_summary(TI.model_summary(model)), model.quant, tol_scale)
+    rep = C.compare_sources(eng, ref, keys, "layer", tols=tols, strict=strict,
                             title=f"engine {eng.path} vs oracle replay (layer-by-layer) {len(layers)} layer(s) x {len(positions)} position(s)")
     rep.notes += notes
     rep.errors += [n for n in notes if "cannot replay" in n]     # a (layer, position) that could not be checked is not a pass

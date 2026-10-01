@@ -50,6 +50,24 @@ struct EngramConstants {
     std::vector<int64_t> num_embeddings; // engram.num_embeddings      [L] table rows (optional: checked against the primes when present)
 };
 
+/// The constants from DS1-A's `strata::ds41::model::EngramConfig` (include/strata/ds41/model/config.hpp), or any struct with the same members (layers, heads,
+/// ngram, pad_id, cvocab, num_embeddings, primes, offsets, multipliers, token_map).  A template, so that this header does not include the loader's.
+template <class C>
+EngramConstants engram_constants_from(const C& e) {
+    EngramConstants c;
+    c.layer_ids.assign(e.layers.begin(), e.layers.end());
+    c.n_heads = (int32_t) e.heads;
+    c.max_ngram_size = (int32_t) e.ngram;
+    c.pad_token_id = (int32_t) e.pad_id;
+    c.compressed_vocab_size = (int32_t) e.cvocab;
+    c.primes.assign(e.primes.begin(), e.primes.end());
+    c.offsets.assign(e.offsets.begin(), e.offsets.end());
+    c.multipliers.assign(e.multipliers.begin(), e.multipliers.end());
+    c.token_map.assign(e.token_map.begin(), e.token_map.end());
+    c.num_embeddings.assign(e.num_embeddings.begin(), e.num_embeddings.end());
+    return c;
+}
+
 /// engram.py NgramHashState, text only, one sequence.  Position p hashes the compressed ids of tokens p, p-1, p-2, p-3 (the pad token's compressed id where the
 /// sequence has not started).  Incremental: keeps the last max_ngram_size - 1 compressed ids, so a prompt fed one token at a time, in chunks or all at once
 /// gives the same rows as the oracle's prefill + decode.  Row index of (layer li, order i = 2..max_ngram, head h) = rolling_xor_i % primes[li][i-2][h] + offsets,

@@ -43,6 +43,9 @@
 //                  stays finite).  fminf-style clamps would turn them into numbers.
 //  11. sockets     the two halves of an expert run CONCURRENTLY, each into its own partial y_k; y_0 + y_1 equals the sequential accumulation
 //                  (one buffer for both halves would race: every half covers all 5120 rows).
+//  12. geometry    the views as templates over the geometry G (view_cpu_half<G> ...): at MiniGeom (hidden 256, ff 256, the model of make_mini_gguf.py) the
+//                  packed halves are the independently derived layout, CPU halves and blob halves give bitwise equal y on every ISA, the pipeline stages
+//                  agree with FP64 and half0 + half1 equals the whole expert; at RealGeom the templates agree with the non-template views.
 #include "strata/ds41/cpu/mxfp4_expert.hpp"
 
 #include <algorithm>
@@ -55,6 +58,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace strata::ds41;
@@ -812,6 +816,109 @@ void test_halves(Rng& rng) {
     }
 }
 
+// ---- 12. geometry ------------------------------------------------------------------------------------------------------
+template <class G>
+struct GeomExpert {
+    using L = HalfLayout<G>;
+    std::vector<uint8_t> blob, half0, half1;
+    GeomExpert(Rng& rng, int elo, int ehi) : blob(L::kBlobBytesW), half0(L::kHalfBytesW), half1(L::kHalfBytesW) {
+        fill_rows(rng, blob.data(), (size_t) 2 * G::kFF, L::kGateRowBlocksW, EMode::kRealistic, 0, elo, ehi);
+        fill_rows(rng, blob.data() + L::kBlobDownOff, (size_t) G::kHidden, L::kDownRowBlocksW, EMode::kRealistic, 0, elo, ehi);
+        pack_cpu_half<G>(blob.data(), 0, half0.data());
+        pack_cpu_half<G>(blob.data(), 1, half1.data());
+    }
+};
+
+// RealGeom's layout constants are geometry.hpp's (the templates are the old functions)
+static_assert(HalfLayout<RealGeom>::kHalfBytesW == kHalfBytes && HalfLayout<RealGeom>::kBlobBytesW == kBlobBytes && HalfLayout<RealGeom>::kHalfDownOff == kHalfDown &&
+              HalfLayout<RealGeom>::kHalfGateBytesW == kHalfGateBytes && HalfLayout<RealGeom>::kBlobDownOff == kBlobDown);
+static_assert(HalfLayout<MiniGeom>::kHalfBytesW == 52224 && HalfLayout<MiniGeom>::kBlobBytesW == 104448 && Derived<MiniGeom>::kExpertBlobBytes == 104448);
+
+template <class G>
+void test_geometry(Rng& rng) {
+    using L = HalfLayout<G>;
+    std::printf("[12] the views as templates over the geometry: %s (hidden %d, ff %d, half ff %d, blob %zu B, half %zu B)\n", G::kName, G::kHidden, G::kFF, L::kHalfFFW,
+                L::kBlobBytesW, L::kHalfBytesW);
+    GeomExpert<G> be(rng, 117, 122);
+    const int hidden = G::kHidden, ff = G::kFF, half_ff = ff / 2;
+    const size_t grow = (size_t) hidden / 32 * kBlockBytes, drow = (size_t) ff / 32 * kBlockBytes, dpiece = drow / 2;
+    // the views carry the geometry's numbers
+    {
+        const ExpertView a = view_cpu_half<G>(be.half1.data()), b = view_blob_half<G>(be.blob.data(), 1), c = view_blob<G>(be.blob.data());
+        CHECK(a.hidden == hidden && a.ff == half_ff && b.hidden == hidden && b.ff == half_ff && c.hidden == hidden && c.ff == ff, "%s: view hidden / ff", G::kName);
+        CHECK(a.down_row_stride == dpiece && b.down_row_stride == drow && c.down_row_stride == drow, "%s: view strides %zu / %zu / %zu (want %zu / %zu)", G::kName, a.down_row_stride,
+              b.down_row_stride, c.down_row_stride, dpiece, drow);
+        CHECK(a.chunks() == half_ff / 32 && c.chunks() == ff / 32, "%s: chunks", G::kName);
+    }
+    // the packed half, against a layout derived here from the blob's own definition: [gate rows of the half][up rows][down: every row's half-blocks]
+    for (int h = 0; h < 2; ++h) {
+        const std::vector<uint8_t>& half = h ? be.half1 : be.half0;
+        bool ok = true;
+        const uint8_t* gate = be.blob.data() + (size_t) h * half_ff * grow;
+        const uint8_t* up = be.blob.data() + (size_t) ff * grow + (size_t) h * half_ff * grow;
+        const uint8_t* down = be.blob.data() + 2 * (size_t) ff * grow;
+        ok = ok && std::memcmp(half.data(), gate, (size_t) half_ff * grow) == 0;
+        ok = ok && std::memcmp(half.data() + (size_t) half_ff * grow, up, (size_t) half_ff * grow) == 0;
+        for (int r = 0; r < hidden && ok; ++r)
+            ok = std::memcmp(half.data() + 2 * (size_t) half_ff * grow + (size_t) r * dpiece, down + (size_t) r * drow + (size_t) h * dpiece, dpiece) == 0;
+        CHECK(ok, "%s: packed half %d is the independently derived layout", G::kName, h);
+    }
+    // the pipeline stages against FP64 on each kind of view (CPU half, in-place blob half, the whole expert)
+    Stats st;
+    for (int T : {1, 3, 8}) {
+        std::vector<float> w((size_t) T);
+        for (auto& v : w) v = rng.uniform(0.2f, 2.0f);
+        run_pipeline_case(rng, view_cpu_half<G>(be.half0.data()), T, w, 1.0, st, G::kName);
+        run_pipeline_case(rng, view_blob_half<G>(be.blob.data(), 1), T, w, 1.0, st, G::kName);
+        run_pipeline_case(rng, view_blob<G>(be.blob.data()), T, w, 1.0, st, G::kName);
+    }
+    std::printf("    worst: stage c %.2e of max, end-to-end rel RMS %.4f (deterministic bound used: at most %.1f%%), SIMD-vs-scalar y/rms %.2e; intermediate flips %d of %d\n",
+                st.worst_stage_c, st.worst_e2e, 100 * st.worst_bound_use, st.worst_isa_y, st.flips, st.elements);
+    // CPU halves and blob halves: bitwise equal; half0 + half1 vs the whole expert; the full intermediate is the two halves' intermediates
+    for (int T : {1, 4, 8}) {
+        std::vector<float> x((size_t) T * hidden), w((size_t) T);
+        for (auto& v : x) v = rng.normal();
+        for (auto& v : w) v = rng.uniform(0.3f, 1.8f);
+        static ActQ xq[kMaxTokens];
+        static ExpertScratch sa, sb, sc, s0h, s1h;
+        for (Isa isa : all_isas()) {
+            quantize_acts(x.data(), hidden, T, xq, isa);
+            std::vector<float> ya((size_t) T * hidden, 0.f), yb = ya, yfull = ya;
+            for (int h = 0; h < 2; ++h) {
+                expert_run(isa, view_cpu_half<G>(h ? be.half1.data() : be.half0.data()), xq, T, w.data(), sa, ya.data());
+                expert_run(isa, view_blob_half<G>(be.blob.data(), h), xq, T, w.data(), sb, yb.data());
+            }
+            CHECK(std::memcmp(ya.data(), yb.data(), ya.size() * 4) == 0, "%s %s T=%d: CPU halves and blob halves are not bitwise equal", G::kName, isa_name(isa), T);
+            expert_run_blob<G>(isa, be.blob.data(), xq, T, w.data(), sc, yfull.data());
+            std::vector<double> yd(yfull.begin(), yfull.end());
+            const double r = rms(yd);
+            double werr = 0;
+            for (size_t i = 0; i < ya.size(); ++i) werr = std::max(werr, std::fabs((double) ya[i] - (double) yfull[i]));
+            CHECK(r > 0 && werr <= 3e-5 * r, "%s %s T=%d: half0 + half1 vs full: %.3g (rms %.3g)", G::kName, isa_name(isa), T, werr, r);
+            const int nch = half_ff / 32;
+            expert_gate_up(isa, view_blob_half<G>(be.blob.data(), 0), xq, T, w.data(), s0h, 0, nch);
+            expert_gate_up(isa, view_blob_half<G>(be.blob.data(), 1), xq, T, w.data(), s1h, 0, nch);
+            bool same = true;
+            for (int t = 0; t < T && same; ++t) {
+                std::vector<int8_t> f(ff), a(half_ff), b(half_ff);
+                act_unpack(sc.h[t], ff, f.data());
+                act_unpack(s0h.h[t], half_ff, a.data());
+                act_unpack(s1h.h[t], half_ff, b.data());
+                same = std::memcmp(f.data(), a.data(), half_ff) == 0 && std::memcmp(f.data() + half_ff, b.data(), half_ff) == 0 &&
+                       std::memcmp(sc.h[t].scale, s0h.h[t].scale, nch * 4) == 0 && std::memcmp(sc.h[t].scale + nch, s1h.h[t].scale, nch * 4) == 0;
+            }
+            CHECK(same, "%s %s: the full intermediate is the two halves' intermediates", G::kName, isa_name(isa));
+        }
+    }
+    // the template views are the non-template ones at RealGeom
+    if constexpr (std::is_same_v<G, RealGeom>) {
+        const ExpertView a = view_cpu_half<G>(be.half0.data()), b = view_cpu_half(be.half0.data());
+        const ExpertView c = view_blob_half<G>(be.blob.data(), 1), d = view_blob_half(be.blob.data(), 1);
+        CHECK(a.gate == b.gate && a.up == b.up && a.down == b.down && a.down_row_stride == b.down_row_stride && a.hidden == b.hidden && a.ff == b.ff, "RealGeom: view_cpu_half<G> == view_cpu_half");
+        CHECK(c.gate == d.gate && c.up == d.up && c.down == d.down && c.down_row_stride == d.down_row_stride && c.hidden == d.hidden && c.ff == d.ff, "RealGeom: view_blob_half<G> == view_blob_half");
+    }
+}
+
 // ---- 7. threads ----------------------------------------------------------------------------------------------------------
 void test_threads(Rng& rng) {
     std::printf("[7] ragged thread splits, T tokens vs single tokens (bitwise)\n");
@@ -1139,6 +1246,8 @@ int main(int argc, char** argv) {
     test_routing_weight(rng);
     test_pipeline_real(rng);
     test_halves(rng);
+    test_geometry<MiniGeom>(rng);
+    if (!g_quick) test_geometry<RealGeom>(rng);
     test_threads(rng);
     test_accumulate(rng);
     test_quantiser_rule(rng);

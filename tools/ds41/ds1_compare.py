@@ -18,7 +18,7 @@ execution order the engine's array is compared with the oracle's:
 Each sample gets a level: OK (within the soft tolerance), FLIP (above soft, within hard: a rounding decision of the int8 / fp8 / fp4
 quantisers fell the other way on one element - expected now and then, see DS1_VERIFY.md section "Flips") or FAIL (beyond hard).  A stage fails when
 any sample fails or when the fraction of FLIP samples exceeds the stage's budget (a systematic error shows up there long before it is large).
-The tolerances (TOLERANCES below) are derived in docs/deepseek/DS1_VERIFY.md and re-measured by tools/ds41/ds1_noise.py.
+The tolerances (class Tolerances below) are derived in docs/deepseek/DS1_VERIFY.md and re-measured by tools/ds41/ds1_noise.py.
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ class Level(enum.IntEnum):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# tolerances
+# tolerances (derivation and measurements: docs/deepseek/DS1_VERIFY.md, re-measured by tools/ds41/ds1_noise.py)
 # ---------------------------------------------------------------------------------------------------------------
 
 
@@ -65,54 +65,153 @@ class FloatTol:
 
 @dataclasses.dataclass(frozen=True)
 class SetTol:
-    tie_rel: float         # a selection mismatch is a near-tie when margin <= tie_rel * scale
+    tie_rel: float         # a selection mismatch is a near-tie when margin <= (tie_rel + 10 * observed input error) * scale
     max_diff_frac: float   # ... and at most this fraction of the selection may differ (at least one entry)
     budget: float
 
 
-# Filled from the measurements of tools/ds41/ds1_noise.py (docs/deepseek/DS1_VERIFY.md has the derivation).
-# "layer": stage-isolated replay (every stage fed with the engine's own inputs) - only the stage's own float noise and its own quantiser flips.
-# "full":  whole-run comparison - the noise of every earlier stage and position has accumulated.
-TOLERANCES: dict = {"layer": {}, "full": {}}
+@dataclasses.dataclass(frozen=True)
+class Dims:
+    """The model dimensions the tolerance model needs (defaults: the real model, include/strata/ds41/geometry.hpp)."""
+    dim: int = 5120
+    hc: int = 4
+    n_heads: int = 64
+    head_dim: int = 512
+    index_n_heads: int = 32
+    index_head_dim: int = 128
+    q_lora: int = 1280
+    o_groups: int = 8
+    o_lora: int = 1024
+    ff: int = 2304                 # moe_inter_dim
+    top_k: int = 6                 # routed experts per token
+
+    @classmethod
+    def from_summary(cls, d: dict | None) -> "Dims":
+        """From the `model` block of trace.json (trace_io.model_summary); keys that are absent keep the real model's value."""
+        d = d or {}
+        names = {"dim": "dim", "hc": "hc_mult", "n_heads": "n_heads", "head_dim": "head_dim", "index_n_heads": "index_n_heads",
+                 "index_head_dim": "index_head_dim", "q_lora": "q_lora_rank", "o_groups": "o_groups", "o_lora": "o_lora_rank",
+                 "ff": "moe_inter_dim", "top_k": "n_activated_experts"}
+        return cls(**{k: int(d[v]) for k, v in names.items() if v in d})
 
 
-def _fill_tolerances() -> None:
-    def tab(mode, rows):
-        TOLERANCES[mode].update(rows)
+REAL_DIMS = Dims()
 
-    f = FloatTol
-    # soft_rms soft_max hard_rms hard_max budget
-    tab("layer", {
-        "embed": f(1e-12, 1e-12, 1e-9, 1e-9, 0.0),
-        "engram_out": f(2e-6, 2e-6, 2e-3, 2e-3, 0.05),
-        "attn_in": f(2e-6, 2e-6, 2e-3, 2e-3, 0.05),
-        "q": f(2e-5, 2e-5, 2e-2, 2e-2, 0.10),
-        "kv_win": f(2e-5, 2e-5, 5e-2, 0.30, 0.10),
-        "latent": f(2e-5, 2e-5, 0.15, 0.40, 0.10),
-        "index_k": f(2e-5, 2e-5, 0.15, 0.40, 0.10),
-        "attn_out": f(2e-5, 2e-5, 2e-2, 2e-2, 0.10),
-        "ffn_in": f(2e-6, 2e-6, 2e-3, 2e-3, 0.05),
-        "router_w": f(1e-5, 1e-5, 1e-2, 1e-2, 0.05),
-        "ffn_out": f(2e-5, 2e-5, 2e-2, 2e-2, 0.10),
-        "block_out": f(2e-6, 2e-6, 2e-3, 2e-3, 0.05),
-        "pre_mix": f(2e-6, 2e-6, 2e-3, 2e-3, 0.05),
-        "final_hidden": f(2e-6, 2e-6, 2e-3, 2e-3, 0.05),
-        "logits": f(2e-6, 2e-6, 5e-3, 5e-3, 0.05),
-        "topk": SetTol(1e-4, 0.05, 0.05),
-        "router_idx": SetTol(1e-5, 0.5, 0.05),
-        "cand_blocks": SetTol(1e-4, 0.25, 0.05),
-    })
-    tab("full", {k: v for k, v in TOLERANCES["layer"].items()})
+# --- the model behind the numbers (all measured; DS1_VERIFY.md section 3) -----------------------------------------
+SUM_NOISE = 4.0e-8        # soft_rms = SUM_NOISE * sqrt(K) for a float32 sum of K terms: 2.2x the measured naive left-to-right sequential error
+                          # (1.8e-8 * sqrt(K), K = 256 .. 20480); the engine's lane-strided sums are 3-6x better, numpy BLAS 4-7x
+SOFT_FLOOR = 1.0e-6       # nothing is held tighter than this (the measured float32-vs-float64 stage error on the mini model is <= 5e-7)
+SOFT_MAX_OVER_RMS = 2.5   # max_rel (max |E-O| / max |O|) vs rms_rel of a float32 sum error: measured 1.2 - 1.6
+HARD_NOFLIP = 50.0        # a stage without a quantiser inside has no excuse for a sample above 50 x soft (hard = 50 x soft)
+FLIP_RATE = 2.2e-5        # P(an int8 rounding decision flips) per element at the engine's pre-quantiser noise (5e-7 relative); 4.4e-5 at 1e-6
+FLIP_RMS = 1.9e-2         # one int8 flip in a K-element GEMV input moves the output by 1.9e-2 / sqrt(K) of its rms (K = 256 .. 8192, Gaussian)
+FLIP_MULT = 5.0           # hard = FLIP_MULT single-flip errors (up to 3 flips and outlier blocks: measured p99.9 is 4x the median)
+FLIP_FLOOR = 3.0e-3       # ... never below this (heavy-tailed activations: measured p99.9 up to 1.4e-3 at K = 2304 .. 8192)
+KV_FLIP_RATE = 1.0e-5     # per element, fp8 / fp4 fake-quant of a cache row (measured 2.4e-6 at 3e-7 noise, 9e-6 at 1e-6)
+KV_FLIP_RMS = {"fp8": 0.25, "fp4e4m3": 0.65, "fp4e8m0": 0.45}      # one flip moves the row by this / sqrt(K) of its rms
+KV_FLIP_MAX = {"fp8": 0.10, "fp4e4m3": 0.25, "fp4e8m0": 0.15}      # ... and one element by this much of the row's max |.|
+KV_MULT = 2.0
+BUDGET_BASE = 0.02        # a stage may always have this fraction of FLIP-level samples
+BUDGET_MULT = 2.0         # budget = BASE + MULT * P(at least one flip in a sample), capped
+BUDGET_CAP = 0.9
+CHAOS_CEILING_RMS = 1.0   # full mode, downstream of the first deviation: rms_rel above this (the tensor itself) is a failure
+TIE_FLOAT = 2.0e-5        # float32 noise of a router / indexer score relative to its scale, x ~10 safety (no quantiser flip involved)
+TIE_INDEX_FP4 = 5.0e-2    # a flip in the fp4 fake-quant of the indexer's q moves its scores by up to ~1 - 4 % of their scale (analysis in DS1_VERIFY.md)
 
 
-_fill_tolerances()
+@dataclasses.dataclass
+class StageModel:
+    """What can make an engine value of this stage differ from the oracle's when both are handed the same inputs."""
+    k_float: int = 0                          # longest float32 sum feeding the stage (sets the soft tolerance)
+    int8_sites: tuple = ()                    # K of every int8 activation quantisation INSIDE the stage (its input is the engine's, bit-identical)
+    kv: str | None = None                     # fake-quantised cache row written by the stage: "fp8" | "fp4e4m3" | "fp4e8m0"
+    kv_k: int = 0
 
 
-def tolerance(mode: str, stage: str, scale: float = 1.0):
-    t = TOLERANCES[mode][stage]
-    if scale == 1.0 or isinstance(t, SetTol):
-        return t
-    return FloatTol(*(x * scale for x in dataclasses.astuple(t)[:4]), t.budget)
+def stage_models(d: Dims, q) -> dict:
+    int8 = bool(q.int8_act or q.linear_act)
+    S = StageModel
+    return {
+        "embed": S(0),
+        "engram_out": S(d.dim),
+        "attn_in": S(d.dim),
+        # wq_a (int8 in: exact) -> q_norm -> int8 q_lora (the site) -> wq_b -> RoPE
+        "q": S(d.q_lora, (d.q_lora,) if int8 else ()),
+        # wkv -> kv_norm -> RoPE -> fp8 fake-quant (window_kv)
+        "kv_win": S(d.head_dim, (), "fp8" if q.window_kv else None, d.head_dim),
+        # compressor wkv / wgate are BF16 weights with float activations: a float32 sum of K = dim terms (DS1.md section 2)
+        "latent": S(d.dim, (), "fp4e4m3" if q.compressed_kv else None, d.head_dim),
+        "index_k": S(d.dim, (), "fp4e8m0" if q.index else None, d.index_head_dim),
+        # sparse attention (<= window + top-k terms), inverse RoPE, wo_a (float act, K = heads*head_dim/groups), int8 o_groups*o_lora (the site), wo_b
+        "attn_out": S(max(d.n_heads * d.head_dim // max(d.o_groups, 1), 640), (d.o_groups * d.o_lora,) if int8 else ()),
+        "ffn_in": S(d.dim),
+        "router_w": S(d.dim),
+        # (top_k routed + 1 shared) x int8 of silu(g)*u (the site, K = ff) -> w2
+        "ffn_out": S(d.ff, (d.ff,) * (d.top_k + 1) if int8 else ()),
+        "block_out": S(d.hc),
+        "pre_mix": S(d.hc * d.dim),
+        "final_hidden": S(d.dim),
+        "logits": S(d.dim),
+    }
+
+
+def _budget(lam: float) -> float:
+    return min(BUDGET_CAP, BUDGET_BASE + BUDGET_MULT * (1.0 - math.exp(-lam)))
+
+
+@dataclasses.dataclass
+class Tolerances:
+    """Per-stage tolerances for one (dimensions, quantisation flags) pair, `scale` multiplies the float values (a loosening you must justify)."""
+    dims: Dims
+    quant: object
+    scale: float = 1.0
+    stages: dict = dataclasses.field(default_factory=dict)       # stage -> FloatTol | SetTol
+    lam: dict = dataclasses.field(default_factory=dict)          # stage -> expected flips per sample (documentation)
+
+    def __post_init__(self):
+        d, q = self.dims, self.quant
+        for stage, m in stage_models(d, q).items():
+            soft = max(SOFT_FLOOR, SUM_NOISE * math.sqrt(m.k_float)) if m.k_float else 1e-12
+            soft_max = soft * SOFT_MAX_OVER_RMS if m.k_float else 1e-12
+            lam, hard, hard_max = 0.0, soft * HARD_NOFLIP if m.k_float else 1e-9, 0.0
+            hard_max = hard * SOFT_MAX_OVER_RMS if m.k_float else 1e-9
+            if m.int8_sites:
+                lam += FLIP_RATE * sum(m.int8_sites)
+                single = FLIP_RMS / math.sqrt(min(m.int8_sites))
+                hard = max(hard, FLIP_FLOOR, FLIP_MULT * single * (4.0 if q.linear_act else 1.0))
+                hard_max = max(hard_max, 2.0 * hard)
+            if m.kv:
+                lam += KV_FLIP_RATE * m.kv_k
+                hard = max(hard, KV_MULT * KV_FLIP_RMS[m.kv] / math.sqrt(m.kv_k))
+                hard_max = max(hard_max, KV_MULT * KV_FLIP_MAX[m.kv])
+            budget = _budget(lam) if stage != "embed" else 0.0
+            self.lam[stage] = lam
+            self.stages[stage] = FloatTol(soft * self.scale, soft_max * self.scale, hard * self.scale, hard_max * self.scale, budget)
+        tie_idx = TIE_INDEX_FP4 if q.index else TIE_FLOAT
+        self.stages["router_idx"] = SetTol(TIE_FLOAT, 0.2, 0.02)
+        self.stages["topk"] = SetTol(tie_idx, 0.10, _budget(0.0) + (0.03 if q.index else 0.0))
+        self.stages["cand_blocks"] = SetTol(tie_idx, 0.25, _budget(0.0) + (0.03 if q.index else 0.0))
+
+    def __getitem__(self, stage: str):
+        return self.stages[stage]
+
+    def __contains__(self, stage: str) -> bool:
+        return stage in self.stages
+
+    def table(self) -> str:
+        L = [f"{'stage':13s} {'soft rms':>9s} {'soft max':>9s} {'hard rms':>9s} {'hard max':>9s} {'flips/sample':>12s} {'budget':>7s}"]
+        for st in sorted(self.stages, key=lambda n: STAGE_ORDER[n]):
+            t = self.stages[st]
+            if isinstance(t, FloatTol):
+                L.append(f"{st:13s} {t.soft_rms:9.1e} {t.soft_max:9.1e} {t.hard_rms:9.1e} {t.hard_max:9.1e} {self.lam.get(st, 0.0):12.3f} {t.budget:7.2f}")
+            else:
+                L.append(f"{st:13s} near-tie window {t.tie_rel:.0e} of the score scale, <= {t.max_diff_frac:.0%} of the selection, budget {t.budget:.2f}")
+        return "\n".join(L)
+
+
+def default_tolerances(quant=None, dims: Dims | None = None, scale: float = 1.0) -> Tolerances:
+    from ref.ds41.quant import QuantConfig
+    return Tolerances(dims or REAL_DIMS, quant if quant is not None else QuantConfig(int8_act=True, window_kv=True, compressed_kv=True, index=True), scale)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -187,9 +286,16 @@ def selection(a) -> list:
     return sorted({int(x) for x in np.asarray(a).reshape(-1) if x >= 0})
 
 
-def set_sample(stage, layer, pos, e, o, margin, scale, tol: SetTol) -> Sample:
+def set_sample(stage, layer, pos, e, o, margin, scale, tol: SetTol, extra_noise: float = 0.0) -> Sample:
+    """An integer selection (router experts, top-k positions, candidate blocks): EXACT set equality, or a near-tie.
+
+    A different selection is excused only when the ORACLE's recorded margin (gap between its k-th and (k+1)-th candidate) is within the noise the two sides'
+    scores can differ by: a swap across the boundary needs |s_a - s_b| <= 2 noise, and the gap is at most |s_a - s_b|, so a gap above the noise window
+    proves the difference is not rounding.  The window is `tol.tie_rel` (the stage's own float / quantiser noise) plus `extra_noise` (10 x the observed
+    error of the stage's input, for whole-run comparisons).  The excuse is a FLIP-level sample (counted against the budget), never a plain pass."""
+    ea = np.asarray(e).reshape(-1)
     es, os_ = selection(e), selection(o)
-    if len(np.asarray(e).reshape(-1)) and len(es) != len([x for x in np.asarray(e).reshape(-1) if x >= 0]):
+    if len(ea) and len(es) != len([x for x in ea if x >= 0]):
         return Sample(stage, layer, pos, Level.FAIL, note="duplicate entries in the engine's selection")
     if es == os_:
         return Sample(stage, layer, pos, Level.OK)
@@ -197,10 +303,11 @@ def set_sample(stage, layer, pos, e, o, margin, scale, tol: SetTol) -> Sample:
     swaps = max(diff // 2, 1)
     limit = max(1, math.ceil(tol.max_diff_frac * max(len(os_), 1)))
     gap = None if margin is None else float(margin)
-    near = gap is not None and math.isfinite(gap) and scale is not None and gap <= tol.tie_rel * max(float(scale), 1e-30)
+    window = (tol.tie_rel + extra_noise) * max(float(scale), 1e-30) if scale is not None else 0.0
+    near = gap is not None and math.isfinite(gap) and scale is not None and gap <= window
     detail = (f"selections differ in {swaps} entr{'y' if swaps == 1 else 'ies'} (engine only {sorted(set(es) - set(os_))[:6]}, "
               f"oracle only {sorted(set(os_) - set(es))[:6]}); oracle margin {gap if gap is not None else 'n/a'} of scale "
-              f"{scale if scale is not None else 'n/a'}")
+              f"{scale if scale is not None else 'n/a'} (tie window {window:.3g})")
     if near and swaps <= limit:
         s = Sample(stage, layer, pos, Level.FLIP, note="near-tie: " + detail)
         s.extra["near_tie"] = True
@@ -244,11 +351,16 @@ def _softmax_kl(o_logits, e_logits) -> float:
     return float(np.sum(np.exp(lo) * (lo - le)))
 
 
-def compare_one(stage: str, layer, pos: int, e, o, ref: Source, mode: str, tol_scale: float = 1.0) -> Sample:
-    """One (stage, layer, position): engine array e against oracle array o."""
+# the stage whose error moves a selection's scores (for the whole-run near-tie window)
+SELECTION_INPUTS = {"router_idx": ("ffn_in",), "topk": ("attn_in", "q"), "cand_blocks": ("attn_in", "q")}
+SELECTION_MARGIN = {"router_idx": "router_margin", "topk": "index_margin", "cand_blocks": "cand_margin"}
+
+
+def compare_one(stage: str, layer, pos: int, e, o, ref: Source, tols: Tolerances, extra_noise: float = 0.0) -> Sample:
+    """One (stage, layer, position): engine array e against oracle array o, at the soft / hard levels of `tols`."""
     st = STAGE[stage]
     if st.kind in ("float", "kvq", "logits", "weights"):
-        tol = tolerance(mode, stage, tol_scale)
+        tol = tols[stage]
         try:
             m = float_metrics(e, o)
         except ValueError as ex:
@@ -257,21 +369,19 @@ def compare_one(stage: str, layer, pos: int, e, o, ref: Source, mode: str, tol_s
                    "NaN/Inf in the engine's values" if m["nonfinite"] else "")
         if stage == "logits":
             ea, oa = np.asarray(e, dtype=np.float64).reshape(-1), np.asarray(o, dtype=np.float64).reshape(-1)
-            if np.isfinite(ea).all() and np.isfinite(oa).all():
+            if np.isfinite(ea).all() and np.isfinite(oa).all() and oa.size > 1:
                 top2 = np.partition(oa, -2)[-2:]
                 s.extra.update({"top1_match": int(np.argmax(ea)) == int(np.argmax(oa)), "gap": float(top2[1] - top2[0]),
                                 "kl": _softmax_kl(oa, ea), "max_logit": float(np.max(np.abs(oa)))})
         return s
     if st.kind == "set":
-        tol = TOLERANCES[mode][stage]
-        mstage = {"router_idx": "router_margin", "topk": "index_margin", "cand_blocks": "cand_margin"}[stage]
-        mg = ref.get(mstage, pos, layer)
+        mg = ref.get(SELECTION_MARGIN[stage], pos, layer)
         margin, scale = (None, None) if mg is None else (float(mg[0]), float(mg[1]))
-        return set_sample(stage, layer, pos, e, o, margin, scale, tol)
+        return set_sample(stage, layer, pos, e, o, margin, scale, tols[stage], extra_noise)
     raise AssertionError(stage)
 
 
-def _router_w_sample(eng: Source, ref: Source, pos, layer, mode, tol_scale) -> Sample | None:
+def _router_w_sample(eng: Source, ref: Source, pos, layer, tols: Tolerances) -> Sample | None:
     ew, ow = eng.get("router_w", pos, layer), ref.get("router_w", pos, layer)
     ei, oi = eng.get("router_idx", pos, layer), ref.get("router_idx", pos, layer)
     if ew is None or ow is None or ei is None or oi is None:
@@ -281,41 +391,63 @@ def _router_w_sample(eng: Source, ref: Source, pos, layer, mode, tol_scale) -> S
         return Sample("router_w", layer, pos, Level.OK, note="skipped: the selections differ (router_idx reports it)")
     emap, omap = dict(zip(ei.tolist(), ew.tolist())), dict(zip(oi.tolist(), ow.tolist()))
     ids = sorted(omap)
-    return compare_one("router_w", layer, pos, [emap[i] for i in ids], [omap[i] for i in ids], ref, mode, tol_scale)
+    return compare_one("router_w", layer, pos, [emap[i] for i in ids], [omap[i] for i in ids], ref, tols)
 
 
-def tie_taints(tie, pos: int, layer, stage: str) -> bool:
-    """Is a sample at (pos, layer, stage) downstream of the near-tie event `tie` = (pos0, layer0, stage0)?  A flipped selection at layer L0 changes the
-    stream from there on at that position, hence every later layer's caches at every later position (layer L0's own caches are written before the
-    selection, so later positions at layers <= L0 stay clean)."""
-    p0, l0, s0 = tie
-    if layer is None:
-        return pos >= p0 and (stage in ("final_hidden", "logits") or pos > p0)
+# stages whose error persists in the cache: later positions of the same layer read them
+CACHE_FEEDERS = ("engram_out", "attn_in", "kv_win", "latent", "index_k")
+
+
+def downstream_of(onset, pos: int, layer, stage: str) -> bool:
+    """Can a sample at (pos, layer, stage) carry the error of the deviation `onset` = (pos0, layer0, stage0)?  Same position: everything later in
+    execution order.  Later positions: every layer above layer0 (its caches at pos0 are contaminated), layer0 itself only when the deviation sits in
+    a stage that feeds the layer's own cache rows; layers below layer0 stay clean (their rows at pos0 were written before the deviation)."""
+    p0, l0, s0 = onset
+    if stage == "embed":
+        return False
+    if layer is None:                                      # final_hidden, logits: after every layer of the same position
+        if l0 is None:
+            return pos == p0 and STAGE_ORDER[stage] > STAGE_ORDER[s0]
+        return pos >= p0
+    if l0 is None:
+        return False
     if pos == p0:
         return layer > l0 or (layer == l0 and STAGE_ORDER[stage] > STAGE_ORDER[s0])
-    return pos > p0 and layer > l0
+    return pos > p0 and (layer > l0 or (layer == l0 and s0 in CACHE_FEEDERS))
+
+
+def _dominated(a, b) -> bool:
+    """Is onset b implied by onset a (everything b taints, a taints)?"""
+    (pa, la, sa), (pb, lb, sb) = a, b
+    if la is None or lb is None:
+        return False
+    if pa == pb:
+        return la < lb or (la == lb and STAGE_ORDER[sa] <= STAGE_ORDER[sb])
+    return pa < pb and (la < lb or (la == lb and sa in CACHE_FEEDERS))
 
 
 @dataclasses.dataclass
 class Report:
     mode: str
+    tols: Tolerances | None = None
     samples: list = dataclasses.field(default_factory=list)
     missing: list = dataclasses.field(default_factory=list)         # (stage, layer, pos): in the oracle, not in the engine
     notes: list = dataclasses.field(default_factory=list)
     tie_events: list = dataclasses.field(default_factory=list)      # (pos, layer, stage, text)
-    tainted: int = 0                                                  # failures excused as downstream of a tie
+    onsets: list = dataclasses.field(default_factory=list)          # full mode: (pos, layer, stage, text) the deviations above float noise that taint what follows
+    downstream: int = 0                                               # full mode: samples judged only against the chaos ceiling
     errors: list = dataclasses.field(default_factory=list)          # conditions that fail the run whatever the samples say (cannot replay, other tokens)
     strict: bool = False
-    budgets: dict = dataclasses.field(default_factory=dict)         # stage -> (n_flip, n, budget)
     title: str = ""
 
     # -- verdict
     def stage_rows(self) -> dict:
         rows: dict = {}
         for s in self.samples:
-            r = rows.setdefault(s.stage, {"n": 0, "ok": 0, "flip": 0, "fail": 0, "worst_rms": (0.0, None), "worst_max": (0.0, None), "min_cos": (1.0, None)})
+            r = rows.setdefault(s.stage, {"n": 0, "ok": 0, "flip": 0, "fail": 0, "down": 0, "worst_rms": (0.0, None), "worst_max": (0.0, None), "min_cos": (1.0, None)})
             r["n"] += 1
             r[("ok", "flip", "fail")[int(s.level)]] += 1
+            r["down"] += 1 if s.extra.get("downstream") else 0
             if s.rms_rel > r["worst_rms"][0]:
                 r["worst_rms"] = (s.rms_rel, (s.layer, s.pos))
             if s.max_rel > r["worst_max"][0]:
@@ -325,13 +457,17 @@ class Report:
         return rows
 
     def budget_violations(self) -> list:
+        """Stages whose FLIP-level samples are more than the quantiser-flip model allows: a systematic difference, not isolated flips."""
         out = []
+        if self.tols is None:
+            return out
         for stage, r in self.stage_rows().items():
-            if stage in TOLERANCES[self.mode]:
-                b = TOLERANCES[self.mode][stage].budget
-                allowed = max(b * r["n"], 1.0 if r["n"] < 10 else 0.0)        # a handful of samples can't establish a rate: one FLIP is tolerated
+            if stage in self.tols:
+                b = self.tols[stage].budget
+                n = r["n"] - r["down"]
+                allowed = max(b * n, 1.0 if n < 10 else 0.0)        # a handful of samples can't establish a rate: one FLIP is tolerated
                 if r["flip"] > allowed:
-                    out.append((stage, r["flip"], r["n"], b))
+                    out.append((stage, r["flip"], n, b))
         return out
 
     def failures(self) -> list:
@@ -370,11 +506,17 @@ class Report:
             L.append(f"logits: top-1 agreement {top1}/{len(lg)} ({100.0 * top1 / len(lg):.2f} %), KL(oracle||engine) mean {np.mean(kls):.3e} max {np.max(kls):.3e}"
                      f"; mismatches: " + (", ".join(f"p{s.pos} (oracle gap {s.extra['gap']:.3g})" for s in lg if not s.extra["top1_match"])[:300] or "none"))
         if self.tie_events:
-            L.append(f"near-ties (a selection that differs where the oracle's margin is within the tie threshold): {len(self.tie_events)}")
+            L.append(f"near-ties (a selection that differs where the oracle's margin is within the tie window): {len(self.tie_events)}")
             for (p, l, st, txt) in self.tie_events[:8]:
                 L.append(f"    position {p}, layer {l}, {st}: {txt}")
-            if self.tainted:
-                L.append(f"  {self.tainted} later failure(s) lie downstream of a near-tie and are not counted as failures (re-run with `layers` to check them in isolation)")
+        if self.mode == "full":
+            n = len(self.samples)
+            if self.onsets:
+                p, l, st, txt = self.onsets[0]
+                L.append(f"first deviation above float noise: position {p}, " + (f"layer {l}, " if l is not None else "") + f"stage {st}: {txt}")
+                L.append(f"  {self.downstream} of {n} samples lie downstream of a deviation: an int8 / fp8 / fp4 rounding flip or a near-tie is amplified by the quantisers of "
+                         f"every later layer, so they are checked against the chaos ceiling only; use `layers` (stage-isolated replay) to check them strictly")
+            L.append(f"strictly checked: {n - self.downstream} of {n} samples ({100.0 * (n - self.downstream) / max(n, 1):.0f} %)")
         if self.missing:
             by: dict = {}
             for (st, l, p) in self.missing:
@@ -391,7 +533,7 @@ class Report:
         ff = self.first_failure()
         if ff is None and bv:
             st = min(bv, key=lambda v: STAGE_ORDER.get(v[0], 999))[0]
-            ff = min((s for s in self.samples if s.stage == st and s.level == Level.FLIP), key=lambda s: s.key, default=None)
+            ff = min((s for s in self.samples if s.stage == st and s.level == Level.FLIP and not s.extra.get("downstream")), key=lambda s: s.key, default=None)
         if ff is not None:
             L.append(f"FIRST FAILURE: {ff.where()}: rms_rel {ff.rms_rel:.3e}, max_rel {ff.max_rel:.3e}, max_abs {ff.max_abs:.3e}, cos {ff.cos:.8f}" + (f"  [{ff.note}]" if ff.note else ""))
             if verbose:
@@ -403,10 +545,12 @@ class Report:
 
     def to_json(self) -> dict:
         rows = self.stage_rows()
-        return {"mode": self.mode, "ok": self.ok, "samples": len(self.samples), "stages": {k: {kk: (list(vv) if isinstance(vv, tuple) else vv) for kk, vv in v.items()} for k, v in rows.items()},
-                "first_failure": (lambda f: None if f is None else {"pos": f.pos, "layer": f.layer, "stage": f.stage, "rms_rel": f.rms_rel, "max_rel": f.max_rel, "note": f.note})(self.first_failure()),
+        ff = self.first_failure()
+        return {"mode": self.mode, "ok": self.ok, "samples": len(self.samples), "downstream": self.downstream,
+                "stages": {k: {kk: (list(vv) if isinstance(vv, tuple) else vv) for kk, vv in v.items()} for k, v in rows.items()},
+                "first_failure": None if ff is None else {"pos": ff.pos, "layer": ff.layer, "stage": ff.stage, "rms_rel": ff.rms_rel, "max_rel": ff.max_rel, "note": ff.note},
                 "budget_violations": [list(v) for v in self.budget_violations()], "tie_events": [list(t) for t in self.tie_events],
-                "missing": len(self.missing), "notes": self.notes, "errors": self.errors}
+                "onsets": [list(o) for o in self.onsets[:20]], "missing": len(self.missing), "notes": self.notes, "errors": self.errors}
 
 
 def execution_keys(ref: Trace, positions: Iterable[int] | None, layers: Iterable[int] | None, stages: Iterable[str] | None) -> list:
@@ -431,10 +575,19 @@ def execution_keys(ref: Trace, positions: Iterable[int] | None, layers: Iterable
     return keys
 
 
-def compare_sources(eng: Source, ref: Source, keys: list, mode: str, *, tol_scale: float = 1.0, strict: bool = False, title: str = "",
-                    taint: bool = True) -> Report:
-    """Compare the arrays of two sources over `keys` ((pos, layer, stage) in execution order)."""
-    rep = Report(mode=mode, strict=strict, title=title)
+def compare_sources(eng: Source, ref: Source, keys: list, mode: str, *, tols: Tolerances | None = None, strict: bool = False, title: str = "",
+                    chaos: bool = True) -> Report:
+    """Compare the arrays of two sources over `keys` ((pos, layer, stage) in execution order).
+
+    mode "layer": every sample at the stage tolerances (the oracle was handed the engine's inputs: no error accumulates).
+    mode "full":  the oracle ran its own trajectory.  The first sample above the float noise (soft tolerance) is the ONSET of a deviation; everything
+                  downstream of it (`downstream_of`) is judged against the chaos ceiling only (finite, rms_rel <= CHAOS_CEILING_RMS), because the
+                  int8 / fp8 / fp4 quantisers turn a 1e-4 input difference into 1e-3 .. 1e-2 differences in every later layer (DS1_VERIFY.md section 4);
+                  everything before the first onset, and the layers below a deviation at later positions, stay strictly checked."""
+    tols = tols or default_tolerances()
+    rep = Report(mode=mode, tols=tols, strict=strict, title=title)
+    seen: dict = {}
+    onsets: list = []
     for (pos, layer, stage) in keys:
         o = ref.get(stage, pos, layer)
         if o is None:
@@ -444,25 +597,55 @@ def compare_sources(eng: Source, ref: Source, keys: list, mode: str, *, tol_scal
             rep.missing.append((stage, layer, pos))
             continue
         if stage == "router_w":
-            s = _router_w_sample(eng, ref, pos, layer, mode, tol_scale)
+            s = _router_w_sample(eng, ref, pos, layer, tols)
             if s is None:
                 continue
         else:
-            s = compare_one(stage, layer, pos, e, o, ref, mode, tol_scale)
+            extra = 0.0
+            if mode == "full" and stage in SELECTION_INPUTS:
+                extra = 10.0 * max([seen[(i, layer, pos)].max_rel for i in SELECTION_INPUTS[stage] if (i, layer, pos) in seen] or [0.0])
+            s = compare_one(stage, layer, pos, e, o, ref, tols, extra)
+        seen[(stage, layer, pos)] = s
         if s.extra.get("near_tie"):
             rep.tie_events.append((pos, layer, stage, s.note))
-        if s.level == Level.FAIL and taint and mode == "full" and any(tie_taints((p0, l0, st0), pos, layer, stage) for (p0, l0, st0, _) in rep.tie_events):
-            s.level = Level.FLIP
-            s.note = "downstream of a near-tie: " + s.note
-            rep.tainted += 1
+        if mode == "full" and chaos:
+            if any(downstream_of(on, pos, layer, stage) for on in onsets):
+                s.extra["downstream"] = True
+                rep.downstream += 1
+                nonfinite = s.note.startswith("NaN/Inf") or not math.isfinite(s.rms_rel)
+                if STAGE[stage].kind in ("float", "kvq", "logits", "weights"):
+                    s.level = Level.FAIL if (nonfinite or s.rms_rel > CHAOS_CEILING_RMS or s.note.startswith("shape")) else Level.OK
+                    if s.level == Level.FAIL:
+                        s.note = (s.note + "; " if s.note else "") + f"beyond the chaos ceiling ({CHAOS_CEILING_RMS})"
+                elif s.level == Level.FAIL:                           # a selection that differs far from a tie, downstream of a deviation
+                    s.note = "downstream of a deviation: " + s.note
+                    s.level = Level.OK
+                rep.samples.append(s)
+                continue
+            if s.level >= Level.FLIP:                                  # the first deviation above float noise
+                new = (pos, layer, stage)
+                if not any(_dominated(on, new) for on in onsets):
+                    onsets = [on for on in onsets if not _dominated(new, on)] + [new]
+                    txt = (f"rms_rel {s.rms_rel:.2e}, max_rel {s.max_rel:.2e}" + (f"  [{s.note}]" if s.note else "")
+                           + ("" if s.level == Level.FAIL else "  (flip level: expected at this rate, not a defect by itself)"))
+                    rep.onsets.append((pos, layer, stage, txt))
+                if s.level == Level.FLIP:
+                    s.level = Level.OK                                 # not counted against the stage budget in whole-run mode: the onset is reported instead
         rep.samples.append(s)
     return rep
+
+
+def tolerances_of(eng: Trace, ref: Trace | None = None, scale: float = 1.0) -> Tolerances:
+    """The tolerance model for a trace pair: dimensions from the oracle's trace.json `model` block (else the engine's, else the real model's),
+    quantisation flags from the engine's."""
+    meta = (ref.meta.get("model") if ref is not None else None) or eng.meta.get("model")
+    return Tolerances(Dims.from_summary(meta), eng.quant(), scale)
 
 
 def compare_traces(eng: Trace, ref: Trace, *, positions=None, layers=None, stages=None, tol_scale: float = 1.0, strict: bool = False) -> Report:
     """Whole-run comparison of an engine trace with an oracle trace (mode "full")."""
     pos = sorted(set(eng.positions()) & set(ref.positions())) if positions is None else [p for p in positions if p in set(eng.positions())]
-    rep = compare_sources(eng, ref, execution_keys(ref, pos, layers, stages), "full", tol_scale=tol_scale, strict=strict,
+    rep = compare_sources(eng, ref, execution_keys(ref, pos, layers, stages), "full", tols=tolerances_of(eng, ref, tol_scale), strict=strict,
                           title=f"engine {eng.path} ({eng.producer}) vs oracle {ref.path}")
     if set(ref.positions()) - set(eng.positions()) and positions is None:
         rep.notes.append(f"the engine trace lacks {len(set(ref.positions()) - set(eng.positions()))} of the oracle's {len(ref.positions())} positions: only the common ones were compared")

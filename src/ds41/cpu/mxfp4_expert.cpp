@@ -262,47 +262,11 @@ void quantize_acts(const float* x, int n, int T, ActQ* out, Isa isa) {
 }
 
 // ---- weights -----------------------------------------------------------------------------------------------------
-ExpertView view_cpu_half(const uint8_t* half) {
-    ExpertView v;
-    v.gate = half + kHalfGate;
-    v.up = half + kHalfUp;
-    v.down = half + kHalfDown;
-    v.down_row_stride = (size_t) kHalfDownRowBlocks * kBlockBytes;
-    v.hidden = kHidden;
-    v.ff = kHalfFF;
-    return v;
-}
-
-ExpertView view_blob_half(const uint8_t* blob, int h) {
-    ExpertView v;
-    v.gate = blob + kBlobGate + (size_t) h * kHalfGateBytes;
-    v.up = blob + kBlobUp + (size_t) h * kHalfGateBytes;
-    v.down = blob + kBlobDown + (size_t) h * kHalfDownRowBlocks * kBlockBytes;
-    v.down_row_stride = kDownRowBytes;
-    v.hidden = kHidden;
-    v.ff = kHalfFF;
-    return v;
-}
-
-ExpertView view_blob(const uint8_t* blob) {
-    ExpertView v;
-    v.gate = blob + kBlobGate;
-    v.up = blob + kBlobUp;
-    v.down = blob + kBlobDown;
-    v.down_row_stride = kDownRowBytes;
-    v.hidden = kHidden;
-    v.ff = kFF;
-    return v;
-}
-
-void pack_cpu_half(const uint8_t* blob, int h, uint8_t* out) {
-    const ExpertView v = view_blob_half(blob, h);
-    std::memcpy(out + kHalfGate, v.gate, kHalfGateBytes);
-    std::memcpy(out + kHalfUp, v.up, kHalfGateBytes);
-    const size_t piece = (size_t) kHalfDownRowBlocks * kBlockBytes;
-    for (int r = 0; r < kHidden; ++r)
-        std::memcpy(out + kHalfDown + (size_t) r * piece, v.down + (size_t) r * v.down_row_stride, piece);
-}
+// RealGeom's views: the templates of the header at the geometry the engine runs (the bytes and strides are the ones geometry.hpp spells out).
+ExpertView view_cpu_half(const uint8_t* half) { return view_cpu_half<RealGeom>(half); }
+ExpertView view_blob_half(const uint8_t* blob, int h) { return view_blob_half<RealGeom>(blob, h); }
+ExpertView view_blob(const uint8_t* blob) { return view_blob<RealGeom>(blob); }
+void pack_cpu_half(const uint8_t* blob, int h, uint8_t* out) { pack_cpu_half<RealGeom>(blob, h, out); }
 
 // ---- the primitive -----------------------------------------------------------------------------------------------
 void mxfp4_dot_rows(Isa isa, const uint8_t* w, size_t row_stride, int nblocks, int nrows, const ActQ* x, int T,
