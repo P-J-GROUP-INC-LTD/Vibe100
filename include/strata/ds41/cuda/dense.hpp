@@ -135,6 +135,18 @@ struct RopeParams {
     double beta_fast = 32.0;
     double beta_slow = 1.0;
 };
+/// rope.py layer_rope_params: a layer with a compress ratio uses theta = compress_rope_theta with YaRN (original_seq_len, factor, beta_fast, beta_slow of the
+/// config), a layer without (L0, L1) theta = rope_theta and no YaRN.
+inline RopeParams ds41_layer_rope_params(int compress_ratio, double rope_theta, double compress_rope_theta, int original_seq_len, double factor = 16.0,
+                                         double beta_fast = 32.0, double beta_slow = 1.0) {
+    RopeParams p;
+    p.original_seq_len = compress_ratio != 0 ? original_seq_len : 0;
+    p.base = compress_ratio != 0 ? compress_rope_theta : rope_theta;
+    p.factor = factor;
+    p.beta_fast = beta_fast;
+    p.beta_slow = beta_slow;
+    return p;
+}
 inline void ds41_rope_table_host(int dim, int seqlen, const RopeParams& p, std::vector<float>& cos_out, std::vector<float>& sin_out) {
     if (dim < 2 || dim % 2 != 0 || seqlen < 0) throw std::invalid_argument("ds41_rope_table_host: bad dim / seqlen");
     const int half = dim / 2;
@@ -204,8 +216,8 @@ inline SharedExpertScratch shared_expert_scratch_carve(void* base, int T) {
 
 /// y[T][kHidden] = W2 . ( silu(min(W1.x, L)) * clamp(W3.x, -L, L) ), L = swiglu_limit (10; <= 0: no clamp), mirroring ref/ds41/moe.py expert with weights = None
 /// (the routing weight is 1: the shared expert).  int8_act = true (the engine's mode, QuantConfig.int8_act): x and h are quantised (CONTRACTS.md), the three
-/// GEMVs are Q8_0 x int8 dp4a; false (QuantConfig.exact): FP32 activations throughout.  x fp32 [T][kHidden].  Six launches (quantise, gate+up, SwiGLU +
-/// quantise, down) become four in the int8 mode.  y is OVERWRITTEN (the caller adds the routed experts' sum).
+/// GEMVs are Q8_0 x int8 dp4a; false (QuantConfig.exact): FP32 activations throughout.  x fp32 [T][kHidden].  int8 mode: four launches (quantise x, gate + up in one
+/// launch, SwiGLU + quantise h, down).  y is OVERWRITTEN (the caller adds the routed experts' sum).
 template <class G>
 void ds41_shared_expert(Dev& dev, const SharedExpertWeights& w, const float* x, int T, float* y, const SharedExpertScratch& scratch, bool int8_act = true,
                         float swiglu_limit = 10.0f, Stream stream = nullptr);
