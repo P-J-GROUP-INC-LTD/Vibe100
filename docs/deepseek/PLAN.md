@@ -70,10 +70,13 @@ be measured), one V100 32 GB, weights from an **MXFP4 GGUF**. Consequences:
   2. **GPU-node duties:** the host thread that drives the GPU, the page-locked staging pool for cache fills, the
      mapped doorbell/activation buffers, and the PCIe-fed queue of promotion candidates live on the GPU's socket;
      Engram I/O threads on the drive's socket.
-  3. **Experts are row-split across both sockets** (w1/w3: 1152 rows each, w2: 2560 rows each): each socket's
-     workers compute only their local half and the 2304-float intermediate is exchanged once per expert. Every
-     miss is computed by both sockets at local bandwidth, with no UPI traffic for compute and no imbalance from
-     which experts a token routes to.
+  3. **Every expert is split across both sockets the way tensor-parallel MLPs are**: socket A holds rows
+     0-1151 of w1/w3 and the matching columns 0-1151 of w2, socket B the other halves (1152 = 36 MXFP4 blocks,
+     so the split falls on block boundaries). Each socket computes its half of the intermediate from its own
+     gate/up rows and multiplies it by its own w2 columns into a partial 5120-vector; the two partials are added
+     once per layer, together with the other experts' (an add the layer needs anyway to hand its result to the
+     GPU). No mid-expert exchange, no UPI traffic for compute, and exactly 50/50 work on every token whatever
+     experts it routes to.
   4. **"Secondary hot" experts next to the GPU** (the user's idea): putting the next-hottest experts *only* on the
      GPU's socket would send most CPU misses to that one socket — half the box's bandwidth doing most of the work
      while the other socket idles — so it loses to (3) for compute. Where GPU-locality does pay is the bytes that

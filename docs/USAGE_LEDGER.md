@@ -38,6 +38,17 @@ and DeepSeek-V4.1 (`docs/deepseek/PLAN.md`, DS-2).
    Jaccard 0.18-0.31), so the ledger file is chosen per model config (one per server / use); a ledger can also
    be exported as an `STRP` profile and shared.
 
+### Co-activation (which experts fire together)
+
+The ledger also keeps, per layer, how often pairs of experts are routed to the same token (a 384×384 or
+512×512 count per layer, a few MB in all). With every CPU expert split in half across the sockets, co-activation
+cannot unbalance them — two experts that always fire together are each computed by both sockets — so the counts
+are not needed for the NUMA layout. They are kept because they predict: when expert A is routed, the experts that
+usually accompany A (in this layer, and in the next) are the ones to prefetch from the SSD or promote into VRAM
+first. If measurement ever shows whole experts per socket beating the split (e.g. the halves make the CPU
+kernels less efficient), the same counts give the placement for that variant: a balanced max-cut per layer that
+puts experts which fire together on opposite sockets.
+
 ## How fast placement can change
 
 Promotions into VRAM travel over PCIe Gen3 (~12 GB/s): a DeepSeek MXFP4 expert (18.8 MB) takes ~1.6 ms, a Qwen
