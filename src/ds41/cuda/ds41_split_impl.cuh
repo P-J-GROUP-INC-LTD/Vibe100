@@ -170,6 +170,7 @@ namespace strata::ds41::cuda {
 template <class G>
 void split_hits_misses(const int32_t* ids, const float* weights, int T, const int32_t* residency_table, int n_slots, int layer, HitEntry* hits,
                        MissEntry* misses, HitGroup* groups, SplitCounts* counts, SplitHostRecord* host, uint32_t seq, void* stream) {
+    static_assert(G::kLayers >= 1 && G::kExperts >= 1 && G::kTopK >= 1, "split: a model has layers, experts and a top-k");
     if (T < 1) throw std::invalid_argument("split_hits_misses: T must be >= 1");
     if (layer < 0 || layer >= G::kLayers) throw std::invalid_argument("split_hits_misses: layer out of range");
     if (n_slots < 0) throw std::invalid_argument("split_hits_misses: n_slots must be >= 0 (the number of cache slots the residency table may name)");

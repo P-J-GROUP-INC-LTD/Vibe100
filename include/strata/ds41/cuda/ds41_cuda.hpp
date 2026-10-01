@@ -36,6 +36,22 @@
 //             contiguously - MiniGeom's 8-block rows of 136 B), (kFF / 32) % 4 == 0, kHidden % 64 == 0 (the down tile), kHidden / 32 % 4 == 0.
 //
 // ---------------------------------------------------------------------------------------------------------------------
+// FOR THE OTHER DS-1 PACKAGES (what to include; nothing here pulls a kernel)
+// ---------------------------------------------------------------------------------------------------------------------
+//   strata/ds41/cuda/ds41_dev.hpp          Dev (device memory, mapped host memory, copies, streams, events, a stopwatch), DevBuf<T>, MappedBuf<T>, HostDev
+//                                          (the emulation's Dev), Stream, stream_or_default().  Plain C++: host code compiles unchanged for the V100 and the emulator.
+//   strata/ds41/cuda/ds41_cuda_runtime.hpp CudaDev, the Dev for a real GPU (includes cuda_runtime.h; only the engine's and the V100 programs' host code needs it).
+//   strata/ds41/cuda/ds41_cuda.hpp         this file: ds41_quantize_acts<G>() (any width; the layout above), the router / split / hot-expert host API.
+//   src/ds41/cuda/ds41_dev.cuh             (kernel side, the .cu / emulator impl files only) DS41_KERNEL & co., the intrinsic wrappers, and the launch helper
+//                                          dev::launch(kernel<G, ...>, grid, block, smem, stream, args...) + dev::check_launch("what"): the same call under nvcc and in
+//                                          the emulator; see ds41_dev.hpp "THE LAUNCH PATTERN".
+//   An op of another package is `template <class G> void ds41_<op>(Dev&, args..., Stream = nullptr)` (DS1.md section 5); the shared quantiser's signature is
+//       template <class G> void ds41_quantize_acts(Dev& dev, const float* x, int T, int width, int8_t* xq, float* xs, Stream stream = nullptr,
+//                                                   ActOrder order = ActOrder::kInterleaved);
+//   (xq: T * width bytes, xs: T * width / 32 floats, sizes quant_acts_q_bytes() / quant_acts_s_floats(); explicitly instantiated for RealGeom in ds41_experts.cu and
+//   for RealGeom + MiniGeom in the emulator build, ds41_emu_impl.cpp: a G the build did not instantiate is a link error.)
+
+// ---------------------------------------------------------------------------------------------------------------------
 // DEVICE-SIDE LIST FORMATS (all plain structs, 16-byte multiples, little endian; the miss list is meant to be read by
 // the host)
 // ---------------------------------------------------------------------------------------------------------------------
@@ -95,11 +111,12 @@
 //                                 ActOrder::kInterleaved (the default)   byte 8*((j&15)>>2) + 2*(j&3) + (j>>4)   (act_perm_pos(j))
 //                                 ActOrder::kNatural                     byte j
 //       xs  fp32  [T][NB]       the block scales d, token-major (token t, block b at index t * NB + b)
-//   INTERLEAVED is what dp4a wants after the MXFP4 decode: the 8-byte groups are [x[4k], x[4k+16], x[4k+1], x[4k+17], x[4k+2], x[4k+18], x[4k+3],
-//   x[4k+19]] for k = 0..3, i.e. the 32-bit word 2m of a block holds the bytes of elements 4m..4m+3 interleaved... precisely: word w (0..7) holds bytes 4w..4w+3,
-//   and word 2k = [x[4k], x[4k+16], x[4k+1], x[4k+17]], word 2k+1 = [x[4k+2], x[4k+18], x[4k+3], x[4k+19]].  A GEMV whose weights are stored as Q8_0 (32 int8
-//   in natural order per block) wants NATURAL: word w = x[4w..4w+3], 8 dp4a per block with no permute.  One quantise call per (input, order); every GEMV that
-//   reads the same input in the same order shares it.
+//   INTERLEAVED is what dp4a wants after the MXFP4 decode.  The block is four 8-byte groups, k = 0..3; group k is
+//       [x[4k], x[4k+16], x[4k+1], x[4k+17], x[4k+2], x[4k+18], x[4k+3], x[4k+19]]
+//   i.e. as 32-bit little-endian words (w = 0..7 = bytes 4w..4w+3 of the block): word 2k = [x[4k], x[4k+16], x[4k+1], x[4k+17]] and word 2k+1 = [x[4k+2],
+//   x[4k+18], x[4k+3], x[4k+19]] (x = the natural elements j = 0..31 of the block, byte 0 first).  A GEMV whose weights are stored as Q8_0 (32 int8 in natural
+//   order per block) wants NATURAL: word w = x[4w .. 4w+3], 8 dp4a per block with no permute.  One quantise call per (input, order); every GEMV that reads the same
+//   input in the same order shares it.  Both orders carry the same scales xs (the scale of block b is independent of the byte order).
 //   Alignment: xq 16 bytes, xs 16 bytes when NB % 4 == 0 (else 4).  Sizes: quant_acts_q_bytes(T, W) = T*W bytes, quant_acts_s_floats(T, W) = T*W/32 floats.
 //   (act_perm_pos() below is the single definition of the interleaved order.)
 //
