@@ -48,6 +48,25 @@ be measured), one V100 32 GB, weights from an **MXFP4 GGUF**. Consequences:
   50 tok/s — easy for NVMe). Layer 1's rows are needed right after sampling, so the reads are issued the moment a
   token is known (and for the prompt, all at once). Only a small staging pool is page-locked for GPU fills, not the
   whole 289 GB.
+- **RAM budget** (24 × 16 GiB = 384 GiB, ~377 GiB usable; sizes from the GGUF's tensor table):
+
+  | Item | GiB | Where |
+  |---|---|---|
+  | routed experts, MXFP4 | 268.95 | resident, row-split: 134.5 per node |
+  | OS, services, server | ~6-10 | |
+  | engine host buffers (staging for cache fills, activations, miss lists) | ~2-4 | GPU's node |
+  | `token_embd` (BF16; rows looked up per token) | 1.23 | host |
+  | dense weights (attention, shared experts, mHC, router, indexer, head) | 8.33 | **GPU**; the host copy is dropped after upload |
+  | DSpark sidecar (optional, if drafting runs on the CPU) | 7.42 | |
+  | **left for Engram's page cache** | **~85-95** | of 97.28 GiB of Engram tables |
+
+  So nearly all of Engram stays in RAM (90-100 %), and the "spare" ~100 GB is exactly what holds it.
+- **Mirroring** (a full copy of experts on each node, as the user ran Qwen Next with ~2× decode): its gain comes
+  from every CPU read becoming node-local. The row-split above gets the same locality with ONE copy, so mirroring
+  adds no bandwidth on top of it — and a full mirror needs 538 GiB, a partial mirror of the next-hottest experts
+  would evict Engram to the SSD (layer 1's Engram rows are needed right after sampling, so that is on the critical
+  path). Kept as a measured experiment, off by default: `mirror N GiB of the next-hottest experts, computed whole
+  on each socket`, only worth it if the per-layer cross-socket reduction of the split measures expensive.
 - **CPU kernels: AVX-512 + VNNI (`vpdpbusd`), no VBMI** (Cascade Lake). MXFP4 needs a nibble → int8 lookup
   (`vpshufb` on 4-bit indices), which AVX-512BW has; AVX2 fallback for other machines.
 - **NUMA and the GPU's socket, from day one** (Dell Precision 7920, 2x Xeon Gold 6226: 12 cores each, 6 channels

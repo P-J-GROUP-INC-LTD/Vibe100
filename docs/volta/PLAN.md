@@ -81,9 +81,12 @@ from the source that matter on this box, both CPU-side and independent of the GP
    with shifts and masks instead of `vpmultishiftqb`. Measure the AVX2 path in Phase 0 first.
 2. **The CPU expert pool is not NUMA-aware.** Workers are pinned to cores (`kernels/cpu/pool.cpp`) but the expert
    arena is placed by first touch, so half the workers read it across UPI. Quick fix for Phase 0:
-   `numactl --interleave=all` (or BIOS node interleaving). Real fix: split every expert's rows between the two
-   sockets and let each socket's workers compute only local rows (balanced, no remote reads; a few-µs exchange of
-   the 640-float intermediate per layer) — shared design with the DeepSeek port (`docs/deepseek/PLAN.md` §2).
+   `numactl --interleave=all` (or BIOS node interleaving). Real fix for Qwen: **mirror the expert arena on both
+   nodes** — the arena is 23-50 GB, so two copies fit easily in 384 GB; each socket's workers read their own node's
+   copy and the GPU's DMA reads the copy on the GPU's node. The user measured ~2x decode from full mirroring of Qwen
+   Next on this box. (Mirroring is simpler than re-partitioning Strata's compile-time-geometry kernels by rows; the
+   DeepSeek port, whose 269 GiB of experts cannot be mirrored, splits rows instead — `docs/deepseek/PLAN.md` §2.)
+   Work package WP-F, after WP-E (AVX-512 without VBMI).
 
 ## 4. Honest limits
 
