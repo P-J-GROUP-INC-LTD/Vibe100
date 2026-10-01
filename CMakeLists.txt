@@ -87,9 +87,12 @@ function(_strata_refuse_cuda13_for_old_arch arch cuda_version nvcc)
 endfunction()
 
 if(STRATA_ENABLE_CUDA)
-  # Which nvcc is enable_language(CUDA) about to use?  (CMake's own order: CMAKE_CUDA_COMPILER, $CUDACXX, then PATH
-  # and $CUDA_PATH/bin.)  Only matters when the architectures below Turing were asked for, and only the nvcc's own
-  # `--version` is trusted: if it cannot be found or read, say nothing and let CMake report what it finds.
+  # Which nvcc is enable_language(CUDA) about to use?  CMake's own order (CMakeDetermineCUDACompiler.cmake and
+  # _cmake_find_compiler in CMakeDetermineCompiler.cmake): CMAKE_CUDA_COMPILER, $CUDACXX, then the directories of the
+  # compilers of the languages already enabled (the C++ compiler's: Ubuntu's /usr/bin/nvcc beside /usr/bin/c++ is found
+  # there before anything on PATH), then PATH and the system prefixes, then $CUDA_PATH/bin.  Only matters when the
+  # architectures below Turing were asked for, and only the nvcc's own `--version` is trusted: if it cannot be found or
+  # read, say nothing and let CMake report what it finds.
   set(_strata_early_archs "${CMAKE_CUDA_ARCHITECTURES}")
   if("${_strata_early_archs}" STREQUAL "" AND NOT "$ENV{CUDAARCHS}" STREQUAL "")
     set(_strata_early_archs "$ENV{CUDAARCHS}")
@@ -99,10 +102,26 @@ if(STRATA_ENABLE_CUDA)
     if(CMAKE_CUDA_COMPILER)
       set(_strata_early_nvcc "${CMAKE_CUDA_COMPILER}")
     elseif(NOT "$ENV{CUDACXX}" STREQUAL "")
-      set(_strata_early_nvcc "$ENV{CUDACXX}")
+      get_filename_component(_strata_early_nvcc "$ENV{CUDACXX}" PROGRAM)    # as CMake reads it: "path [arguments]"
     else()
       unset(_strata_found_nvcc CACHE)             # a lookup, not a setting: never remembered between configures
-      find_program(_strata_found_nvcc NAMES nvcc PATHS "$ENV{CUDA_PATH}/bin")
+      set(_strata_nvcc_hints "${CMAKE_CUDA_COMPILER_HINTS}")
+      get_property(_strata_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
+      foreach(_l IN LISTS _strata_langs)
+        if(CMAKE_${_l}_COMPILER AND IS_ABSOLUTE "${CMAKE_${_l}_COMPILER}")
+          get_filename_component(_strata_hint "${CMAKE_${_l}_COMPILER}" PATH)
+          if(IS_DIRECTORY "${_strata_hint}")
+            list(APPEND _strata_nvcc_hints "${_strata_hint}")
+          endif()
+        endif()
+      endforeach()
+      if(_strata_nvcc_hints)
+        list(REMOVE_DUPLICATES _strata_nvcc_hints)
+        find_program(_strata_found_nvcc NAMES nvcc PATHS ${_strata_nvcc_hints} NO_DEFAULT_PATH)
+      endif()
+      if(NOT _strata_found_nvcc)
+        find_program(_strata_found_nvcc NAMES nvcc PATHS "$ENV{CUDA_PATH}/bin")
+      endif()
       set(_strata_early_nvcc "${_strata_found_nvcc}")
       unset(_strata_found_nvcc CACHE)
     endif()
@@ -124,6 +143,7 @@ if(STRATA_ENABLE_CUDA)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
   endif()
+  set(_strata_pre_turing_build OFF)
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
     # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
@@ -162,12 +182,20 @@ if(STRATA_ENABLE_CUDA)
     if(_base LESS 75 AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
       _strata_refuse_cuda13_for_old_arch("${_base}" "${CMAKE_CUDA_COMPILER_VERSION}" "${CMAKE_CUDA_COMPILER}")
     endif()
+    if(_base LESS 75)
+      set(_strata_pre_turing_build ON)
+    endif()
     # #220 / #224: RTX 50 engines built with CUDA 12.8 crashed in the prompt path on Linux (13.0 and newer did not)
     if(_base GREATER_EQUAL 120 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
       message(WARNING "Building for sm_${_base} (RTX 50) with CUDA ${CMAKE_CUDA_COMPILER_VERSION}: engines built with "
                       "CUDA 12.8 crashed on long prompts on these cards (issues #220, #224). Use CUDA 13.0 or newer.")
     endif()
   endforeach()
+  if(_strata_pre_turing_build)
+    # nvcc 12.8 deprecates offline compilation below sm_75 and prints that for EVERY .cu file (and every link); a Volta
+    # build is a supported target here, so the notice is noise that buries the real warnings
+    string(APPEND CMAKE_CUDA_FLAGS " -Wno-deprecated-gpu-targets")
+  endif()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
   set(_strata_gpu_runtime_target CUDA::cudart)
   set(_strata_gpu_blas_target CUDA::cublas)

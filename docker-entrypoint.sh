@@ -3,6 +3,10 @@
 # build and lives in the image, so the first start only downloads the model.
 # The install config is kept on the /data volume so a recreated container skips
 # the setup pass and goes straight to serving.
+# (A card the image's engine has no code for - one outside CUDA_ARCHITECTURES - is
+# compiled for at the first start, into the container's file system, NOT /data: a
+# container started with --rm compiles it again each time.  Build the image for the
+# card instead; see the Dockerfile.)
 set -e
 cd /opt/strata || exit 1
 

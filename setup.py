@@ -36,6 +36,7 @@ import argparse
 import ctypes
 import hashlib
 import json
+import mmap
 import os
 import platform
 import re
@@ -92,6 +93,8 @@ MIN_DRIVER = 580                       # CUDA 13.0
 PREBUILT_MIN_ARCH = 75                 # the ready-made engine covers sm_75 (RTX 20) and newer
 CUDA13_MIN_ARCH = 120                  # RTX 50 (sm_120): built with CUDA 13.0 (an engine built with 12.8 crashed, #220)
 CUDA12_TOOLKIT = "12.8"                # what is installed for a Volta engine
+CUDA12_MIN_TOOLKIT = (12, 4)           # the oldest CUDA 12 used for one: nvcc 12.0-12.3 reject a g++ newer than 12 (Ubuntu 24.04's
+                                       # packaged 12.0 stops at "unsupported GNU version" with its g++ 13)
 MIN_DRIVER_CUDA12 = 570                # CUDA 12.8
 MIN_ENGINE = (0, 1, 31)                # v0.1.31: Unsloth UD-Q4_K_XL (experimental), GGUF-in-place low-RAM mode, Windows GGUF load 2x, server race + tokenizer fixes, AMD intrinsics; v0.1.30: short prompts faster (streaming from 1024 tokens), resident low-RAM variant, multi-GPU session carve, RDNA4; v0.1.29: sampled answers faster (split top-k), #154 correctness fixes; v0.1.28: the expert cache reserves the draft head, a cancelled request no longer fails the next; v0.1.27: RTX 20 (sm_75) in the ready-made engine, the HIP build without CUDA headers; v0.1.26: the draft layer's prompt pass in batches; v0.1.25: faster prompts (grouping off the copy engine, fused hyper-connection kernels), AMD HIP backend, --kv k8v4; v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
@@ -263,14 +266,24 @@ def page_file_gb():
 # (Xeon Gold 62xx, Silver 42xx, ...) has VNNI but no VBMI and runs the kernels' second build (shuffle / shift / mask unpack
 # instead of vpmultishiftqb, bit-identical results); Ice Lake / Zen 4 and newer run the VBMI build.  Without VNNI
 # (Skylake-X, Zen 2/3, Core 12th-14th gen) the engine uses its AVX2 kernels and the canonical Q2_0 pack is not offered.
+# That holds for an engine COMPILED FROM THIS SOURCE.  The ready-made engine (Niko1221/Strata's release, built from upstream's
+# source) still has only the VBMI build of its canonical Q2_0 kernel: its start-up calls cpu_require_expert_support(), which
+# wants VBMI too, and exits "missing AVX512-VBMI" on a Cascade Lake.  So the canonical pack is chosen for such an engine only
+# on a CPU with VBMI (pack_avx512), else the native pack (the AVX2 rows) that any CPU runs.
 AVX512_FLAGS = frozenset({"avx512f", "avx512bw", "avx512vl", "avx512dq", "avx512_vnni"})   # /proc/cpuinfo's spelling
 CPUID7_EBX_NEED = (1 << 16) | (1 << 17) | (1 << 30) | (1 << 31)   # F, DQ, BW, VL
 CPUID7_ECX_NEED = 1 << 11                                          # VNNI
+CPUID7_ECX_VBMI = 1 << 1
 
 
 def avx512_from_flags(flags) -> bool:
     """True when /proc/cpuinfo's `flags` have everything the AVX-512 kernels use (VBMI is not needed)."""
     return AVX512_FLAGS <= set(flags)
+
+
+def vbmi_from_flags(flags) -> bool:
+    """AVX-512 VBMI in /proc/cpuinfo's `flags`: Ice Lake / Zen 4 and newer have it, Cascade Lake (VNNI, no VBMI) does not."""
+    return "avx512vbmi" in set(flags)
 
 
 def avx512_from_cpuid7(ebx: int, ecx: int) -> bool:
@@ -280,7 +293,8 @@ def avx512_from_cpuid7(ebx: int, ecx: int) -> bool:
 
 def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, DQ, VNNI - VBMI is
-    optional, it only picks the faster build), the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
+    optional, it only picks the faster build), the same test the engine makes (cpu_avx512_ok), not just AVX-512F.  That is the
+    test for an engine compiled from this source; see pack_avx512 for the ready-made one."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
     if WIN:
         pf = ctypes.windll.kernel32.IsProcessorFeaturePresent
@@ -301,8 +315,8 @@ def cpu_info():
     return name, avx2, avx512
 
 
-def _cpuid_avx512_full() -> bool:
-    """Windows has no feature bit for VNNI: ask the CPU (CPUID leaf 7) through a tiny machine-code stub."""
+def _cpuid7_regs():
+    """(EBX, ECX) of CPUID leaf 7 on Windows, through a tiny machine-code stub; None when it cannot be asked."""
     try:
         code = bytes([0x53, 0x49, 0x89, 0xC8, 0xB8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2,   # push rbx; r8=rcx; cpuid(7,0)
                       0x41, 0x89, 0x18, 0x41, 0x89, 0x48, 0x04, 0x5B, 0xC3])                   # [r8]=ebx,[r8+4]=ecx; pop rbx
@@ -310,14 +324,78 @@ def _cpuid_avx512_full() -> bool:
         k32.VirtualAlloc.restype = ctypes.c_void_p
         buf = k32.VirtualAlloc(None, len(code), 0x3000, 0x40)
         if not buf:
-            return False
+            return None
         ctypes.memmove(buf, code, len(code))
         regs = (ctypes.c_uint32 * 2)()
         ctypes.CFUNCTYPE(None, ctypes.c_void_p)(buf)(ctypes.addressof(regs))
-        ebx, ecx = regs[0], regs[1]
-        return avx512_from_cpuid7(ebx, ecx)                            # F, DQ, BW, VL and VNNI; VBMI is optional
+        return regs[0], regs[1]
     except Exception:
+        return None
+
+
+def _cpuid_avx512_full() -> bool:
+    """Windows has no feature bit for VNNI: ask the CPU (CPUID leaf 7)."""
+    regs = _cpuid7_regs()
+    return regs is not None and avx512_from_cpuid7(*regs)             # F, DQ, BW, VL and VNNI; VBMI is optional
+
+
+def cpu_has_vbmi() -> bool:
+    """AVX-512 VBMI: Ice Lake / Zen 4 and newer have it, Cascade Lake (VNNI, no VBMI) does not."""
+    if WIN:
+        regs = _cpuid7_regs()
+        return regs is not None and bool(regs[1] & CPUID7_ECX_VBMI)
+    try:
+        return vbmi_from_flags(re.search(r"^flags\s*:\s*(.*)$", open("/proc/cpuinfo").read(), re.M).group(1).split())
+    except (OSError, AttributeError):
         return False
+
+
+def built_from_this_source(meta: dict) -> bool:
+    """An engine/BUILD.json that says the engine was compiled here (the CUDA build, or the AMD one) from THIS checkout's
+    source, as it is now: only such an engine has what Vibe100 added to the CPU side - the AVX-512 expert kernels that need
+    no VBMI (WP-E) - and the --numa option (WP-F).  The ready-made engine is built from upstream's source, and a compiled one
+    whose source has changed since (a `git pull` not yet compiled) is not this source either."""
+    return meta.get("source") in ("local", "local-hip") and meta.get("src") == source_hash(ENGINE_SOURCES)
+
+
+def pack_avx512(avx512: bool, vbmi: bool, from_source: bool) -> bool:
+    """Whether the canonical Q2_0 pack (the AVX-512 kernel) can be chosen.  An engine compiled from this source runs it on any
+    CPU cpu_info() calls AVX-512; the ready-made upstream engine only on one with VBMI as well (see AVX512_FLAGS)."""
+    return avx512 and (from_source or vbmi)
+
+
+def installed_engine_local() -> bool:
+    """engine/BUILD.json says the installed engine was compiled here (not downloaded)."""
+    try:
+        return json.loads((ROOT / "engine" / "BUILD.json").read_text()).get("source") in ("local", "local-hip")
+    except (OSError, ValueError):
+        return False
+
+
+# A Q2_0 pack folder is in one of two forms.  Canonical (tools/strata_pack.py + pack_index.py): experts.bin and dense.bin in
+# the AVX-512 kernel's layout, with manifest.json and embd.bin.  Native (tools/iq_pack.py): the experts as the GGUF stores them,
+# described by native_experts.txt (+ experts.bin.src.json, conversions.json).  THE ENGINE TELLS THEM APART BY native_experts.txt
+# ALONE, and reads an experts.bin whatever form it is in: a canonical pack written into a native folder (or the other way
+# round) is a pack whose layout file lies, which the engine reads as garbage.  So a switch of form removes the layout files
+# of the old one first, the completion markers (native_experts.txt, index.txt) first.
+PACK_FILES = ("native_experts.txt", "index.txt", "manifest.json", "experts.bin.src.json", "conversions.json", "extra.bin",
+              "dense.bin", "embd.bin", "experts.bin")
+PACK_NATIVE_ONLY = ("native_experts.txt", "experts.bin.src.json", "conversions.json", "extra.bin")
+PACK_CANONICAL_ONLY = ("manifest.json", "embd.bin")
+
+
+def drop_other_pack_form(pack: Path, canonical: bool) -> bool:
+    """The Q2_0 pack folder holds a pack of the other form than the one about to be written: its layout files are
+    removed (not the tokenizer, not the model's GGUF files, which are elsewhere).  True when it did."""
+    if not any((pack / f).exists() for f in (PACK_NATIVE_ONLY if canonical else PACK_CANONICAL_ONLY)):
+        return False
+    for f in PACK_FILES:
+        try:
+            (pack / f).unlink(missing_ok=True)
+        except OSError as e:
+            fail(f"cannot remove {pack / f} ({e})", "it belongs to an earlier pack of the other form: delete the files "
+                 f"{', '.join(PACK_FILES)} in {pack} by hand and run this again")
+    return True
 
 
 def _run_stub(code: bytes, *args) -> None:
@@ -374,6 +452,69 @@ def gpus():
         except ValueError:
             continue
     return found
+
+
+def nvidia_pci_gpus(sysfs="/sys") -> list:
+    """The NVIDIA graphics / compute controllers on the PCI bus (Linux sysfs: vendor 0x10de, class 0x0300 VGA or 0x0302 3D),
+    as (PCI address, device id), whether or not a driver drives them.  Empty elsewhere."""
+    found = []
+    try:
+        for d in sorted(Path(sysfs, "bus", "pci", "devices").iterdir()):
+            try:
+                if (d / "vendor").read_text().strip().lower() == "0x10de" and \
+                        (d / "class").read_text().strip().lower()[:6] in ("0x0300", "0x0302"):
+                    found.append((d.name, (d / "device").read_text().strip()))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return found
+
+
+def missing_gpu_notes(found, sysfs="/sys", proc="/proc") -> list:
+    """Lines saying why nvidia-smi may list fewer NVIDIA GPUs than the PCI bus has (empty when it lists them all).  The usual
+    reason for a V100 / Titan V: its driver.  The open kernel modules (nvidia-driver-NNN-open) support Turing and newer only,
+    and R580 is the last driver branch that supports Volta - a newer one leaves the card unlisted without an error."""
+    pci = nvidia_pci_gpus(sysfs)
+    if len(found) >= len(pci):
+        return []
+    try:
+        ver = Path(proc, "driver", "nvidia", "version").read_text(errors="replace")
+    except OSError:
+        ver = ""
+    nrvm = next((ln for ln in ver.splitlines() if ln.startswith("NVRM version")), ver.strip())
+    m = re.search(r"\s(\d{3,4})\.\d+", nrvm)
+    major = int(m.group(1)) if m else 0
+    lines = [f"the PCI bus has {len(pci)} NVIDIA GPU{'s' if len(pci) != 1 else ''} ("
+             + ", ".join(f"{a} = 10de:{d[2:]}" for a, d in pci) + f") but nvidia-smi lists {len(found)}"]
+    if not ver:
+        lines.append("The NVIDIA kernel driver is not loaded (there is no /proc/driver/nvidia/version).  A V100 / Titan V needs "
+                     "the proprietary driver of the 570-580 branch: on Ubuntu, sudo apt install nvidia-driver-580 (not "
+                     "nvidia-driver-580-open), then restart.")
+    elif "Open Kernel Module" in nrvm:
+        lines.append("The installed driver is NVIDIA's open kernel module, which supports Turing (RTX 20 series) and newer "
+                     "only: a V100 / Titan V (Volta) needs the proprietary driver - on Ubuntu, sudo apt install "
+                     "nvidia-driver-580 (not nvidia-driver-580-open) - then restart.")
+    elif major > 580:
+        lines.append(f"The installed driver is {major}.  R580 is the last driver branch that supports Volta (V100 / Titan "
+                     f"V): a newer one does not drive the card.  Install nvidia-driver-580 and hold it (sudo apt-mark hold "
+                     "nvidia-driver-580), then restart.")
+    else:
+        lines.append("The installed driver does not list every card: a V100 / Titan V needs the proprietary driver of the "
+                     "570-580 branch (not the open kernel modules, not R590 or newer); a card passed through to a virtual "
+                     "machine (vfio-pci) is not listed either.")
+    return lines
+
+
+def show_missing_gpus(found) -> None:
+    """Says (Linux) when the PCI bus has NVIDIA GPUs that nvidia-smi does not list, and why that may be."""
+    if WIN:
+        return
+    notes = missing_gpu_notes(found)
+    if notes:
+        warn(notes[0])
+        for n in notes[1:]:
+            say("       " + n)
 
 
 GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
@@ -454,6 +595,16 @@ def cards_conflict(cards) -> str | None:
     old = next(g for g in cards if needs_cuda12([g["arch"]]))
     new = next(g for g in cards if int(g["arch"]) >= CUDA13_MIN_ARCH)
     return conflict_text(gpu_name(old), gpu_name(new))
+
+
+def still_present(built) -> set:
+    """The architectures of an engine's code that this PC still has a card of.  A compiled engine is rebuilt with the
+    generations it was made for (a card added later must not take the others' code away), but a card that is gone - a V100
+    taken out, an RTX 5090 put in its place - no longer pins its generation: kept for good it would make one engine for Volta
+    and an RTX 50 card (arch_conflict) impossible, and stop the setup every time.  When no card is listed at all (nvidia-smi does
+    not answer) nothing can be told, and all of them are kept."""
+    present = {int(g["arch"]) for g in gpus()}
+    return {int(a) for a in built if int(a) in present} if present else {int(a) for a in built}
 
 
 def together_ok(found) -> list:
@@ -649,12 +800,18 @@ def find_nvcc(archs=None):
     volta = archs is not None and needs_cuda12(archs)
     for c in dict.fromkeys(cands):                     # every toolkit found; the newest wins
         if c and Path(c).exists():
-            v = re.search(r"release (\d+)\.(\d+)", out([c, "--version"]))
-            if v and volta and not 12 <= int(v.group(1)) < 13:
+            v = nvcc_version(c)
+            if v and volta and not 12 <= v[0] < 13:
                 continue
-            if v and (best[1] is None or (int(v.group(1)), int(v.group(2))) > best[1]):
-                best = (c, (int(v.group(1)), int(v.group(2))))
+            if v and (best[1] is None or v > best[1]):
+                best = (c, v)
     return best
+
+
+def nvcc_version(nvcc):
+    """(major, minor) of an nvcc, from its own `--version`; None when it does not answer."""
+    v = re.search(r"release (\d+)\.(\d+)", out([str(nvcc), "--version"]))
+    return (int(v.group(1)), int(v.group(2))) if v else None
 
 
 def find_vcvars():
@@ -1256,12 +1413,19 @@ def update_installed_engine(url_base) -> None:
         try:                                           # a failed compile must not stop the model from starting
             if gpu is None:
                 raise RuntimeError("no NVIDIA GPU found")
-            own = {int(x) for x in meta.get("archs", [])}
+            own = still_present({int(x) for x in meta.get("archs", [])})   # the cards it was made for that are still here
             archs = own | {int(gpu["arch"])}
             if arch_conflict(archs):                   # the biggest card is an RTX 50 and the engine is a V100's (or the
                 archs = own                            # other way round): it is rebuilt for the cards it was made for
             gpu = {**gpu, "archs": sorted(archs)}
             build_engine(gpu, vision, False, get_llama_cpp())
+            for p in installed_configs():              # the toolkit it was built with may be another one now
+                try:
+                    cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+                    if cfg.get("backend") != "hip":
+                        refresh_lib_dirs(p, cfg)
+                except (OSError, ValueError):
+                    pass
         except (Exception, SystemExit) as e:
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
         return
@@ -1287,7 +1451,9 @@ def install_build_tools(gpu, yes):
     # 12.8 crashed in the prompt path on Linux (#220).  Anything between: any CUDA 12 or newer (13.0 is what gets installed).
     cuda12 = needs_cuda12(archs)
     nvcc, cuda_v = find_nvcc(archs)
-    need_cuda = (13, 0) if max(archs) >= CUDA13_MIN_ARCH else (12, 0)
+    # (a Volta engine: not a CUDA 12.0-12.3 either, they reject the g++ 13 of Ubuntu 24.04 - 12.8 is installed instead, as when
+    # there is no toolkit)
+    need_cuda = (13, 0) if max(archs) >= CUDA13_MIN_ARCH else CUDA12_MIN_TOOLKIT if cuda12 else (12, 0)
     toolkit = f"the NVIDIA CUDA Toolkit {CUDA12_TOOLKIT}" if cuda12 else "the NVIDIA CUDA Toolkit 13.0"
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
@@ -1304,15 +1470,18 @@ def install_build_tools(gpu, yes):
         newer = find_nvcc()[1]                          # the CUDA 13 that is there, if any (it is passed over)
         say("  (Your V100 / Titan V is a Volta card, which CUDA 13 dropped: its engine has to be built with CUDA 12."
             + (f" The CUDA {newer[0]}.{newer[1]} you have stays as it is; 12 is installed next to it." if newer else "")
+            + (f" The CUDA {cuda_v[0]}.{cuda_v[1]} you have is too old: its nvcc rejects the g++ 13 of current distributions "
+               f"(CUDA {CUDA12_MIN_TOOLKIT[0]}.{CUDA12_MIN_TOOLKIT[1]} or newer is needed); {CUDA12_TOOLKIT} is installed next to it."
+               if nvcc is not None else "")
             + ")")
     say("  They can be installed now (about 8-10 GB, 15-40 minutes" + (", Windows will ask for permission" if WIN else
                                                                         ", sudo will ask for your password") + ").")
     if ask("  Install them now?", ["y", "n"], "y", yes) != "y":
-        fail("the build tools are needed", "install them yourself (see README.md) and run it again")
+        fail("the build tools are needed", "install them yourself (see docs/DETAILS.md, \"Before you start\"; for a V100 docs/volta/VOLTA.md) and run it again")
     if WIN:
         if shutil.which("winget") is None:
             fail("winget (Windows package manager) is not available",
-                 "install 'App Installer' from the Microsoft Store, or install the tools by hand (README.md)")
+                 "install 'App Installer' from the Microsoft Store, or install the tools by hand (docs/DETAILS.md, \"Before you start\")")
         wg = ["winget", "install", "-e", "--source", "winget", "--accept-package-agreements",
               "--accept-source-agreements", "--disable-interactivity"]
         if not have_cc:
@@ -1350,7 +1519,7 @@ def install_build_tools(gpu, yes):
             run(["sudo", "apt-get", "install", "-y", pkg])
     nvcc, cuda_v = find_nvcc(archs)
     if (WIN and find_vcvars() is None) or (not WIN and shutil.which("g++") is None):
-        fail("the C++ build tools did not install", "install them by hand (README.md) and run it again")
+        fail("the C++ build tools did not install", "install them by hand (docs/DETAILS.md, \"Before you start\"; for a V100 docs/volta/VOLTA.md) and run it again")
     if nvcc is None or cuda_v < need_cuda:
         fail(f"the CUDA Toolkit {CUDA12_TOOLKIT if cuda12 else '13.0'} did not install",
              "install CUDA 12.8 (not 13: it has no Volta) from https://developer.nvidia.com/cuda-12-8-1-download-archive,"
@@ -1404,7 +1573,7 @@ def fresh_build_folder(bdir: Path, nvcc, archs) -> None:
         shutil.rmtree(bdir, ignore_errors=True)
 
 
-ENGINE_SOURCES = ("CMakeLists.txt", "src", "include", "third_party/ggml")
+ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml")   # (cmake/: the included .cmake files)
 VISION_SOURCES = ("tools/vision",)
 
 
@@ -1432,15 +1601,21 @@ def build_engine(gpu, vision, yes, llama) -> Path:
     archs = sorted({int(x) for x in gpu.get("archs", [gpu["arch"]])})    # every card the model runs on
     built = {int(x) for x in meta.get("archs", [])}
     # a card the engine has no code for (a GPU added with --gpus, #128) needs a compile even when the source is the
-    # same; the compile keeps the generations it was built for
+    # same; the compile keeps the generations it was built for that this PC still has a card of (still_present)
     new_arch = local and not set(archs) <= built
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch
-    vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
+    # The image encoder counts as built only when it was compiled here from this source, for these cards: the ready-made one
+    # (CUDA 13: no sm_70 code, and libcudart.so.13) is not kept when the engine turns into a locally compiled one, and a
+    # GPU encoder made for other cards is made again for these.  (It is recorded below as built here, so a stale one that
+    # was kept would never be looked at again.)
+    vision_archs = {int(x) for x in meta.get("vision_archs") or meta.get("archs") or []}
+    vision_ok = not want_vision or (local and (eng / VEXE).exists() and meta.get("vision_src") == vsrc and
+                                    (vision != "gpu" or set(archs) <= vision_archs))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
     if local:
-        archs = sorted(built | set(archs))
+        archs = sorted(still_present(built) | set(archs))
     refuse_conflict(archs)
     nvcc, vcvars = install_build_tools({**gpu, "archs": archs}, yes)
     cuda_archs = ";".join(str(x) for x in archs)
@@ -1465,9 +1640,12 @@ def build_engine(gpu, vision, yes, llama) -> Path:
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
+    v = nvcc_version(nvcc)
     stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
-                                 "vision": vision,
-                                 "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None}, indent=1))
+                                 "vision": vision, "cuda": f"{v[0]}.{v[1]}" if v else None,
+                                 "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None,
+                                 "vision_archs": (archs if not vision_ok else sorted(vision_archs))
+                                 if want_vision and vision == "gpu" else None}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
@@ -1726,7 +1904,7 @@ def previous_config(elsewhere_first: list, settings: dict):
 
 
 def choices_from_config(cfg_path: Path) -> dict:
-    """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
+    """The setup answers a config was written with (family, size, context, KV, images, projection, network, NUMA)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("strata-"):]
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
@@ -1742,7 +1920,7 @@ def choices_from_config(cfg_path: Path) -> dict:
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
-            "layer_split": cfg.get("layer_split")}
+            "layer_split": cfg.get("layer_split"), "numa": cfg.get("numa")}
 
 
 def find_in(roots: list, rel: str):
@@ -1857,12 +2035,35 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
+def saved_numa(cfg_path: Path, requested):
+    """The --numa setting a model is set up with: the one asked for now, else the one its config already has (a `--setup` run
+    again for the same model must not drop a saved off / mirror)."""
+    if requested is None and cfg_path.exists():
+        try:
+            return json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("numa")
+        except (OSError, ValueError):
+            pass
+    return requested
+
+
+def engine_has_option(exe, option: str) -> bool:
+    """The engine binary carries this command-line option (its argument parser compares against the text): the one test that
+    cannot go stale, whatever BUILD.json says - the ready-made upstream engine exits "unknown argument" on --numa."""
+    try:
+        with open(exe, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+            return m.find(option.encode() + b"\0") >= 0
+    except (OSError, ValueError):                      # (an empty file cannot be mapped)
+        return False
+
+
 def apply_numa(cfg: dict) -> bool:
     """Vibe100 WP-F: the engine's `--numa auto|mirror|off` (one copy of the expert arena per NUMA node, so each CPU worker
     reads its own socket's memory - docs/volta/VOLTA.md).  The setting is kept in the model's config as "numa" and shows in
     its engine arguments only when it is not the engine's default: "auto" (or none) passes nothing, so a config made before
     this existed, and a one-socket PC, are untouched.  A config without a "numa" setting is left alone (a `--numa` someone
-    wrote into its arguments by hand stays).  Returns whether cfg["args"] changed."""
+    wrote into its arguments by hand stays).  An engine without the option (the ready-made one, or one compiled from an older
+    source) is not given it - it would exit "unknown argument" - and says so; the setting stays in the config for an engine
+    that has it.  Returns whether cfg["args"] changed."""
     if "numa" not in cfg:
         return False
     args = list(cfg.get("args") or [])
@@ -1871,7 +2072,12 @@ def apply_numa(cfg: dict) -> bool:
         i = new.index("--numa")
         del new[i:i + 2]
     if cfg.get("numa") in ("mirror", "off"):
-        new += ["--numa", cfg["numa"]]
+        if engine_has_option(cfg.get("exe") or "", "--numa"):
+            new += ["--numa", cfg["numa"]]
+        else:
+            warn(f"--numa {cfg['numa']} is saved for this model, but the installed engine {cfg.get('exe') or ''} has no such option "
+                 "(the ready-made engine is built from upstream's source): it is not passed.  An engine compiled from this "
+                 f"source has it: {'START-HERE.bat' if WIN else './setup.sh'} --setup --build")
     if new == args:
         return False
     cfg["args"] = new
@@ -2015,15 +2221,25 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     say("  The installed engine has no code for " + ", ".join(f"{g['name']} (sm_{g['arch']})" for g in missing) +
         ": it is compiled for " + ("these cards" if len(cards) > 1 else "it") + " now.")
     main = gpu_info(cards[0]["index"])
-    built = {int(x) for x in meta.get("archs", [])}
+    built = still_present({int(x) for x in meta.get("archs", [])})   # (a card taken out no longer keeps its generation)
     if meta.get("source") != "local" and needs_cuda12([g["arch"] for g in cards]):
         built = set()                                  # a ready-made engine's list (RTX 20-50) is not for a CUDA 12 compile
     archs = sorted(built | {int(g["arch"]) for g in cards})
     vision = meta.get("vision") or ("gpu" if (ROOT / "engine" / VEXE).exists() else "none")
     build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp())
-    dirs = json.loads(info.read_text()).get("cuda_dirs") or []
-    cfg["lib_dirs"] = dirs + [d for d in cfg.get("lib_dirs") or [] if d not in dirs]
-    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    refresh_lib_dirs(cfg_path, cfg, force=True)
+    return cfg
+
+
+def refresh_lib_dirs(cfg_path: Path, cfg: dict, force=False) -> dict:
+    """A model's config lists the libraries the engine loads (lib_dirs): after the engine was compiled again they are the
+    toolkit's of THAT compile (engine/BUILD.json's cuda_dirs), in front of what the config had.  Written only when they
+    changed - a config's modification time is what makes it the most recently used model - or when `force`."""
+    dirs = json.loads((ROOT / "engine" / "BUILD.json").read_text()).get("cuda_dirs") or []
+    new = dirs + [d for d in cfg.get("lib_dirs") or [] if d not in dirs]
+    if new != cfg.get("lib_dirs") or force:
+        cfg["lib_dirs"] = new
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     return cfg
 
 
@@ -2172,6 +2388,7 @@ def main() -> int:
                 a.vision = a.vision or ch["vision"]
                 a.experimental_speed_projection = a.experimental_speed_projection or ch["esp"]
                 a.host, a.api_key = a.host or ch["host"], a.api_key or ch["api_key"]
+                a.numa = a.numa or ch["numa"]           # a saved off / mirror (Vibe100 WP-F)
                 a.port = a.port or ch["port"]
                 if isinstance(ch.get("gpu"), list):     # a layer split: set up across the same cards again
                     a.gpus = a.gpus or ",".join(str(g) for g in ch["gpu"])
@@ -2215,6 +2432,7 @@ def main() -> int:
     # ---- 1. the PC
     step(1, "checking your PC")
     found = gpus()
+    show_missing_gpus(found)                           # a V100 the driver does not list: the driver is the reason
     amd = [] if WIN else amd_gpus()
     nv_ok = any(gpu_problem(g) is None for g in found)
     amd_ok = [g for g in amd if amd_problem(g) is None]
@@ -2279,8 +2497,10 @@ def main() -> int:
         if needs_cuda12(gpu["archs"]):                 # a V100 / Titan V: never the ready-made engine
             nv, nv_v = find_nvcc(gpu["archs"])
             ok("Volta (V100 / Titan V): the engine is compiled on this PC with CUDA 12 - CUDA 13 dropped Volta, so the "
-               "ready-made engine has no code for it" + (f" (CUDA {nv_v[0]}.{nv_v[1]} found)" if nv else
-                                                         f" (CUDA {CUDA12_TOOLKIT} is installed for it; asks first)"))
+               "ready-made engine has no code for it" +
+               (f" (CUDA {nv_v[0]}.{nv_v[1]} found)" if nv and nv_v >= CUDA12_MIN_TOOLKIT else
+                f" (CUDA {nv_v[0]}.{nv_v[1]} found, too old: its nvcc rejects g++ 13; CUDA {CUDA12_TOOLKIT} is installed for it; "
+                "asks first)" if nv else f" (CUDA {CUDA12_TOOLKIT} is installed for it; asks first)"))
         # a V100's engine is built with CUDA 12.8 (driver 570); the others' with / for CUDA 13 (580)
         min_driver = MIN_DRIVER_CUDA12 if needs_cuda12(gpu["archs"]) else MIN_DRIVER
         if driver_major(gpu) < min_driver:
@@ -2292,6 +2512,7 @@ def main() -> int:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
     cpu, avx2, avx512 = cpu_info()
+    vbmi = cpu_has_vbmi() if avx512 else False
     need = min(d["ram_gb"] for d in MODELS.values())
     low_ok = low_ram_fits("IQ1_M", ram, gpu["vram_gb"]) and a.low_ram != "off"   # the smallest model, mapped
     if ram < need - 4 and not a.check and not low_ok:
@@ -2483,9 +2704,14 @@ def main() -> int:
         if s.exists() and not done(s) and whole_shard(s):
             mark(s, "whole (checked against its own tensor directory)")
     have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
-    need = (0 if a.gguf_dir or have_model else MODELS[model]["download_gb"]) + 8 + \
-        (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0) + \
-        (MODELS[model]["arena_gb"] + 1 if low_ram and not (model == "Q2_0" and avx512 and family == "qwen") else 0)
+    def disk_need(canonical):                          # GB: the download, the pack (the canonical Q2_0 one is ~40 GB more)
+        return (0 if a.gguf_dir or have_model else MODELS[model]["download_gb"]) + 8 + \
+            (40 if model == "Q2_0" and canonical and family == "qwen" else 0) + (1 if vision != "none" else 0) + \
+            (MODELS[model]["arena_gb"] + 1 if low_ram and not (model == "Q2_0" and canonical and family == "qwen") else 0)
+    # which pack: decided once the engine is known (step 4, pack_avx512); here the engine that is expected - compiled here
+    # (--build, AMD, a V100, or one that already is), or the ready-made one
+    canonical_expected = pack_avx512(avx512, vbmi, bool(a.build or hip or needs_cuda12(gpu["archs"]) or installed_engine_local()))
+    need = disk_need(canonical_expected)
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB", "use --models-dir on a bigger drive")
 
@@ -2515,6 +2741,15 @@ def main() -> int:
     meta = json.loads((eng / "BUILD.json").read_text())
     lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs()
     ok(f"engine: {eng / EXE}")
+    # the pack the CPU's AVX-512 kernel reads is chosen for THIS engine: one compiled from this source runs it on a
+    # Cascade Lake (VNNI, no VBMI); the ready-made upstream engine exits "missing AVX512-VBMI" there
+    avx512p = pack_avx512(avx512, vbmi, built_from_this_source(meta))
+    if avx512 and not avx512p and model == "Q2_0" and family == "qwen":
+        say("  This CPU has AVX-512 VNNI but not VBMI (Cascade Lake): the ready-made engine's AVX-512 kernel for this model needs "
+            "VBMI, so the model is prepared in the form its AVX2 kernels read.  An engine compiled here has an AVX-512 kernel "
+            f"for this CPU, which is faster: {'START-HERE.bat' if WIN else './setup.sh'} --setup --build")
+    if avx512p != canonical_expected and free_gb(models_dir) < disk_need(avx512p):    # (the engine had to be compiled after all)
+        fail(f"not enough free disk space in {models_dir}: need ~{disk_need(avx512p):.0f} GB", "use --models-dir on a bigger drive")
 
     # ---- 5. the model files
     step(5, f"downloading {fam['title']} {model}")
@@ -2550,7 +2785,10 @@ def main() -> int:
     step(6, "preparing the model for Strata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
     env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
-    if model == "Q2_0" and avx512 and family == "qwen":
+    if model == "Q2_0" and family == "qwen" and drop_other_pack_form(pack, avx512p):
+        say(f"  {pack} holds the {'native' if avx512p else 'canonical'} form of this model's pack, and this engine on this CPU reads "
+            f"the {'canonical' if avx512p else 'native'} one: its layout files are replaced (the model files and the tokenizer stay)")
+    if model == "Q2_0" and avx512p and family == "qwen":
         # the Q2_0 experts repacked for the AVX-512 kernel (the measured speed): a one-time ~40 GB conversion
         if not (pack / "index.txt").exists() or not (pack / "experts.bin").exists():   # index.txt is written last
             say("  Converting the Q2_0 experts for the AVX-512 kernel (one time, ~40 GB written, 2-5 min) ...")
@@ -2650,15 +2888,16 @@ def main() -> int:
         cfg["api_key"] = a.api_key
     if a.draft_vocab:
         cfg["draft_vocab"] = a.draft_vocab
-    if a.numa:                                         # WP-F: "auto" is the default and passes nothing (apply_numa)
-        cfg["numa"] = a.numa
+    cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    numa = saved_numa(cfg_path, a.numa)                # WP-F: "auto" is the default and passes nothing (apply_numa)
+    if numa:
+        cfg["numa"] = numa
         apply_numa(cfg)
     if vision != "none":
         cfg["vision"] = {"exe": str(eng / VEXE), "mmproj": str(mmproj), "model": str(shards[0]),
                          "gpu": vision == "gpu", "max_tokens": VISION[vision]["max_tokens"]}
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
-    cfg_path = ROOT / f"strata-{tag.lower()}.json"
     cal = None if hip else saved_calibration(cfg)     # tools/calibrate.py is NVIDIA-only for now
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))

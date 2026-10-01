@@ -10,8 +10,11 @@ last test reads the engine's header, so the two cannot drift apart without this 
 from __future__ import annotations
 
 import builtins
+import json
 import re
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -93,6 +96,147 @@ class CpuInfo(unittest.TestCase):
 
     def test_ice_lake_still_counts(self):
         self.assertEqual(self.info(ICE_LAKE)[1:], (True, True))
+
+
+class Vbmi(unittest.TestCase):
+    """The ready-made upstream engine's canonical Q2_0 kernel needs AVX-512 VBMI on top (its cpu_require_expert_support exits
+    "missing AVX512-VBMI" on a Cascade Lake); an engine compiled from this source does not."""
+
+    def vbmi(self, flags):
+        with mock.patch.object(setup, "WIN", False), mock.patch("builtins.open", fake_open(CPUINFO.format(name="x", flags=flags))):
+            return setup.cpu_has_vbmi()
+
+    def test_flag(self):
+        self.assertFalse(self.vbmi(CASCADE_LAKE))
+        self.assertFalse(self.vbmi(SKYLAKE_X))
+        self.assertFalse(self.vbmi(ZEN3))
+        self.assertTrue(self.vbmi(ICE_LAKE))
+        self.assertTrue(self.vbmi(ZEN4))
+
+    def test_unreadable_cpuinfo(self):
+        with mock.patch.object(setup, "WIN", False), mock.patch("builtins.open", side_effect=OSError):
+            self.assertFalse(setup.cpu_has_vbmi())
+
+    def test_windows_cpuid(self):
+        with mock.patch.object(setup, "WIN", True), mock.patch.object(setup, "_cpuid7_regs", return_value=(0, 1 << 1 | 1 << 11)):
+            self.assertTrue(setup.cpu_has_vbmi())
+        with mock.patch.object(setup, "WIN", True), mock.patch.object(setup, "_cpuid7_regs", return_value=(0, 1 << 11)):
+            self.assertFalse(setup.cpu_has_vbmi())
+        with mock.patch.object(setup, "WIN", True), mock.patch.object(setup, "_cpuid7_regs", return_value=None):
+            self.assertFalse(setup.cpu_has_vbmi())
+
+
+class PackChoice(unittest.TestCase):
+    """Which engine gets the canonical Q2_0 pack (setup.py picks it by this: the AVX-512 kernel)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        p = mock.patch.object(setup, "ROOT", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+        (self.tmp / "CMakeLists.txt").write_text("project(strata VERSION 0.1.31 LANGUAGES CXX)")
+        self.src = setup.source_hash(setup.ENGINE_SOURCES)
+
+    PREBUILT = {"version": "0.1.31", "archs": [75, 80, 86, 89, 120], "ptx": True, "cuda": "13.0"}      # upstream's release
+
+    def test_built_from_this_source(self):
+        self.assertTrue(setup.built_from_this_source({"source": "local", "src": self.src}))
+        self.assertTrue(setup.built_from_this_source({"source": "local-hip", "backend": "hip", "src": self.src}))
+        self.assertFalse(setup.built_from_this_source(self.PREBUILT))
+        self.assertFalse(setup.built_from_this_source({"source": "local", "src": "an-older-checkout"}))   # a git pull since
+        self.assertFalse(setup.built_from_this_source({"source": "local"}))
+
+    def test_cascade_lake_with_the_ready_made_engine_gets_the_native_pack(self):
+        # Xeon Gold 62xx / W-22xx / i9-10980XE with an RTX 20-50 card and the downloaded engine, Q2_0 (the audit's finding)
+        self.assertTrue(setup.avx512_from_flags(CASCADE_LAKE.split()))
+        self.assertFalse(setup.pack_avx512(True, setup.vbmi_from_flags(CASCADE_LAKE.split()),
+                                           setup.built_from_this_source(self.PREBUILT)))
+
+    def test_cascade_lake_with_a_local_engine_gets_the_canonical_pack(self):
+        self.assertTrue(setup.pack_avx512(True, False, setup.built_from_this_source({"source": "local", "src": self.src})))
+
+    def test_ice_lake_and_zen4_keep_the_canonical_pack_with_either_engine(self):
+        self.assertTrue(setup.pack_avx512(True, True, False))
+        self.assertTrue(setup.pack_avx512(True, True, True))
+
+    def test_no_avx512_never_gets_it(self):
+        for from_source in (False, True):
+            self.assertFalse(setup.pack_avx512(False, False, from_source))
+            self.assertFalse(setup.pack_avx512(False, True, from_source))
+
+    def test_the_engine_and_the_hardware_in_one_install(self):
+        # the installed engine is read from engine/BUILD.json
+        (self.tmp / "engine").mkdir()
+        self.assertFalse(setup.installed_engine_local())
+        (self.tmp / "engine" / "BUILD.json").write_text(json.dumps(self.PREBUILT))
+        self.assertFalse(setup.installed_engine_local())
+        (self.tmp / "engine" / "BUILD.json").write_text(json.dumps({"source": "local", "src": self.src}))
+        self.assertTrue(setup.installed_engine_local())
+
+
+class PackForm(unittest.TestCase):
+    """A Q2_0 pack folder holds one form of the pack, and the engine tells them apart by native_experts.txt alone: a switch
+    of form must not leave the old form's marker (or its experts.bin) behind."""
+
+    def setUp(self):
+        self.pack = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.pack, True)
+        (self.pack / "tokenizer").mkdir()
+        (self.pack / "tokenizer" / "vocab.json").write_text("{}")
+
+    def make(self, *names):
+        for n in names:
+            (self.pack / n).write_text(n)
+
+    def left(self):
+        return sorted(str(p.relative_to(self.pack)) for p in self.pack.rglob("*") if p.is_file())
+
+    NATIVE = ("native_experts.txt", "index.txt", "dense.bin", "conversions.json")
+    CANONICAL = ("manifest.json", "embd.bin", "dense.bin", "experts.bin", "index.txt")
+
+    def test_native_pack_to_canonical(self):
+        # an upstream install on a Cascade Lake had the native pack; a re-run with an engine from this source wants canonical
+        self.make(*self.NATIVE, "experts.bin", "experts.bin.src.json")
+        self.assertTrue(setup.drop_other_pack_form(self.pack, True))
+        self.assertEqual(self.left(), ["tokenizer/vocab.json"])        # no native_experts.txt: the engine reads the new pack right
+
+    def test_canonical_pack_to_native(self):
+        self.make(*self.CANONICAL)
+        self.assertTrue(setup.drop_other_pack_form(self.pack, False))
+        self.assertEqual(self.left(), ["tokenizer/vocab.json"])        # (experts.bin of the canonical pack would be read as native)
+
+    def test_the_wanted_form_is_left_alone(self):
+        self.make(*self.CANONICAL)
+        self.assertFalse(setup.drop_other_pack_form(self.pack, True))
+        self.assertEqual(len(self.left()), len(self.CANONICAL) + 1)
+        for p in self.pack.glob("*.*"):
+            p.unlink()
+        self.make(*self.NATIVE, "experts.bin", "experts.bin.src.json")
+        self.assertFalse(setup.drop_other_pack_form(self.pack, False))
+        self.assertEqual(len(self.left()), len(self.NATIVE) + 2 + 1)
+
+    def test_a_half_converted_pack_of_both_forms_is_cleared_either_way(self):
+        for want in (True, False):
+            self.make(*self.NATIVE, "manifest.json", "embd.bin", "experts.bin")
+            self.assertTrue(setup.drop_other_pack_form(self.pack, want))
+            self.assertEqual(self.left(), ["tokenizer/vocab.json"])
+
+    def test_an_empty_folder_and_a_missing_one(self):
+        self.assertFalse(setup.drop_other_pack_form(self.pack, True))
+        self.assertFalse(setup.drop_other_pack_form(self.pack / "nope", False))
+
+    def test_a_hard_linked_dense_bin_is_not_written_through(self):
+        # tools/iq_pack.py --base hard-links the base pack's dense.bin: removing the name must not touch the other pack
+        other = Path(tempfile.mkdtemp()) / "dense.bin"
+        other.write_text("base pack")
+        self.make("native_experts.txt", "index.txt")
+        try:
+            (self.pack / "dense.bin").hardlink_to(other)
+        except OSError:
+            self.skipTest("no hard links here")
+        setup.drop_other_pack_form(self.pack, True)
+        self.assertEqual(other.read_text(), "base pack")
 
 
 class SameRuleAsTheEngine(unittest.TestCase):

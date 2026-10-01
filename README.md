@@ -69,7 +69,7 @@ prompt-attention machine code is unchanged; the FP16 GEMM route below is Volta-o
 | Long-context block scoring | tensor-core kernel on sm_80+ | unchanged: the FP32 warp kernel on Volta (correct, slower; optimise only if the profile says so) |
 | CPU expert kernels | AVX-512 needed VBMI (Ice Lake / Zen 4 and newer), else AVX2 | tiers `Avx512Vbmi` / `Avx512Vnni` / `Avx2`; needs F/BW/VL/DQ/VNNI; Cascade Lake runs the no-VBMI build. i-quant AVX-512 rows stay off by default on the VNNI tier except IQ2_S (measured slower there) |
 | NUMA | none: workers pinned to cores, arena placed by first touch | `--numa auto` mirrors the arena per node (Linux, 2+ nodes, full-RAM arena, room on every node) |
-| Installer | prebuilt engine, CUDA 13.0 | a V100 never gets the prebuilt engine; Ubuntu 22.04/24.04 `cuda-toolkit-12-8` or `winget` 12.8 after asking; `--numa auto\|mirror\|off`; AVX-512 test without VBMI so Cascade Lake is offered the canonical Q2_0 pack; Docker `BASE_IMAGE` build argument |
+| Installer | prebuilt engine, CUDA 13.0 | a V100 never gets the prebuilt engine; Ubuntu 22.04/24.04 `cuda-toolkit-12-8` or `winget` 12.8 after asking; `--numa auto\|mirror\|off`; AVX-512 test without VBMI so Cascade Lake is offered the canonical Q2_0 pack when the engine is compiled from this source (a V100 always; `./setup.sh --setup --build` otherwise - the ready-made upstream engine still needs VBMI for it, so setup prepares the AVX2 native pack there and says how to get the faster one); Docker `BASE_IMAGE` build argument |
 | Tools | upstream's | `tools/volta`, `tools/ds41`, `ref/ds41`, `tools/test_setup_volta.py` |
 | Models | Qwen3.8-Flash-Next | the same, plus the start of DeepSeek-V4.1-Flash (no end-to-end engine) |
 

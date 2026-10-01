@@ -160,6 +160,7 @@ the same way - nothing big is downloaded again.
    set needs a rebuild with its own arch. Add `--build-arg BUILD_VISION=0` to skip the image encoder.
    A V100 / Titan V needs a CUDA 12 base image (driver 570 or newer):
    `docker build -t vibe100 --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04 --build-arg CUDA_ARCHITECTURES=70 .`
+   (on a CUDA 12 base with no `CUDA_ARCHITECTURES` the list is `70;75;80;86;89`: never the RTX 50, which needs CUDA 13)
    ([docs/volta/VOLTA.md](volta/VOLTA.md)).
 3. Run (the first start downloads the ~70 GB model, then starts; later starts go straight to serving):
    `docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data strata`

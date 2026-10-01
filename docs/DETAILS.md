@@ -236,7 +236,7 @@ You need **only an NVIDIA driver** (version 580 or newer; update it with the NVI
 | --- | --- |
 | GPU | NVIDIA **RTX 20, 30, 40 or 50 series**, **12 GB VRAM or more** (8 GB runs, slowly). Measured on an RTX 5070 and an RTX 3090; RTX 20 (Turing, since 0.1.27) was tested by a contributor on an RTX 2070. A V100 / Titan V (Volta) works with an engine compiled here with CUDA 12.8 ([docs/volta/VOLTA.md](volta/VOLTA.md)). |
 | RAM | **64 GB** recommended (see the table above). |
-| CPU | x86-64 with AVX2 (any Intel/AMD desktop CPU from the last ~8 years). AVX-512 with VNNI (Intel Cascade Lake Xeon Gold / Silver 2nd gen and newer, Ice Lake and newer, Ryzen 7000/9000) is a bit faster and is what the canonical Q2_0 pack needs; AVX-512 VBMI (Ice Lake and newer, Zen 4) is not required. See "CPU kernels" below. |
+| CPU | x86-64 with AVX2 (any Intel/AMD desktop CPU from the last ~8 years). AVX-512 with VNNI (Intel Cascade Lake Xeon Gold / Silver 2nd gen and newer, Ice Lake and newer, Ryzen 7000/9000) is a bit faster and is what the canonical Q2_0 pack needs; AVX-512 VBMI (Ice Lake and newer, Zen 4) is not required by an engine compiled from this source (a V100's always is; `./setup.sh --setup --build` for others) - the ready-made upstream engine still needs it for the canonical pack, so with that engine a CPU without VBMI gets the AVX2 native pack. See "CPU kernels" below. |
 | Disk | ~70-80 GB free for the model, ~6 GB for the MTP layer (+1 GB with images). **Q2_0 on an AVX-512 CPU** also writes a one-time ~40 GB copy of its experts for the fast CPU kernel. An NVMe SSD is strongly recommended. |
 | OS | Windows 10/11, or Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
 

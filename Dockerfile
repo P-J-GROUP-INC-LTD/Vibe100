@@ -16,20 +16,25 @@
 #   docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .        # RTX 40 only
 #
 # V100 / Titan V (Volta, sm_70): CUDA 13 dropped Volta, so the image needs a CUDA 12
-# base - BASE_IMAGE - and the architecture must be named, since the default list
-# below is the one for RTX cards (an RTX 50 engine built with CUDA 12.8 crashed on
-# long prompts, issues #220 / #224, and one engine cannot be made for both):
+# base - BASE_IMAGE:
 #   docker build -t vibe100 \
-#     --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04 \
-#     --build-arg CUDA_ARCHITECTURES=70 .
-# A V100 together with RTX 20/30/40 cards in one image is fine (CUDA_ARCHITECTURES=
-# "70;75;86;89", still CUDA 12.8); with an RTX 50 card it is not (the build stops and
-# says so).  Leave the architecture out on a CUDA 12 base and the image builds for the
-# RTX list: the engine has no code for a V100, and the container compiles one at its
-# first start (setup.py does that, 15-20 minutes).  On the default CUDA 13 base CMake
-# refuses sm_70 and says why.  Run the V100 image like any other; the container's
-# driver check is setup.py's (a V100 needs driver 570 or newer - CUDA 12.8 - and the
-# 580 branch is the last that supports Volta, R590 does not).
+#     --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04 .
+# With no CUDA_ARCHITECTURES the list follows the toolkit: 70;75;80;86;89 on a CUDA 12
+# base (a V100 and RTX 20/30/40 / A-series cards; never 120 - an RTX 50 engine built
+# with CUDA 12.8 crashed on long prompts, issues #220 / #224, and one engine cannot be
+# made for both), 75;80;86;89;120 on the default CUDA 13 base (CMake refuses sm_70
+# there and says why).  Name the architecture to narrow it (CUDA_ARCHITECTURES=70 for a
+# V100 only) or to widen it: a V100 together with an RTX 50 card in one image is not
+# possible (the build stops and says so).  Run the V100 image like any other; the
+# container's driver check is setup.py's (a V100 needs driver 570 or newer - CUDA 12.8 -
+# and the 580 branch is the last that supports Volta, R590 does not).
+#
+# A card the engine has no code for (not in the list: an H100, say) makes the container
+# compile one at its first start (setup.py does that, 15-20 minutes) - into the
+# container's own file system, not /data: a container started with --rm, or recreated,
+# compiles it again every time.  Build the image for the card's architecture instead
+# (--build-arg CUDA_ARCHITECTURES=...), or keep the container (docker start) instead of
+# removing it.
 #
 # Run (host needs an NVIDIA driver >= 580 - >= 570 for the V100 image - and
 # nvidia-container-toolkit):
@@ -74,10 +79,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/strata
 COPY . .
 
-# RTX 20 (75), RTX 30 (86), RTX 40 (89), RTX 50 (120), plus 80 for A-series. CMakeLists
-# refuses anything below 70; 70 (V100 / Titan V) needs a CUDA 12 BASE_IMAGE and cannot
-# be in the same image as 120. BUILD_VISION=0 skips the image encoder build.
-ARG CUDA_ARCHITECTURES=75;80;86;89;120
+# Empty (the default): the list follows the toolkit that is installed - 75;80;86;89;120
+# with CUDA 13 (RTX 20 / A-series / RTX 30 / RTX 40 / RTX 50), 70;75;80;86;89 with CUDA 12
+# (the same without the RTX 50, which needs CUDA 13, plus the V100 / Titan V, which
+# CUDA 13 dropped).  CMakeLists refuses anything below 70; 70 needs a CUDA 12 BASE_IMAGE
+# and cannot be in the same image as 120.  BUILD_VISION=0 skips the image encoder build.
+ARG CUDA_ARCHITECTURES=""
 ARG BUILD_VISION=1
 
 RUN python3 -m venv .venv \
@@ -94,13 +101,18 @@ import json, os, pathlib, shutil
 import setup
 
 llama = setup.get_llama_cpp()
-arch = os.environ.get("CUDA_ARCHITECTURES", "75;80;86;89;120").strip().strip('"').replace(",", ";")
+arch = os.environ.get("CUDA_ARCHITECTURES", "").strip().strip('"').replace(",", ";")
+if not arch:                             # none given: the list follows the toolkit (never 120 with CUDA 12: #220 / #224)
+    arch = "70;75;80;86;89" if (setup.find_nvcc()[1] or (13, 0))[0] < 13 else "75;80;86;89;120"
 archs = [int(a.split("-")[0]) for a in arch.split(";") if a.split("-")[0].isdigit()]
 setup.refuse_conflict(archs)             # a Volta card and an RTX 50 cannot share one engine (CUDA 12 vs 13)
 nvcc, cuda_v = setup.find_nvcc(archs)    # for Volta: only a CUDA 12.x toolkit counts
 if nvcc is None:
     raise SystemExit(f"CUDA_ARCHITECTURES={arch} needs a CUDA 12.x toolkit (CUDA 13 dropped Volta, sm_70), and this "
                      "base image has none: --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04")
+if setup.needs_cuda12(archs) and cuda_v < setup.CUDA12_MIN_TOOLKIT:
+    raise SystemExit(f"CUDA {cuda_v[0]}.{cuda_v[1]} is too old for sm_70 on this base image (its nvcc rejects g++ 13): "
+                     "--build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04")
 print(f"building with CUDA {cuda_v[0]}.{cuda_v[1]} ({nvcc}) for sm_" + ", sm_".join(str(a) for a in archs))
 vision = "gpu" if os.environ.get("BUILD_VISION", "1") == "1" else "none"
 
@@ -119,11 +131,13 @@ shutil.copy2(setup.ROOT / "build" / setup.EXE, eng / setup.EXE)
 if vision != "none":
     shutil.copy2(setup.ROOT / "build-vision" / "bin" / setup.VEXE, eng / setup.VEXE)
 bindir = pathlib.Path(nvcc).parent
-meta = {"source": "local", "version": setup.source_version(),
-        "archs": [int(a.split("-")[0]) for a in arch.split(";") if a.split("-")[0].isdigit()], "vision": vision,
+archs = sorted(set(archs))
+meta = {"source": "local", "version": setup.source_version(), "archs": archs, "vision": vision,
+        "cuda": f"{cuda_v[0]}.{cuda_v[1]}",
         "cuda_dirs": [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()],
         "src": setup.source_hash(setup.ENGINE_SOURCES),
-        "vision_src": setup.source_hash(setup.VISION_SOURCES) if vision != "none" else None}
+        "vision_src": setup.source_hash(setup.VISION_SOURCES) if vision != "none" else None,
+        "vision_archs": archs if vision != "none" else None}
 (eng / "BUILD.json").write_text(json.dumps(meta, indent=1))
 PYEOF
 

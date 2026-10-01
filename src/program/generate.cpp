@@ -1343,10 +1343,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
     }
-#if defined(STRATA_USE_HIP)
     {
         // every GPU this run uses must be an architecture the binary has code for (a gfx1100 build on a gfx1201
-        // card would otherwise fail later with "invalid device function")
+        // card would otherwise fail later with "invalid device function"; on CUDA also: an sm_70-only build on a
+        // card of cc 7.5 or newer, whose first prompt would die in a trap stub - device.hpp, older_code_problem)
         std::vector<int> used{0};
         if (multi_gpu) used.insert(used.end(), split_devs.begin(), split_devs.end());
         for (int r = 0; r < 3; ++r)
@@ -1358,7 +1358,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-#endif
     if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;

@@ -33,7 +33,7 @@ switches, then DeepSeek - with the exact commands and what to send back after ea
 | --- | --- |
 | **The card** | Tesla V100 16 GB or 32 GB (PCIe or SXM2), Quadro GV100, Titan V (12 GB). `nvidia-smi --query-gpu=name,compute_cap --format=csv` must say **7.0**. 32 GB is the one worth having: the GPU's VRAM holds a copy of the most-used experts, so more VRAM means more answers served from the card. |
 | **The driver** | The **proprietary R580** branch: **570 or newer** (CUDA 12.8 needs it; CUDA 13 needs 580 or newer) and **no newer than the 580 series**, because R580 is the last NVIDIA driver branch that supports Volta. On Ubuntu that is `nvidia-driver-580` - **not** `nvidia-driver-580-open`: NVIDIA's open kernel modules support Turing and newer only, so they do not drive a V100. Once it works, hold it (`apt-mark hold`, see [RUNBOOK.md](RUNBOOK.md) step 2): the next `apt upgrade` or "Additional Drivers" click must not move a V100 box to a branch that no longer lists the card. |
-| **CUDA toolkit** | **12.8** (any 12.x from 12.0 to 12.9 is accepted; 12.8 is the one this port was checked with). **Not 13.** The installer finds an existing 12.x or installs 12.8 next to whatever CUDA you have; it passes nvcc to CMake itself, so your default CUDA is not touched. |
+| **CUDA toolkit** | **12.8** (any 12.x from **12.4** to 12.9 is accepted; 12.8 is the one this port was checked with; Ubuntu 24.04's own packaged 12.0 is passed over because its nvcc rejects g++ 13 - the installer then installs 12.8 next to it, after asking). **Not 13.** The installer finds an existing 12.x or installs 12.8 next to whatever CUDA you have; it passes nvcc to CMake itself, so your default CUDA is not touched. |
 | **RAM and disk** | The same as for any card - [the table in the user guide](../STRATA_README.md#which-model-should-i-pick). A V100 server usually has plenty; with 64 GB of RAM every size fits. |
 | **A compiler** | Linux: `g++` (installed with `build-essential`). Windows: Visual Studio 2022 Build Tools (C++). The installer offers to install them. |
 | **The OS** | Linux (Ubuntu 22.04 / 24.04 gets the CUDA 12.8 install automatically; other distributions: install CUDA 12.8 yourself, the installer finds it in `/usr/local/cuda-12.*` or `/opt/cuda*`). Windows is possible for a Titan V / Quadro GV100 through the same installer; that path is untested. |
@@ -107,7 +107,11 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data
 ```
 
 The host needs the NVIDIA Container Toolkit and a driver 570 or newer (and not past the 580 series). The default
-base (CUDA 13) is unchanged for RTX cards; with it `CUDA_ARCHITECTURES=70` stops the build with the reason. The
+base (CUDA 13) is unchanged for RTX cards; with it `CUDA_ARCHITECTURES=70` stops the build with the reason. With no
+`CUDA_ARCHITECTURES` the list follows the toolkit: `70;75;80;86;89` on a CUDA 12 base, `75;80;86;89;120` on the CUDA 13
+default (`70` alone, as above, builds faster). A card outside the list makes the container compile an engine at its first
+start - into the container, not `/data`, so a container run with `--rm` compiles it again every time: build the image for that
+card's architecture, or keep the container (`docker start`). The
 other options (`-e MODEL=...`, `-e LOW_RAM=on`, ...) are the same as in the
 [user guide](../STRATA_README.md#install). (The Docker build has not been run on a V100 host either.)
 
@@ -214,7 +218,9 @@ the copy; a replica whose pages are not on its node is dropped and the line says
 locks it; with no swap configured that changes nothing.)
 
 Controls: `--numa auto|mirror|off` (`mirror` asks for it; the engine still refuses, with the reason, where it cannot), set
-at setup or later with `./setup.sh --numa off` (saved for the model), and the environment `STRATA_NUMA_MIRROR=0` / `=1`,
+at setup or later with `./setup.sh --numa off` (saved for the model: it survives `--setup` re-runs and adopting an
+install; setup passes it only to an engine compiled from this source - the ready-made upstream engine has no `--numa`, so
+setup keeps the setting and says so), and the environment `STRATA_NUMA_MIRROR=0` / `=1`,
 which overrides the option for one run - the A/B switch. If the log says the GPU's node was ASSUMED (the BIOS reports
 `numa_node -1`), tell it with `STRATA_NUMA_GPU_NODE=N` (what `nvidia-smi topo -m` shows: the card's CPU affinity).
 
@@ -323,6 +329,10 @@ longer context takes VRAM from the experts' cache (more in [DETAILS.md](../DETAI
   older than the card (`device.cu`; the message names the architectures it was built for), and the attention dispatcher asks the
   runtime which code each kernel got (`ptxVersion`) and never launches a kernel whose body is a trap stub. The remedy is a build for
   the card: `-DCMAKE_CUDA_ARCHITECTURES="70;75"` for a V100 plus an RTX 20.
+- *"the PCI bus has N NVIDIA GPUs (...) but nvidia-smi lists M"* (setup) - a card the driver does not drive. With the open
+  kernel modules (`/proc/driver/nvidia/version` says "Open Kernel Module") a V100 is never listed: they support Turing and newer
+  only; install the proprietary `nvidia-driver-580`. A driver newer than the 580 series does not list Volta either: go back to
+  R580 and hold it ([RUNBOOK.md](RUNBOOK.md), step 2).
 - *"one engine cannot be built for sm_70, sm_120"* - a V100 and an RTX 50 in one engine; choose with `--gpu` / `--gpus`.
 - *A crash or `unspecified launch failure` on a V100* - run `tools/volta/run_parity.sh` and attach its output with
   `strata-<model>.log` and the output of `strata-device` (`build/strata-device`, after `.venv/bin/cmake --build build --target

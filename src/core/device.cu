@@ -69,12 +69,28 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
 // "no kernel image is available for execution on the device", from deep inside whichever stage ran first.
 // cudaFuncGetAttributes on a kernel of this very file asks the driver the same question up front, for the
 // device that is current (device_info() has just made `d` current), without running anything.
+// A binary that has code for the card is not yet a binary that has the RIGHT code (older_code_problem, device.hpp): the
+// attributes of the kernel the driver picked say which SASS runs (binaryVersion) and which architecture it was compiled
+// for (ptxVersion), and both are kept in `d`.  An engine built for sm_70 alone passes this probe on a cc 7.5 card (the sm_70
+// SASS runs there natively) and on an 8.x one (its compute_70 PTX is JIT-compiled), yet all its kernels have the
+// __CUDA_ARCH__ 700 bodies, where the Turing-and-newer paths are traps.  STRATA_CUDA_ARCHS (the list it was built for)
+// goes into that message.  Code that matches the card - sm_75 or newer on a 7.5+ card, anything on a V100 - is left alone.
 // "" when the binary can run on the card (or when the probe failed for a reason that is not about code: the next
 // real CUDA call reports that one with its own context, as it always did).
-std::string missing_code_problem(const DeviceInfo& d) {
+std::string missing_code_problem(DeviceInfo& d) {
     cudaFuncAttributes attr{};
     const cudaError_t e = cudaFuncGetAttributes(&attr, poison_kernel);
-    if (e == cudaSuccess) return "";
+    if (e == cudaSuccess) {
+        d.binary_version = attr.binaryVersion;
+        d.ptx_version = attr.ptxVersion;
+#if defined(STRATA_CUDA_ARCHS)
+        const char* const built_for = STRATA_CUDA_ARCHS;
+#else
+        const char* const built_for = "";
+#endif
+        return older_code_problem("GPU " + std::to_string(d.ordinal) + " (" + d.name + ")", d.cc_major, d.cc_minor,
+                                  d.ptx_version, d.binary_version, built_for);
+    }
     cudaGetLastError();          // these errors are not sticky, but a stale one would be blamed on the next caller
     if (e != cudaErrorNoKernelImageForDevice && e != cudaErrorInvalidDeviceFunction &&
         e != cudaErrorUnsupportedPtxVersion) {
@@ -125,8 +141,28 @@ std::string gpu_arch_problem(int ordinal) {
     }
     return arch_problem(p, ordinal);
 #else
-    (void) ordinal;
-    return "";
+    // CUDA: the same two questions device_info() asks (missing_code_problem: no code at all for the card, or code
+    // compiled below sm_75 on a card of 7.5 or newer - an sm_70-only engine on an RTX 20 / 30 / 40, whose
+    // Turing-and-newer kernels are trap stubs), for every GPU a run uses, at engine start.  The probe needs the card
+    // current, so the caller's current device is restored afterwards.
+    int count = 0, prev = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || ordinal < 0 || ordinal >= count || cudaGetDevice(&prev) != cudaSuccess) {
+        cudaGetLastError();
+        return "";
+    }
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, ordinal) != cudaSuccess || cudaSetDevice(ordinal) != cudaSuccess) {
+        cudaGetLastError();
+        return "";
+    }
+    DeviceInfo d;
+    d.ordinal = ordinal;
+    d.name = p.name;
+    d.cc_major = p.major;
+    d.cc_minor = p.minor;
+    const std::string why = missing_code_problem(d);
+    cudaSetDevice(prev);
+    return why;
 #endif
 }
 
