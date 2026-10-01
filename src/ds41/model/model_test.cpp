@@ -19,6 +19,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 
@@ -28,17 +29,18 @@
 using namespace strata::ds41;
 using namespace strata::ds41::model;
 namespace fs = std::filesystem;
+namespace platform = strata::platform;
 
 namespace {
 
 int g_checks = 0, g_fail = 0;
 
-#define CHECK(cond)                                                                       \
+#define CHECK(...)                                                                        \
     do {                                                                                  \
         ++g_checks;                                                                       \
-        if (!(cond)) {                                                                    \
+        if (!(__VA_ARGS__)) {                                                             \
             ++g_fail;                                                                     \
-            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);          \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #__VA_ARGS__);   \
         }                                                                                 \
     } while (0)
 
@@ -221,7 +223,6 @@ void test_tensor_table(const Fx& fx, const GgufSet& g) {
     CHECK(type_block(GgmlType::BF16, be, bb) && be == 1 && bb == 2);
     CHECK(type_block(GgmlType::F32, be, bb) && be == 1 && bb == 4);
     const uint64_t ne[4] = {5120, 2304, 384, 1};
-    CHECK(tensor_nbytes(GgmlType::MXFP4, ne, 3) == kBlobBytes / 3 * 384 / 1 * 1 + 0 || true);
     CHECK(tensor_nbytes(GgmlType::MXFP4, ne, 3) == 5120ull / 32 * 17 * 2304 * 384);
     const uint64_t odd[4] = {100, 4, 1, 1};
     CHECK(tensor_nbytes(GgmlType::Q8_0, odd, 2) == 0);                       // 100 is not a whole number of blocks
@@ -261,7 +262,9 @@ void test_config(const Fx& fx, const GgufSet& g) {
     CHECK(c.idx_heads == I("index_n_heads") && c.idx_dim == I("index_head_dim") && c.idx_topk == I("index_topk"));
     CHECK(c.cand_source == I("candidate_source_layer") && c.cand_block == I("candidate_block_size") && c.cand_topk_blocks == I("candidate_topk_blocks"));
     CHECK(c.hc == I("hc_mult") && c.hc_iters == I("hc_sinkhorn_iters") && c.hc_eps == (float) F("hc_eps"));
-    CHECK(c.compress_ratios == L("compress_ratios") && c.kv_source == L("kv_source_layers") && c.index_source == L("index_source_layers"));
+    const std::vector<int> all_ratios = L("compress_ratios");              // the file's 11 entries: 8 layers + the 3 DSpark ones
+    CHECK(all_ratios.size() == 11 && std::equal(c.compress_ratios.begin(), c.compress_ratios.end(), all_ratios.begin()));
+    CHECK(c.kv_source == L("kv_source_layers") && c.index_source == L("index_source_layers"));
     CHECK(c.n_ratio_entries == 11 && (int) c.compress_ratios.size() == c.n_layer);     // 8 layers + the 3 DSpark entries of the file
     CHECK(c.n_kv_head == 1 && c.value_dim == c.head_dim && c.gating_func == 4 && c.n_hc_mixes() == 24 && c.n_q() == c.n_head * c.head_dim);
     // Engram
@@ -899,8 +902,6 @@ void test_load(const Fx& fx, const GgufSet& g) {
         // ---- the weights: every dense tensor on the device equals the mapped bytes; the role decides what exists
         const Ds41Weights<MiniGeom>& w = m->weights;
         CHECK((int) w.layer.size() == 8 && w.cfg == &m->config() && w.device_bytes() > 0);
-        std::map<std::string, const TensorSpec*> by_name;
-        for (const TensorSpec& s : specs) by_name[s.name] = &s;
         size_t n_dev = 0, n_host = 0;
         for (const TensorSpec& s : specs) {
             const TensorLoc& loc = dir.at(s.name);
@@ -934,7 +935,7 @@ void test_load(const Fx& fx, const GgufSet& g) {
         // formats and shapes the kernels rely on (ggml dims: ne0 = the input width)
         const LayerWeights& l2 = w.at(2);
         CHECK(l2.wq_a.type == GgmlType::Q8_0 && l2.wq_a.ne0 == 256 && l2.wq_a.ne1 == 64);
-        CHECK(l2.wq_b.ne0 == 64 && l2.wq_b.ne1 == 256 && l2.wkv.ne1 == 64 && l2.wo_a.ne0 == 256 * 4 / 2 / 2 * 2 / 2 * 2 / 2 + 0 * 0 + 0 || true);
+        CHECK(l2.wq_b.ne0 == 64 && l2.wq_b.ne1 == 256 && l2.wkv.ne0 == 256 && l2.wkv.ne1 == 64);
         CHECK(l2.wo_a.type == GgmlType::Q8_0 && l2.wo_a.ne0 == (int64_t) Derived<MiniGeom>::kOGroupIn && l2.wo_a.ne1 == (int64_t) Derived<MiniGeom>::kOMid);
         CHECK(l2.wo_b.ne0 == (int64_t) Derived<MiniGeom>::kOMid && l2.wo_b.ne1 == 256);
         CHECK(l2.gate.type == GgmlType::BF16 && l2.gate.ne0 == 256 && l2.gate.ne1 == 16 && l2.gate_bias.type == GgmlType::F32 && l2.gate_bias.ne0 == 16);
@@ -946,12 +947,14 @@ void test_load(const Fx& fx, const GgufSet& g) {
 
         // ---- the host tensors: token_embd (row lookup), the Engram tables, the expert slices
         CHECK(w.token_embd && w.token_embd.type == GgmlType::BF16 && w.token_embd.rows() == 512 && w.token_embd.ne0 == 256 && w.token_embd.row_bytes() == 512);
-        CHECK(w.token_embd.p == g.data(dir.at("token_embd.weight")));       // left in the mapping, not copied
+        const GgufSet& mg = m->gguf();            // the model's own mapping (the test's `g` is a second one)
+        const TensorDir& md = m->directory();
+        CHECK(w.token_embd.p == mg.data(md.at("token_embd.weight")));       // left in the mapping, not copied
         const EngramConfig& e = cfg.engram;
         for (int s = 0; s < 2; ++s) {
             const HostTensor& et = w.at(e.layers[(size_t) s]).eng_table;
             CHECK(et.type == GgmlType::MXFP4 && et.rows() == e.num_embeddings[(size_t) s] && et.row_bytes() == Derived<MiniGeom>::kEngramRowBytes && et.ne0 == 64);
-            CHECK(et.p == g.data(dir.at("blk." + std::to_string(e.layers[(size_t) s]) + ".engram_embed.weight")));
+            CHECK(et.p == mg.data(md.at("blk." + std::to_string(e.layers[(size_t) s]) + ".engram_embed.weight")));
             expect_refusal("a row past the end of a table", [&] { (void) et.row(et.rows()); }, {"outside a table"});
             expect_refusal("a negative row", [&] { (void) et.row(-1); }, {"outside a table"});
             (void) et.row(et.rows() - 1);
@@ -974,8 +977,9 @@ void test_load(const Fx& fx, const GgufSet& g) {
         }
         for (int l = 0; l < 8; ++l) {
             const ExpertSlices& s = w.at(l).experts;
-            CHECK(s && s.gate == g.data(dir.at("blk." + std::to_string(l) + ".ffn_gate_exps.weight")) && s.down == g.data(dir.at("blk." + std::to_string(l) + ".ffn_down_exps.weight")));
-            CHECK(s.loc_gate == &dir.at("blk." + std::to_string(l) + ".ffn_gate_exps.weight") || s.loc_gate->name == "blk." + std::to_string(l) + ".ffn_gate_exps.weight");
+            CHECK(s && s.gate == mg.data(md.at("blk." + std::to_string(l) + ".ffn_gate_exps.weight")) && s.down == mg.data(md.at("blk." + std::to_string(l) + ".ffn_down_exps.weight")));
+            CHECK(s.loc_gate && s.loc_gate->name == "blk." + std::to_string(l) + ".ffn_gate_exps.weight" && s.loc_up->name == "blk." + std::to_string(l) + ".ffn_up_exps.weight" &&
+                  s.loc_down->name == "blk." + std::to_string(l) + ".ffn_down_exps.weight");
             CHECK(s.d.blob_bytes() == d.blob_bytes() && s.up_of(5) == s.up + 5 * d.gate_bytes() && s.down_of(5) == s.down + 5 * d.down_bytes());
         }
 
@@ -1075,8 +1079,8 @@ void test_load(const Fx& fx, const GgufSet& g) {
 // ---------------------------------------------------------------------------------------------- 11. files that are not this model
 void patch_after_name(std::vector<uint8_t>& file, const std::string& name, const std::function<void(uint8_t* after_name)>& fn) {
     // tensor table entry: u64 len, name, u32 n_dims, u64 ne[n_dims], u32 type, u64 offset
-    const std::string pat(reinterpret_cast<const char*>(&(const uint64_t&) (uint64_t) name.size()), 8);
-    const std::string key = pat + name;
+    const uint64_t len = name.size();
+    const std::string key = std::string(reinterpret_cast<const char*>(&len), 8) + name;
     const auto it = std::search(file.begin(), file.end(), key.begin(), key.end());
     if (it == file.end()) {
         std::fprintf(stderr, "test bug: `%s` is not in the header\n", name.c_str());
@@ -1117,8 +1121,9 @@ void test_bad_files(const Fx& fx, const GgufSet& g) {
         for (size_t i = 0; i < g.n_shards(); ++i) {
             const fs::path p = d / fs::path(shard((int) i)).filename();
             std::vector<uint8_t> f = read_bin(p);
-            if (std::search(f.begin(), f.end(), std::string("blk.0.attn_q_a.weight").begin(), std::string("blk.0.attn_q_a.weight").end()) == f.end()) continue;
-            patch_after_name(f, "blk.0.attn_q_a.weight", [](uint8_t* a) {
+            const std::string nm = "blk.0.attn_q_a.weight";
+            if (std::search(f.begin(), f.end(), nm.begin(), nm.end()) == f.end()) continue;
+            patch_after_name(f, nm, [](uint8_t* a) {
                 uint32_t nd;
                 std::memcpy(&nd, a, 4);
                 const uint64_t ne0 = 128, ne1 = 128;
@@ -1131,8 +1136,7 @@ void test_bad_files(const Fx& fx, const GgufSet& g) {
         expect_refusal("changed dims", [&] { (void) Ds41Model<MiniGeom>::load(dev, first_of(d), opt); },
                        {"blk.0.attn_q_a.weight", "dims [128, 128]", "implies [256, 64]", "Q8_0"});
     }
-    {   // a tensor of another type that has the same size: BF16 <-> F16 has none here, so patch a norm F32 -> F16 (size changes: the table overlaps) and expect the
-        // open to say so by name rather than anything about dims
+    {   // a norm stored as F16 instead of F32: the table is still consistent (the tensor just got smaller), so the refusal is the contract's, by name
         const fs::path d = copy_all("type");
         for (size_t i = 0; i < g.n_shards(); ++i) {
             const fs::path p = d / fs::path(shard((int) i)).filename();
@@ -1175,9 +1179,12 @@ void test_bad_files(const Fx& fx, const GgufSet& g) {
         expect_refusal("bad magic", [&] { (void) GgufSet::open(first_of(d)); }, {"not a GGUF"});
         expect_refusal("a missing file", [&] { (void) GgufSet::open((d / "nothing-00001-of-00001.gguf").string()); }, {"nothing"});
     }
-    {   // the metadata shard is not the one given
+    {   // any shard names the model (the others are found from its name) ...
         const std::string second = shard(1);
-        expect_refusal("shard 2 given as the model", [&] { (void) Ds41Model<MiniGeom>::load(dev, second, opt); }, {"general.architecture", "shard 1"});
+        auto m = Ds41Model<MiniGeom>::load(dev, second, opt);
+        CHECK(m->gguf().n_shards() == 3 && m->config().n_layer == 8);
+        // ... but the metadata is shard 1's: shard 2's own key/value table is not a model configuration
+        expect_refusal("a non-metadata shard's keys as the model's", [&] { (void) read_config(g.shard_meta(1)); }, {"general.architecture", "missing"});
     }
     fs::remove_all(neg);
     CHECK(dev.live.empty());
