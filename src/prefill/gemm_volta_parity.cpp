@@ -119,15 +119,17 @@ void scale_row(std::vector<uint16_t>& m, int64_t row, int64_t K, double f) {
 }
 uint16_t bf(float f) { return bf16_from_f32(f); }
 
-// k of the chunk (the route's rule, on the host): the smallest k >= 0 with max finite |v| * 2^-k < 2^15
+// k of the chunk (the route's rule, on the host): max finite |v| * 2^-k in [2^14, 2^15), at least -63; 0 for a chunk
+// with no normal nonzero value
 int scale_k_of(const std::vector<uint16_t>& v) {
     uint32_t m = 0;
     for (uint16_t b : v) {
         const uint32_t mag = b & 0x7FFFu;
         if (mag < 0x7F80u) m = std::max(m, mag);
     }
-    const uint32_t e = m >> 7;
-    return e > 141u ? (int) (e - 141u) : 0;
+    const int e = (int) (m >> 7);
+    if (e == 0) return 0;
+    return std::max(e - 141, -63);
 }
 
 // ------------------------------------------------------------------------------------------------ reference
@@ -466,11 +468,11 @@ bool run_default_route(std::mt19937_64& rng) {
     bool expect_big;
     if (e == "0") expect_big = false;
     else if (e == "1") expect_big = true;
-    else expect_big = cc >= 70 && cc < 80;
+    else expect_big = cc >= 70 && cc < 75;
     struct Shape { int64_t T, N, K; bool expect; const char* what; };
     const Shape shapes[] = {{1024, 1024, 1024, expect_big, "a big shape"},
                             {1024, 1, 2560, false, "the N = 1 router gate (stays upstream whatever the variable)"},
-                            {32, 4096, 2560, false, "T = 32 (a draft layer: stays upstream)"},
+                            {32, 4096, 2560, false, "T = 32 (decode / verify sizes: stay upstream)"},
                             {1024, 48, 2560, false, "N = 48 (GDN gates: stays upstream)"}};
     bool pass = true;
     for (const Shape& s : shapes) {
@@ -557,7 +559,13 @@ std::vector<Case> make_cases() {
         Case c{"tiny: fp16 subnormal range", 96, 130, 520, 0, 0.0f};
         c.sx = 3e-6;
         c.sw = 2e-5;
-        c.note = "every element is on the 2^-24 grid: the error is bounded by qb, not small";
+        c.note = "both chunks scaled UP (k < 0): converted exactly although every value is below fp16's normal range";
+        add(c);
+    }
+    {
+        Case c{"tiny X: k clamped at -63", 96, 130, 520, 0, 0.0f};
+        c.sx = 1e-17;
+        c.note = "max|x| ~ 2^-54: k_x = -63 (not -69), alpha = 2^(k_x + k_w) stays a normal float, still exact";
         add(c);
     }
     {

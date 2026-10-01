@@ -69,30 +69,36 @@ void note(cublasStatus_t s, const char* what) {
 // (a 2^-24 grid), below 2^-25 zero.  Activations of large models do exceed 65504 (the "massive" channels of the
 // residual stream), and one infinity in an operand would poison every output it touches.  So each operand chunk is
 // scaled by a POWER OF TWO, chosen ON THE DEVICE: a reduction finds the largest finite |bf16| of the chunk, its
-// biased exponent E gives k = max(0, E - 141) - the smallest k >= 0 with max * 2^-k < 2^15 - and the chunk is
-// converted as x * 2^-k.  A power of two changes no mantissa bit.  The product of an X chunk (k_x) and a W chunk
-// (k_w) is then 2^-(k_x + k_w) times the true one, which the GEMM's own alpha puts back, in FP32, exactly:
-// alpha = 2^(k_x + k_w) (clamped at 2^127, which is only reachable when |x| |w| > 2^155 and the upstream route
-// overflows FP32 as well).  k = 0 - alpha = 1, inputs bit-identical to the bf16 route - for every chunk whose
-// largest finite value is below 32768, i.e. for every ordinary activation and weight.  Because alpha and beta are
+// biased exponent E gives k = E - 141 - the k with max * 2^-k in [2^14, 2^15): negative, a scaling UP, for a chunk
+// of small values - and the chunk is converted as x * 2^-k.  A power of two changes no mantissa bit.  The product of
+// an X chunk (k_x) and a W chunk (k_w) is then 2^-(k_x + k_w) times the true one, which the GEMM's own alpha puts
+// back, in FP32, exactly: alpha = 2^(k_x + k_w).  A power-of-two scale commutes with FP32 rounding as long as nothing
+// leaves FP32's normal range (the fp16 products are exact, the scaled partial sums stay below 2^44), so the route
+// computes what the bf16 route computes, up to the order of the FP32 additions, for every element that the scaled
+// conversion keeps exact.  k is clamped at -63, so k_x + k_w >= -126 and alpha is a normal float; a chunk whose
+// maximum is below 2^-49 is then scaled up less than it could be (nothing is lost that the bf16 route would keep: its
+// FP32 sums are near the bottom of FP32's range already).  ABOVE, alpha is clamped at 2^127: k_x + k_w > 127 needs
+// max|x| > 2^15 and max|w| > 2^15 with max|x| max|w| >= 2^156 - the two maxima need not meet in one product, so the
+// bf16 route can still be finite there - and then every output of the call is too small by 2^(k_x + k_w - 127).  No
+// model activation or weight comes near (activations reach ~2^17, weights stay below ~2^4); for such data
+// STRATA_PREFILL_F16_GEMM=0 is the exact route.  Because alpha and beta are
 // then DEVICE values the call is made in CUBLAS_POINTER_MODE_DEVICE and the handle's pointer mode is restored; the
 // host never waits for the reduction, so nothing here synchronizes and the route is as asynchronous as the bf16 call
 // (it also allocates nothing, so it adds nothing that stream capture forbids).
 //   * Inf and NaN are left out of the maximum, converted to Inf / NaN, and reach the same outputs as in the bf16
-//     route; a chunk with one Inf and otherwise ordinary values keeps k = 0 and its finite rows stay exact.
-//   * THE UNDERFLOW CONSEQUENCE.  Scaling down gives up the bottom of the range for the top.  After x * 2^-k an
-//     element is rounded to fp16: it keeps all its bits down to 2^(-14+k), is rounded to a grid of 2^(-24+k) below
-//     that (absolute error <= 2^(-25+k)) and is lost below 2^(-25+k).  With k = 0 that is already the case for the
-//     tiny elements of an ordinary chunk (< 6.1e-5), whose absolute error is <= 3e-8 each.  A chunk with a huge outlier
-//     (its maximum is ~2^(14+k) after scaling) loses precision on what lies more than ~2^28 below the maximum and
-//     all of what lies more than ~2^39 below it - in the row or column that holds the outlier far under the FP32
+//     route; a chunk with one Inf and otherwise ordinary values is scaled by its finite maximum and its finite rows
+//     stay exact.  A chunk with no nonzero finite value (or only bf16 subnormals, below 2^-126, which convert to zero
+//     whatever the scale) has k = 0.
+//   * THE UNDERFLOW CONSEQUENCE.  After x * 2^-k an element is rounded to fp16: it keeps all its bits down to
+//     2^(-14+k), is rounded to a grid of 2^(-24+k) below that (absolute error <= 2^(-25+k)) and is lost below
+//     2^(-25+k).  The scaled maximum is at least 2^14, so an element keeps all its bits when it lies within 2^28 of its
+//     chunk's maximum - for a chunk of ordinary activations or weights that is every element (bf16 weights of std
+//     1e-4 convert as exactly as those of std 1).  A chunk with a huge outlier loses precision on what lies more than
+//     ~2^28 below the maximum and all of what lies more than ~2^39 below it - in the row or column that holds the outlier far under the FP32
 //     accumulation noise, but in the OTHER rows of the chunk (the scale is the chunk's, not the row's) it is a real
 //     error: an outlier of 1e8 among unit-variance activations (k = 12) puts the fifth of that chunk's elements on a
 //     2.4e-4 grid, ~3e-5 of the output scale (the parity case "one outlier among ordinary").  Real activations
-//     exceed 65504 by a small factor, k stays 1..3 and nothing is lost that matters.  A chunk dominated by tiny values
-//     (rms below ~1e-4; the relative error then approaches 2^-25 / rms) belongs to the upstream route
-//     (STRATA_PREFILL_F16_GEMM=0).  Scaling UP by a power of two would remove that case at no cost in mantissa bits;
-//     it is not done, so that k = 0 keeps meaning "the same inputs as the bf16 route".
+//     exceed 65504 by a small factor, k stays 1..3 and nothing is lost that matters.
 //
 // WHERE THE FP16 COPIES LIVE: IN THE GEMM SCRATCH, so the route costs no VRAM and cannot fail to allocate.  The
 // scratch is this object's own temporary - `native` dequantizes into it and consumes it before returning, and in
@@ -100,8 +106,9 @@ void note(cublasStatus_t s, const char* what) {
 // in the stretch of it that this call's X, W and Y do not occupy (a caller may well have dequantized the W of this
 // very call into the scratch, and a W used by two calls must survive the first: nothing is converted IN PLACE, a
 // caller's operand is never written).  The engine's scratch is 64 MiB: the X of a 8192-token chunk (K = 2560) is
-// 40 MiB and the largest resident W 12.5 MiB, so those run as one GEMM; K = 10240 (the hyper-connection) fits 3276
-// rows, and the X / W rows are cut into T / N chunks - never K, a K split would need beta = 1 passes and would write
+// 40 MiB, and with most weights (a few MiB) that runs as one GEMM; the PLE key projection (10240 x 2560, 50 MiB) runs
+// as 4 tiles at T = 8192 (its X converted twice), and K = 10240 (the hyper-connection) fits 3276 rows.  The X / W
+// rows are cut into T / N chunks - never K, a K split would need beta = 1 passes and would write
 // every Y element twice.  Each chunk pair is one GEMM into its own sub-block of Y (Y + t0 * ldy + n0, row stride
 // ldy), so every Y element is written by exactly one call and beta means what it meant: beta = 0 never reads Y,
 // beta = 1 adds.  The 64-row rounding of a chunk keeps the sub-blocks' addresses 256-byte aligned.  If the stretch
@@ -111,16 +118,20 @@ void note(cublasStatus_t s, const char* what) {
 // ORDER: everything is on stream_, behind whatever wrote the operands and in front of whatever reads Y or reuses the
 // scratch (`native`'s next dequantization), which is all the scratch needs.
 //
-// WHICH CALLS.  STRATA_PREFILL_F16_GEMM (once): unset / `auto` - this route when the CURRENT device has FP16 tensor
-// cores and no BF16 ones, 7.0 <= cc < 8.0 (a layer split can mix GPUs, so it is decided per call; cc and SM count
-// are cached per ordinal; before Volta there are no tensor cores to gain, and a GeForce Pascal runs FP16 at 1/64 of
-// its FP32 rate), `0` - the upstream call always, `1` - this route on any architecture (to test it on a newer card).
+// WHICH CALLS.  STRATA_PREFILL_F16_GEMM (once): unset / `auto` - this route when the CURRENT device is a Volta,
+// 7.0 <= cc < 7.5 (a layer split can mix GPUs, so it is decided per call; cc and SM count are cached per ordinal),
+// `0` - the upstream call always, `1` - this route on any architecture.  Turing (7.5) has FP16 tensor cores and no
+// BF16 ones too and would gain the same way, but upstream supports it and its numerics stay upstream's unless asked:
+// an RTX 20 user opts in with `1`.  Before Volta there are no tensor cores to gain (and a GeForce Pascal runs FP16 at
+// 1/64 of its FP32 rate).
 // Not worth the conversion, so left to the bf16 call: T < 64, N < 64 or T * N * K < 2^29.  The conversion moves ~6
 // bytes per element of X and of W (the maximum pass reads 2, the conversion reads 2 and writes 2) and costs ~7 launches
 // (~30 us); what it buys is 2 T N K (1/11e12 - 1/90e12) s = 1.6e-13 T N K s at V100 rates.  The two are equal near
 // min(T, N) ~ 50 and the fixed cost is repaid from T N K ~ 2e8 (2^29 leaves a margin), so below those the bf16 call
 // is as fast.  That keeps the N = 1 router gate, the 4-wide injection and the 48-wide GDN gates (all bandwidth-bound
-// reads of X) and every draft-layer call (T <= 32) exactly as upstream.
+// reads of X) exactly as upstream.  Decode and verify calls (T <= 32) never take the route; the draft layer's KV
+// pass (`Prefill::draft_kv`, batches of >= 64 rows) does take it for its hyper-connection projections once its batch
+// is large enough (T * N * K >= 2^29), like any prompt call.
 //
 // TENSOR CORES.  `CUBLAS_GEMM_DEFAULT` is the call: the handle is in CUBLAS_DEFAULT_MATH (init), and with FP16 inputs
 // and CUBLAS_COMPUTE_32F cuBLAS >= 11 selects tensor-core kernels by itself - which is what `Gemm::f16`, the expert
@@ -136,7 +147,8 @@ constexpr int kF16Threads = 256;
 constexpr int64_t kF16StateBytes = 256;           // the device scalars at the head of the stretch
 enum : int { kStMaxX = 0, kStMaxW = 1, kStAlpha = 2, kStBeta = 3 };   // their uint32 words
 constexpr uint32_t kBf16InfBits = 0x7F80u;        // |bf16| from this value up is Inf or NaN
-constexpr uint32_t kBf16E2p14 = 141u;             // the biased exponent of 2^14: a scaled chunk's maximum stays below 2^15
+constexpr int kBf16E2p14 = 141;                   // the biased exponent of 2^14: a scaled chunk's maximum is in [2^14, 2^15)
+constexpr int kMinK = -63;                        // the largest scaling UP: k_x + k_w >= -126 keeps alpha a normal float
 
 // the magnitude bits of a bf16, 0 for an Inf or a NaN (which do not take part in choosing the scale)
 __host__ __device__ __forceinline__ uint32_t finite_mag(uint32_t b) {
@@ -147,10 +159,12 @@ __host__ __device__ __forceinline__ uint32_t finite_mag2(uint32_t w) {
     const uint32_t lo = finite_mag(w & 0xFFFFu), hi = finite_mag(w >> 16);
     return lo > hi ? lo : hi;
 }
-// k of a chunk whose largest finite magnitude has these bits: the smallest k >= 0 with max * 2^-k < 2^15
-__host__ __device__ __forceinline__ uint32_t scale_k(uint32_t max_bits) {
-    const uint32_t e = max_bits >> 7;
-    return e > kBf16E2p14 ? e - kBf16E2p14 : 0u;
+// k of a chunk whose largest finite magnitude has these bits: max * 2^-k in [2^14, 2^15), at least kMinK; 0 when the
+// chunk has no normal nonzero value (zeros and bf16 subnormals convert to zero whatever k is)
+__host__ __device__ __forceinline__ int scale_k(uint32_t max_bits) {
+    const int e = (int) (max_bits >> 7);
+    if (e == 0) return 0;
+    return e - kBf16E2p14 < kMinK ? kMinK : e - kBf16E2p14;
 }
 
 // max over the finite |values| of count bf16 starting at p (any 2-byte alignment): 16-byte loads over the aligned
@@ -185,7 +199,7 @@ __global__ void __launch_bounds__(kF16Threads) bf16_absmax_kernel(const uint16_t
     }
 }
 
-// bf16 bits -> the fp16 bits of x * 2^-k, round-to-nearest-even, in integers: the exponent field moves by 112 + k
+// bf16 bits -> the fp16 bits of x * 2^-k (k signed), round-to-nearest-even, in integers: the exponent field moves by 112 + k
 // (bf16 bias 127, fp16 bias 15) and the 7 mantissa bits go to the top of the 10, so a value that stays in fp16's
 // normal range is converted exactly and with no arithmetic at all; below it the implicit 1 is restored and shifted into
 // the 2^-24 grid (subnormal, rounded to nearest even, the carry into the smallest normal falls out of the add), and
@@ -193,16 +207,16 @@ __global__ void __launch_bounds__(kF16Threads) bf16_absmax_kernel(const uint16_t
 // conversion the route's correctness rests on, and f16_bits.hpp records that `__float2half` + `__half_as_ushort` once
 // produced wrong bits in this tree (0x2600 for 0x26DB).  Being plain integer code it also runs on the host, which is
 // how it was checked against numpy's float16 over every bf16 pattern and every k.  Inf and NaN stay Inf and NaN.
-__host__ __device__ __forceinline__ uint32_t bf16_to_f16_bits(uint32_t b, uint32_t k) {
-    const uint32_t E = (b >> 7) & 0xFFu;
-    const uint32_t e = E - k - 112u;                           // the fp16 biased exponent of x * 2^-k (wraps when < 0)
-    if (e - 1u < 30u && E != 0xFFu)                            // e in 1..30, and not an Inf / NaN: the common case, exact
-        return (b & 0x8000u) | (e << 10) | ((b & 0x7Fu) << 3);
+__host__ __device__ __forceinline__ uint32_t bf16_to_f16_bits(uint32_t b, int k) {
+    const int E = (int) ((b >> 7) & 0xFFu);
+    const int e = E - k - 112;                                 // the fp16 biased exponent of x * 2^-k
+    if ((unsigned) (e - 1) < 30u && E != 0xFF)                 // e in 1..30, and not an Inf / NaN: the common case, exact
+        return (b & 0x8000u) | ((uint32_t) e << 10) | ((b & 0x7Fu) << 3);
     const uint32_t sign = b & 0x8000u, m = b & 0x7Fu;
-    if (E == 0xFFu) return sign | (m ? 0x7E00u : 0x7C00u);
-    if (E == 0u) return sign;                                  // bf16 zero or subnormal (< 2^-126): zero in fp16
-    if ((int) e >= 31) return sign | 0x7C00u;                  // unreachable for a value <= its chunk's maximum
-    const int sh = -((int) e + 2);                             // subnormal: q = (128 + m) * 2^(e + 2), rounded
+    if (E == 0xFF) return sign | (m ? 0x7E00u : 0x7C00u);
+    if (E == 0) return sign;                                   // bf16 zero or subnormal (< 2^-126): zero in fp16
+    if (e >= 31) return sign | 0x7C00u;                        // unreachable for a value <= its chunk's maximum
+    const int sh = -(e + 2);                                   // subnormal: q = (128 + m) * 2^(e + 2), rounded
     const uint32_t mant = 128u | m;
     if (sh <= 0) return sign | (mant << (uint32_t) (-sh));     // e = 0, -1, -2: exact
     if (sh > 8) return sign;                                   // below half the smallest subnormal
@@ -212,7 +226,7 @@ __host__ __device__ __forceinline__ uint32_t bf16_to_f16_bits(uint32_t b, uint32
     return sign | q;
 }
 // two bf16 (the halves of w) -> two fp16 in one word
-__device__ __forceinline__ uint32_t bf16x2_to_f16x2(uint32_t w, uint32_t k) {
+__device__ __forceinline__ uint32_t bf16x2_to_f16x2(uint32_t w, int k) {
     return bf16_to_f16_bits(w & 0xFFFFu, k) | (bf16_to_f16_bits(w >> 16, k) << 16);
 }
 
@@ -220,7 +234,7 @@ __device__ __forceinline__ uint32_t bf16x2_to_f16x2(uint32_t w, uint32_t k) {
 // groups, converted 16 bytes to 16 bytes, coalesced, no index arithmetic beyond the grid-stride
 __global__ void __launch_bounds__(kF16Threads) bf16_to_f16_flat_kernel(const uint4* __restrict__ in, uint4* __restrict__ out,
                                                                        int64_t n8, const uint32_t* __restrict__ slot) {
-    const uint32_t k = scale_k(__ldg(slot));
+    const int k = scale_k(__ldg(slot));
     const int64_t stride = (int64_t) gridDim.x * kF16Threads;
     for (int64_t i = (int64_t) blockIdx.x * kF16Threads + threadIdx.x; i < n8; i += stride) {
         const uint4 q = in[i];
@@ -234,7 +248,7 @@ __global__ void __launch_bounds__(kF16Threads) bf16_to_f16_flat_kernel(const uin
 __global__ void __launch_bounds__(kF16Threads) bf16_to_f16_rows_kernel(const uint16_t* __restrict__ in,
                                                                        uint16_t* __restrict__ out, int64_t rows, int64_t K,
                                                                        int64_t Kp, const uint32_t* __restrict__ slot) {
-    const uint32_t k = scale_k(__ldg(slot));
+    const int k = scale_k(__ldg(slot));
     for (int64_t r = blockIdx.x; r < rows; r += gridDim.x) {
         const uint16_t* src = in + r * K;
         uint16_t* dst = out + r * Kp;
@@ -242,10 +256,11 @@ __global__ void __launch_bounds__(kF16Threads) bf16_to_f16_rows_kernel(const uin
     }
 }
 // alpha = 2^(k_x + k_w), beta as given: the GEMM's scalars, from the two maxima (a launch argument is captured with
-// the launch, so this stays right in a graph)
+// the launch, so this stays right in a graph).  k_x + k_w >= 2 kMinK = -126; the clamp at 127 is the one inexact case
+// (the long comment above)
 __global__ void f16_scale_kernel(uint32_t* st, float beta) {
-    const uint32_t k = min(scale_k(st[kStMaxX]) + scale_k(st[kStMaxW]), 127u);
-    st[kStAlpha] = (127u + k) << 23;
+    const int k = min(scale_k(st[kStMaxX]) + scale_k(st[kStMaxW]), 127);
+    st[kStAlpha] = (uint32_t) (127 + k) << 23;
     st[kStBeta] = __float_as_uint(beta);
 }
 
@@ -685,9 +700,9 @@ bool Gemm::bf16_via_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t 
     if (mode == kRouteOff) return false;
     int cc = 0, sms = 0;
     if (!f16_device(cc, sms)) return false;
-    // auto: FP16 tensor cores without BF16 ones - Volta and Turing.  Before Volta there are no tensor cores to gain
-    // (and a GeForce Pascal runs FP16 at 1/64 of its FP32 rate), so there the bf16 call stays; `1` forces the route.
-    if (mode == kRouteAuto && (cc < 70 || cc >= 80)) return false;
+    // auto: Volta only (7.0, 7.2).  Turing would gain too but keeps upstream's numerics unless asked; before Volta
+    // there are no tensor cores to gain.  `1` forces the route anywhere.
+    if (mode == kRouteAuto && (cc < 70 || cc >= 75)) return false;
     // cublasGemmEx takes int sizes; ldy < N is the caller's error, which the bf16 call reports as before
     if (K < 1 || K > INT_MAX - 8 || N > INT_MAX || T > INT_MAX || ldy > INT_MAX || ldy < N) return false;
     // too small to repay the conversion (see "WHICH CALLS" above); the N = 1 router gate is one of these

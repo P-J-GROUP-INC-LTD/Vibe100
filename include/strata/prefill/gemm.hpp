@@ -5,13 +5,14 @@
 // their native GGUF blocks into a reusable scratch (`dequant_bf16`) right before the product - and activations are
 // rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.
 //
-// VOLTA / TURING (the Vibe100 port): those have FP16 tensor cores and no BF16 ones, so a `CUDA_R_16BF` cuBLAS call
-// runs on the CUDA cores (~8x below the HMMA peak on a V100).  On such a device (7.0 <= cc < 8.0) `bf16`
-// therefore converts its operands to FP16 on the device - exactly, with a per-chunk power-of-two scale chosen on the
-// device so that no value can overflow FP16 - and runs the FP16 tensor-core GEMM with FP32 accumulation.  The FP16
-// copies live in the part of the dequantization scratch the call's own operands do not occupy, so the route costs no
-// VRAM, allocates nothing (it cannot run out of memory) and never waits on the host.  See the long comment in gemm.cu.  Ampere and newer
-// (and the HIP build) keep the upstream bf16 call, bit for bit.
+// VOLTA (the Vibe100 port): it has FP16 tensor cores and no BF16 ones, so a `CUDA_R_16BF` cuBLAS call runs on the
+// CUDA cores (~8x below the HMMA peak on a V100).  On a Volta (7.0 <= cc < 7.5) `bf16` therefore converts its
+// operands to FP16 on the device - exactly, with a per-chunk power-of-two scale chosen on the device so that no value
+// can overflow FP16 and small values are not lost to FP16's subnormal range - and runs the FP16 tensor-core GEMM with
+// FP32 accumulation.  The FP16 copies live in the part of the dequantization scratch the call's own operands do not
+// occupy, so the route costs no VRAM, allocates nothing (it cannot run out of memory) and never waits on the host.
+// See the long comment in gemm.cu.  Turing (which would gain the same way: opt in with STRATA_PREFILL_F16_GEMM=1),
+// Ampere and newer, and the HIP build keep the upstream bf16 call, bit for bit.
 #pragma once
 
 #include <cstddef>
@@ -40,7 +41,7 @@ public:
               float beta = 0.0f);
 
     /// Which route `bf16` takes on this object.  -1 (the default): the process-wide STRATA_PREFILL_F16_GEMM, read once -
-    /// unset or `auto`: the FP16 tensor-core route when the CURRENT device is Volta or Turing (7.0 <= cc < 8.0), `0`: the
+    /// unset or `auto`: the FP16 tensor-core route when the CURRENT device is a Volta (7.0 <= cc < 7.5), `0`: the
     /// upstream cuBLAS bf16 call everywhere, `1`: the FP16 route on every architecture.  0 / 1 here: the same, for
     /// this object only (they win over the variable).  2: the FP16 route for every shape, including the small ones
     /// (T or N below 64, or too little work to repay the conversion) that 1 and `auto` leave to cuBLAS bf16 - for
