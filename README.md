@@ -1,283 +1,212 @@
-<h1 align="center">Strata</h1>
+# Vibe100
 
-<p align="center"><b>Run a 125-billion-parameter AI model on a normal gaming PC</b><br>
-one NVIDIA card (12-24 GB) + 64 GB of RAM · Windows or Linux · one click to install</p>
+**[Strata](https://github.com/Niko1221/Strata) ported to the NVIDIA V100 (Volta), plus the start of a DeepSeek-V4.1-Flash
+port, for a dual-Xeon V100 workstation.**
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+> **Credit first.** Vibe100 is a port of **Strata** by Niko1221 and the Strata contributors (MIT). The engine design - the
+> expert cache on the GPU, the CPU computing the experts the GPU does not hold, speculative decoding, the pack format, the
+> server and web app - is theirs. This repository's first commit, `3906943`, is a byte-for-byte snapshot of Strata
+> 0.1.31 (upstream commit `9259cad`, see [UPSTREAM.md](UPSTREAM.md)); everything after it is the port, and
+> `git diff 3906943` shows exactly what changed. Upstream's own README, install guide and user manual are kept in full in
+> [docs/STRATA_README.md](docs/STRATA_README.md).
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** - a large, smart AI model that
-normally needs a server - on your own PC. It writes its answers at **60-95 tokens per second** (a token is about ¾
-of a word): faster than you can read.
+> **Status: nothing has run on a V100 yet.** The code was compiled for sm_70 with CUDA 12.8 and its machine code
+> inspected; the CPU code was tested on a Cascade-Lake-class VM; GPU kernel logic was checked by running the kernel
+> sources on the CPU. Correctness, parity and speed have to be established on the owner's box (below). Every speed
+> figure in this repository's docs is an estimate unless it says "measured".
 
-- **Free and open source.**
+## What this is
 
-> **Jump to:** [How fast?](#how-fast-is-it) · [Which model?](#which-model-should-i-pick) · [Install](#install) ·
-> [Using it](#using-it) · [Problems?](#something-went-wrong) · [How it works](#how-does-it-work) ·
-> [All the details](docs/DETAILS.md)
+Strata runs Qwen3.8-Flash-Next, a ~125B-parameter mixture-of-experts model, on one consumer GPU plus system RAM: the GPU
+holds the dense layers and a cache of the most-used experts, RAM holds every expert, and the CPU computes the experts the
+GPU does not hold while the GPU works on the others. Upstream supports NVIDIA RTX 20 to 50 (and AMD on Linux).
 
----
+The target here is a Dell Precision 7920: two Xeon Gold 6226 (Cascade Lake), 384 GiB DDR4-2666, one V100 32 GB. Four things
+in upstream did not fit that box, and this port changes them:
 
-## How fast is it?
+1. The ready-made engine is built with CUDA 13, which dropped Volta; the installer could not target sm_70; and upstream's
+   experimental sm_70 build would launch a prompt-attention kernel whose sm_70 body is a trap (seen in the machine code).
+2. Upstream's AVX-512 expert kernels required AVX-512 VBMI, which Cascade Lake lacks.
+3. The CPU expert arena was not NUMA-aware, on a two-socket machine.
+4. A DeepSeek-V4.1-Flash port is planned for the same box; its first, hardware-independent part is here.
 
-Measured on an RTX 5070 (12 GB), a Ryzen 5 7600 and 64 GB of RAM:
+## Status by work package
 
-| Size | Writes answers (short chat) | Writes answers (128K context) | Reads your prompt |
-| --- | ---: | ---: | ---: |
-| **Q2_0** | 93 tokens/s | 74 tokens/s | 2,170 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 63 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 49 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 46 tokens/s | 1,620 tokens/s |
-| **Coder** (IQ1_M) | 55 tokens/s | 43 tokens/s | 2,180 tokens/s |
+| WP | What it does | Commit | Verified without a V100 | Still to run on the hardware |
+|---|---|---|---|---|
+| **A** platform | sm_70 is a supported CMake / installer / Docker target. A V100 compiles its engine with a CUDA 12.x toolkit (installs 12.8 if missing), needs driver 570+, is refused beside an RTX 50. The device check admits cc 7.0 and says so when the binary has no code for the card | `b529651` | built for sm_70 with CUDA 12.8; `tools/test_setup_volta.py` (39 checks, no GPU, re-run for this page: pass) | `./setup.sh` end to end; `build/strata-device --selftest`. Windows and Docker paths never run |
+| **B** audit and harness | `tools/volta`: SASS gate, dispatch audit, parity runner, golden-logits comparison, decode profiler | `04a9333` | SASS gate passed on the integrated sm_70 build (0 unexplained traps; the three Volta kernels have 512 HMMA each); 74 unit tests (re-run: pass) | the tools themselves, on the V100 |
+| **C** prefill GEMM | dense bf16 projections of the prompt path run on FP16 tensor cores (exact conversion, power-of-two scaling, FP32 accumulate) | `2a6b6ff` | compiled for sm_70, no spills, no traps | `gemm_volta_parity` (error vs FP64, TFLOPS) |
+| **D** prompt attention | fixes the sm_70 trap-kernel dispatch; new WMMA prompt-attention kernel for KV modes fp16 / int8 / K8V4 | `bf08826` | compiled for sm_70 (512 HMMA per kernel, 245-248 registers, no spills); logic checked on the CPU (kernel source emulated, ThreadSanitizer) | `qsa_prompt_attn_parity` (32K, 1500 and the 2100/256 edge) |
+| **E** CPU kernels | AVX-512 expert kernels on CPUs with VNNI but no VBMI (second build of `expert.cpp`, chosen at run time); canonical Q2_0 pack offered on Cascade Lake | `4e04395` | no-VBMI unpack proven bit-identical (exhaustive over 2^32 inputs); a ctest greps the objects for VBMI instructions; 10/10 CPU tests on a Cascade-Lake-class VM | speed on the Xeon; the `STRATA_IQ512` A/B |
+| **F** NUMA mirror | one copy of the expert arena per NUMA node; each CPU worker reads its own node's copy; the GPU reads the copy on its node | `f1fac23` | faked 2-node topology: mirrored = single copy bit for bit in every pool mode; a poison test shows each worker reads its own copy; 32/32 non-GPU tests, SASS gate pass | a real two-socket box: placement, `mbind` allowed, replica pages on their node, the A/B speed |
+| **DS-0** foundations | shared geometry header, contracts, per-package CMake hook | `d9721e8` | - | - |
+| **DS-A** oracle | NumPy forward of DeepSeek-V4.1-Flash, validated against DeepSeek's official reference on CPU | `d37b3d5` | 102 tests (per the commit; the tests need torch, not re-run here) | real weights, layer by layer |
+| **DS-B** GGUF tooling | validates the mxxm-t MXFP4 GGUF, manifest, memory plan, expert extraction, mini-GGUF fixture | `7cda903` | 99 tests (re-run: pass, 7 skipped without a ggml source) on saved headers and the mini file | `manifest.py` on the real shards |
+| **DS-C** CPU experts | MXFP4 expert kernels: scalar, AVX2, AVX-512 VNNI (no VBMI) | `86ad959` | 81,000 checks against an FP64 contract and ggml's own MXFP4; ASan / UBSan / TSan clean | the benchmark on the Xeon |
+| **DS-D** V100 experts | router, hit/miss split and MXFP4 hot-expert kernels for sm_70 | `7f8158b` | 16 kernels, no spills or traps; same source run on the CPU through an emulator, 162 checks | `ds41_{router,split,expert}_parity` on the V100 |
 
-- **Writes answers** = how fast the reply appears (tokens per second).
-- **Reads your prompt** = how fast it takes in what you send (long documents, code, chat history), measured on a
-  32K-token prompt; a 4K prompt reads at 910-1,580 tokens/s. A 32K prompt takes about 15 seconds with Q2_0.
+Plans and notes (no code): [docs/volta/PLAN.md](docs/volta/PLAN.md), [docs/deepseek/PLAN.md](docs/deepseek/PLAN.md),
+[docs/USAGE_LEDGER.md](docs/USAGE_LEDGER.md) (a design for placing experts from weeks of use; nothing implements it),
+[docs/volta/NINFER_STUDY.md](docs/volta/NINFER_STUDY.md).
 
-A card with more VRAM is faster, because more of the model fits on the GPU: an RTX 3090 (24 GB) should do roughly
-100-140 tokens per second. All measurements, long-context numbers and estimates for other cards are in the
-[details](docs/DETAILS.md#speed-measured).
+## Same as upstream, and different
 
-Every PC is different: `START-HERE.bat --calibrate` measures a few engine settings on yours and keeps the fastest
-(about 5-10 minutes; on the PC above it made the Coder 7% faster).
+**Unchanged:** the model and its packs, the server, web app and API, speculative decoding, the expert cache with its
+adaptive swaps and profiles, the decode kernels (integer dot products and FP32/FP16 math, which Volta has), ggml's MMQ
+for the prompt's expert GEMMs (on a V100 the CUDA-core int8 path; [dispatch_audit.md](tools/volta/dispatch_audit.md)
+R12b suggests an A/B with `STRATA_PREFILL_MMQ=0`), multi-GPU layer split, AMD HIP, the low-RAM modes, and everything for RTX cards: the
+prebuilt engine, CUDA 13.0, driver 580. The Ampere and Turing paths behave as before (WP-D: the sm_75 to sm_120
+prompt-attention machine code is unchanged; the FP16 GEMM route below is Volta-only by default).
 
-Measured Strata on your own PC? See [Community benchmark results](docs/COMMUNITY_BENCHMARKS.md)
-for a report template and how to share your results in a pull request.
+| | Upstream Strata 0.1.31 | Vibe100 |
+|---|---|---|
+| GPUs | RTX 20 to 50; AMD (Linux, experimental); Pascal only with a community flag | adds **V100 / Titan V (sm_70)**. Pascal is still `-DSTRATA_EXPERIMENTAL_SM60=ON` only |
+| CUDA, driver | prebuilt engine, CUDA 13.0, driver 580+ | RTX unchanged. A V100 compiles locally with CUDA 12.x (12.8 checked), driver 570+; per [VOLTA.md](docs/volta/VOLTA.md) R580 is the last branch with Volta. CMake refuses a CUDA 13 compiler for sm_70 with the reason |
+| Several GPUs | RTX cards share one engine | a V100 can share one with RTX 20/30/40; **not** with an RTX 50 (CUDA 12 vs 13): the setup refuses |
+| Prompt attention on sm_70 | dispatcher keyed on `cc_major` alone, so a V100 launched a trap kernel | keyed on `major*10+minor`; new `prompt_attn_volta_kernel` (WMMA m16n16k16, fp16 in, fp32 accumulate); a 4-bit KV cache still takes the FP32 kernel on every card |
+| Prefill dense GEMMs | cuBLAS bf16 (CUDA cores below sm_80) | FP16 tensor-core route on Volta (7.0 <= cc < 7.5); RTX 20 keeps upstream's call unless `STRATA_PREFILL_F16_GEMM=1`; small shapes keep upstream's call everywhere; `=0` restores it |
+| Long-context block scoring | tensor-core kernel on sm_80+ | unchanged: the FP32 warp kernel on Volta (correct, slower; optimise only if the profile says so) |
+| CPU expert kernels | AVX-512 needed VBMI (Ice Lake / Zen 4 and newer), else AVX2 | tiers `Avx512Vbmi` / `Avx512Vnni` / `Avx2`; needs F/BW/VL/DQ/VNNI; Cascade Lake runs the no-VBMI build. i-quant AVX-512 rows stay off by default on the VNNI tier except IQ2_S (measured slower there) |
+| NUMA | none: workers pinned to cores, arena placed by first touch | `--numa auto` mirrors the arena per node (Linux, 2+ nodes, full-RAM arena, room on every node) |
+| Installer | prebuilt engine, CUDA 13.0 | a V100 never gets the prebuilt engine; Ubuntu 22.04/24.04 `cuda-toolkit-12-8` or `winget` 12.8 after asking; `--numa auto\|mirror\|off`; AVX-512 test without VBMI so Cascade Lake is offered the canonical Q2_0 pack; Docker `BASE_IMAGE` build argument |
+| Tools | upstream's | `tools/volta`, `tools/ds41`, `ref/ds41`, `tools/test_setup_volta.py` |
+| Models | Qwen3.8-Flash-Next | the same, plus the start of DeepSeek-V4.1-Flash (no end-to-end engine) |
 
-**Two or three NVIDIA cards?** Just run `START-HERE.bat`: it lists your cards, says which ones Strata can use, and
-asks whether to share the model across them (recommended when two can). An install made on one card asks once at
-its next start. Or choose yourself: `START-HERE.bat --gpus 0,2` (both, remembered), `--gpus all`, or `--gpu 0` (one
-card, this start only). Each card keeps the experts of its own layers, and prompts flow through the cards in a
-pipeline: on an RTX 5080 + RTX 3090 prompts were read 18-20% faster than on the 5080 alone, decoding on par.
-Every card must be an RTX 20 series or newer (or a V100, which cannot share a model with an RTX 50) with 8 GB or more.
-See [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
+### New run-time switches
 
-## Which model should I pick?
+Environment variables unless noted; defaults checked in the source.
 
-**The size** (the same model, compressed more or less):
+| Switch | Default | Effect |
+|---|---|---|
+| `STRATA_VOLTA_ATTN` | unset = on | cc 7.0 / 7.2: the WMMA prompt attention. `0`: the FP32 kernel (the reference for the checks). `2` / `force` (code only): the WMMA kernel on any sm_70+ card |
+| `STRATA_PREFILL_F16_GEMM` | `auto` | `auto`: the FP16 tensor-core route on Volta (7.0 <= cc < 7.5). `0`: upstream's bf16 cuBLAS call. `1`: the FP16 route on any card (how an RTX 20 opts in) |
+| `--numa auto\|mirror\|off` (engine and `setup.py`) | `auto` | `mirror` asks for it (the engine still says why when it cannot); `off` keeps one copy |
+| `STRATA_NUMA_MIRROR` | unset | `0` / `1` overrides `--numa` for one run: the A/B switch |
+| `STRATA_NUMA_GPU_NODE` | unset (read from sysfs; if the BIOS gives none the first node is assumed, and the log says so) | `N` names the GPU's NUMA node |
+| `STRATA_NUMA_HEADROOM_GIB` | 6 | free memory each node must keep beyond its arena copy, or the engine keeps one copy |
+| `STRATA_FORCE_AVX512_NOVBMI` | unset | `1` runs the no-VBMI build on a CPU that has VBMI, to compare the two |
+| `STRATA_IQ512` | unset | when set (the code tests only that it is set), the AVX-512 i-quant rows are used for every format on any AVX-512 CPU |
 
-| Model | RAM+VRAM Requirements | Speed | Quality |
-| --- | ---: | --- | --- |
-| **Q2_0** | 37.6 GB | fastest | good |
-| **IQ2_XS** | 39.2 GB | fast | better (**recommended**) |
-| **IQ3_XXS** | 47.0 GB | slower | great |
-| **IQ3_S** | 54.8 GB | slowest | best: matches the full model on the published tests (original model only) |
+## Quick start on a V100 box
 
-**Will it fit?** Shard 1 is the part of the model that gets loaded when it starts: its experts go into your **RAM**,
-the rest onto your graphics card (the second shard, a 29 GB lookup table, stays on the SSD). So it fits when your
-**RAM is at least shard 1 + about 10 GB** for Windows and your other programs. With 64 GB of RAM every size fits
-(IQ3_S with little else open); with 48 GB, Q2_0 and IQ2_XS. A bigger graphics card makes it faster, but it doesn't
-lower the RAM needed.
+Details, the A/B for each switch and the known limits: [docs/volta/VOLTA.md](docs/volta/VOLTA.md).
 
-**The version:**
+**1. Check the card.** `nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv` must say **7.0** and a
+driver of **570 or newer** (VOLTA.md: not past the 580 series, the last branch that lists Volta).
 
-- **Qwen3.8-Flash-Next** - the original.
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)** - ISTA-DASLab's coding
-  version: half of the experts removed, keeping the ones that code, tool use and images need (91% of the full model's
-  SWE-bench Verified score, 99% of LiveCodeBench, by its authors). One size (IQ1_M: its experts stored like IQ3_S):
-  shard 1 is **29.6 GB**, so it fits a PC with **32 GB of RAM**, runs 262K context on 64 GB, and reads long prompts
-  the fastest of all. Weaker outside coding.
-- **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)** - a fine-tune by UkisAI
-  that thinks much shorter before answering, so you get the answer sooner, with about the same quality. Same speed per
-  token, and about the same RAM as the same size of the original (no IQ3_S). Its own license applies (see its page).
+**2. BIOS (Dell Precision 7920 and similar).** Node Interleaving: Disabled; Sub-NUMA Clustering: Disabled; System Profile:
+Performance. With interleaving on, Linux sees one node and neither the mirror nor the DeepSeek per-socket split can work.
 
-Not sure? Take **IQ2_XS** - or the **Coder** if you mainly write code, or have 32-48 GB of RAM. You can add another
-one later with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux `./setup.sh --setup`).
+**3. Install.** `./setup.sh` (Linux; `START-HERE.bat` on Windows is untested). It skips the prebuilt engine, finds or installs
+CUDA 12.x (asks before installing 12.8), compiles the engine for sm_70 (10-20 minutes, once; VOLTA.md's figure), then
+downloads and prepares the model like for any card. `./setup.sh --check` only checks card, driver and RAM and says
+whether a CUDA 12 toolkit was found. CUDA 12.8 is the version the port was compiled with; not 13.
 
-For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](docs/ORCA.md).
-It needs an explicit packing conversion and is not an installer menu option.
+**4. Verify, in this order** (the plan's phases, [docs/volta/PLAN.md](docs/volta/PLAN.md) section 3):
 
-An **AMD Radeon RX 7900 XT / XTX, RX 9070 / 9070 XT or Radeon AI PRO R9700 on Linux** works too (experimental; the
-RX 7800 XT / 7700 XT and RX 9060 XT were validated by their owners):
-`./setup.sh --backend hip`, chosen by itself on a PC with no NVIDIA card Strata can use. It installs ROCm without sudo
-and compiles the engine (no images yet; several cards with `--gpus`). Details: [AMD HIP](docs/AMD_HIP.md).
+| Phase | Tool | Gate |
+|---|---|---|
+| 0 profile one decode step on this card | `tools/volta/profile_decode.sh --config strata-<model>.json` (+ `summarize_profile.py`; `--strict` stops unless cc is 7.0) | **Gate 0:** the numbers come from a V100 (a P4000 baseline says nothing) |
+| 1 build for sm_70 and run every GPU parity program | `tools/volta/run_parity.sh` (`--require-v100`, `--skip-build`) | all pass |
+| 2 correctness: Volta paths vs FP32 reference paths on the same card | `python3 tools/volta/golden_compare.py --engine-config strata-<model>.json --prompt-name long --tail 512` | top-1 >= 99%, perplexity within 1-2% (the tool's default threshold is 2%), no NaN/inf |
+| 3 tuning, data-driven from phase 0 | `./setup.sh --calibrate`, `--stats`, `--pcie-frac` | **Gate 1:** IQ3 decode >= 40 tok/s on one V100 and phase 2 passing; if not, stop and reassess Volta before any DeepSeek engine work |
 
-**NVIDIA V100 / Titan V (Volta, 16 or 32 GB)** is supported by this port: `./setup.sh` (`START-HERE.bat`) compiles
-the engine for it with CUDA 12.8 - the ready-made engine is built with CUDA 13, which dropped Volta - and installs
-that toolkit if it is missing (driver 570 up to the 580 branch). Nothing has been measured on a V100 yet. How to
-install it by hand or in Docker, the two run-time switches (`STRATA_VOLTA_ATTN`, `STRATA_PREFILL_F16_GEMM`), the
-verification tools and the known limits: [docs/volta/VOLTA.md](docs/volta/VOLTA.md).
+Each tool explains itself with `--help`. VOLTA.md lists the same tools as a checklist in a different order (card check,
+`build/strata-device --selftest`, parity, golden compare, profile). `tools/volta/sass_audit.py` gates a build's sm_70
+machine code; `tools/volta/compile_one.py` compiles one file for sm_70.
 
-## Install
+**5. NUMA A/B.** The startup log's `NUMA:` lines say what the mirror did. Compare the default, `STRATA_NUMA_MIRROR=0`, and
+`STRATA_NUMA_MIRROR=0 numactl --interleave=all`; do not combine the mirror with `numactl --interleave`.
 
-**You need:** an NVIDIA RTX 20, 30, 40 or 50 card with 12 GB of VRAM or more (RTX 20 since 0.1.27; a V100 / Titan V works
-too: [docs/volta/VOLTA.md](docs/volta/VOLTA.md)), enough RAM for the size you pick (above;
-a big GPU makes up for less RAM - the [low-RAM mode](docs/DETAILS.md)),
-~80 GB of free disk space (an SSD makes the first start much faster), and Windows 10/11 or Linux. The only thing you
-install yourself is a current **NVIDIA driver** ([nvidia.com/drivers](https://www.nvidia.com/drivers) or the NVIDIA
-App). Everything else - Python, the engine, the model - is set up for you.
+## Expected performance
 
-**Windows**
+None of these is a measurement on a V100 by this port.
 
-1. [Download this project](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-2. Double-click **`START-HERE.bat`**.
-3. Answer a few questions - or just press Enter each time for the recommended choice:
-   - **Which model and size?** The original or Swift 1.5, and Q2_0, IQ2_XS, IQ3_XXS or IQ3_S - see [above](#which-model-should-i-pick)
-   - **How much context?** How much text it can keep in mind at once (it suggests one for your card). 384K and
-     512K (experimental) extend the model past its trained 262K by rope scaling - the setup turns it on itself (yarn and a
-     covering factor; `--rope-scaling`/`--rope-scale` override) ([details](docs/DETAILS.md))
-   - **Images?** Whether it should also read pictures
-   - **Experimental speed projection?** Off unless you say yes - [read what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first
+| Figure | What it is | Basis | Source |
+|---|---|---|---|
+| IQ3 decode >= 40 tok/s | the pass mark of Gate 1 | the owner's brief; "a target, not a prediction" | [volta/PLAN.md](docs/volta/PLAN.md) section 4 |
+| ~2x decode from the NUMA mirror | someone mirrored Qwen3.8-Flash-Next's experts on both sockets of this class of box | their report, in another engine; not this engine | [VOLTA.md](docs/volta/VOLTA.md) |
+| ~15 vs ~125 TFLOPS | bf16 GEMM on CUDA cores vs FP16 tensor cores, V100 (VOLTA.md: "about 8x") | quoted in the commit message, not measured; `gemm_volta_parity` prints the achieved figure | `2a6b6ff` |
+| 5.8-6.2 GB/s per thread vs 3.3 | canonical Q2_0 expert kernel, AVX-512 no-VBMI vs AVX2 rows | measured on a Cascade-Lake-class VM, indicative | `4e04395` |
+| ~60-90 tok/s ceiling for DeepSeek at 50% expert hit rate; "well under half of it in practice" | bandwidth budget: GPU ~900 GB/s, CPU ~200 GB/s NUMA-local | arithmetic from the model's sizes; "not a prediction" | [deepseek/PLAN.md](docs/deepseek/PLAN.md) section 2 |
+| 0.5-0.65 expert hit rate for ~26 experts per layer on a V100 32 GB | extrapolated from third-party hit-rate reports | "Measure." | [RESEARCH.md](docs/deepseek/RESEARCH.md) section 7 |
+| ~150 us per layer for 6 hit experts at T=1 | MXFP4 hot-expert kernels, bandwidth-bound | estimate in the commit message | `7f8158b` |
+| ~30 tok/s base, 45-123 with MTP on real text | other people's V100 runs of Qwen3.8-27B NVFP4 (ninfer forks), not Strata | the authors' own numbers | [NINFER_STUDY.md](docs/volta/NINFER_STUDY.md) |
 
-Then it downloads everything (the model is ~70 GB, so the first time takes a while - you can stop and it picks up
-where it left off) and **starts the model**. Your browser opens the Strata app at `http://127.0.0.1:8080`.
+Upstream's figures (for example 93 tokens/s on an RTX 5070) are RTX numbers and say nothing about a V100.
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time): Strata
-> loads 35-55 GB into your RAM and locks part of it for the graphics card. That's normal - wait, and don't close the
-> window. The window tells you what it is doing.
+## DeepSeek-V4.1-Flash (started: DS-0; the engine is not written)
 
-**Next time**, just double-click `START-HERE.bat` again: it starts right away, nothing is downloaded twice. Close its
-window to stop the model.
+DeepSeek-V4.1-Flash is a 40-layer MoE (384 routed experts per layer, 6 active, MQA attention with compressed sparse
+selection, Engram n-gram tables, 4-copy hyper-connections; MIT-licensed weights and code). The plan keeps Strata's idea:
+hot experts in V100 VRAM, the rest computed by the CPU from RAM, in the format DeepSeek released them, **MXFP4**
+(18,800,640 bytes per expert, GGML-compatible, no re-quantisation).
 
-**Updating:** download the new version and unzip it anywhere (or `git pull`), then run `START-HERE.bat` in it. The
-model files are kept in a `Strata-data` folder next to your Strata folder, so a new copy finds them and sets itself up
-the same way - nothing big is downloaded again.
+**Target file:** [mxxm-t/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/mxxm-t/DeepSeek-V4.1-Flash-GGUF) (MXFP4 experts, Q8_0
+attention, 12 shards + a DSpark sidecar). The vcruz305 Q2_K...Q8_0 GGUFs are refused by the tooling (experts not MXFP4).
 
-**Linux:** run `./setup.sh` - same questions, same result.
+**What exists (DS-0):** the contract ([CONTRACTS.md](docs/deepseek/CONTRACTS.md), `include/strata/ds41/geometry.hpp`);
+the NumPy oracle `ref/ds41`; GGUF tooling `tools/ds41` (manifest, expert layout, memory plan: on a V100 32 GB with 384 GiB it
+plans ~1,150 cached experts, 269 GiB of experts in RAM split across the sockets, ~96 GiB left for Engram's page cache;
+the reserves are the plan's numbers, not measurements); MXFP4 CPU kernels `src/ds41/cpu`; V100 router and expert kernels
+`src/ds41/cuda`. Nothing in `src/program`, `src/core`, `src/prefill`, `serve` or `setup.py` refers to it: the `strata` binary
+cannot run DeepSeek, and no DeepSeek tensor data has been read (only GGUF shard headers).
 
-**Docker (Linux):** the same idea, in a container.
+**Next ([PLAN.md](docs/deepseek/PLAN.md) section 4):** *DS-1*, one correct token (dense GEMVs, MQA decode, compressor /
+indexer, mHC, Engram, a decode loop, layer-by-layer comparison with the oracle on real weights; gate: top-1 >= 99% vs the
+reference over 500 tokens, no NaN/inf). *DS-2*, usable (prefill, Engram on SSD with prefetch, expert cache and adaptive
+swaps, server integration, the usage ledger; gate: a measured hit rate, and below ~40% reassess). *DS-3*, fast (routing
+traces, NUMA placement, DSpark drafting). The plan itself says DeepSeek tuning only makes sense after the Volta port
+passes Gate 1 on the card.
 
-1. Host: Docker with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-   and a driver **580 or newer** (CUDA 13.0).
-2. Build (this compiles the engine into the image, so the container never compiles):
-   `docker build -t strata .`
-   `docker build -t strata --build-arg CUDA_ARCHITECTURES=89 .` builds for one card only (faster).
-   The default covers RTX 30 (86), RTX 40 (89), RTX 50 (120) and A-series (80); a card outside that
-   set needs a rebuild with its own arch. Add `--build-arg BUILD_VISION=0` to skip the image encoder.
-   A V100 / Titan V needs a CUDA 12 base image (driver 570 or newer):
-   `docker build -t vibe100 --build-arg BASE_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04 --build-arg CUDA_ARCHITECTURES=70 .`
-   ([docs/volta/VOLTA.md](docs/volta/VOLTA.md)).
-3. Run (the first start downloads the ~70 GB model, then starts; later starts go straight to serving):
-   `docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -v strata-data:/data strata`
+**A bug in DeepSeek's reference, found by the oracle (not confirmed with DeepSeek).** On decode steps where a ratio-2 index-K owner's compressor group is
+incomplete (layers 2, 8, 14: every other token), the official `model.py` scores the indexer against the last published
+index-K cache, which is layer 20's, instead of the layer's own, and the Reuse layers that take their owner's selection
+(`model.py:722-736`) inherit it, 18 ratio-2 layers in all. It changes the top-512 selection only once a layer holds more
+than 512 compressed positions (context above ~1,024 tokens); prefill and training are unaffected. The port follows the
+evident intent (each owner scores against its own cache); the oracle implements both (`stale_index_k=True` reproduces the
+shipped code bit for bit). Recorded as decided in [CONTRACTS.md](docs/deepseek/CONTRACTS.md); to revisit if DeepSeek's or
+llama.cpp's production decode does otherwise.
 
-   The setup choices are env vars: `-e MODEL=IQ2_XS -e FAMILY=qwen -e CONTEXT=32768 -e VISION=no`
-   (or `MODEL=Q2_0|IQ3_XXS|IQ3_S`, `FAMILY=swift|coder`; the defaults above are the recommended ones).
-   `-e VISION=cpu` keeps the image encoder on the CPU. `-e KV=int8|q4_0|k8v4` picks the KV cache
-   precision; `k8v4` is INT8 K with 4-bit V and keeps its KV in VRAM from 64K up.
-   Only the model files, the prepared pack, the MTP layer and the install config live in the
-   `strata-data` volume; the engine is part of the image. Switching between models already on the
-   volume needs no setup pass: `-e MODEL=Q2_0 -e FAMILY=coder` picks that model's config. Add
-   `-e REINSTALL=1` only to change settings for a model already set up (context, vision, KV, host,
-   api_key, LOW_RAM), since those are recorded in its config.
-   Strata loads 32-62 GB into RAM. `--gpus all` on a host with two usable cards takes both: the
-   layer split is setup's recommended default ([docs/MULTI_GPU.md](docs/MULTI_GPU.md)), and a volume
-   set up for one card switches to the pair on its first start there. Pin one card with `-e GPU=0`,
-   or name them with `-e GPUS=0,2` and where the later card's layers start with `-e LAYER_SPLIT=18`.
-   A memory limit needs `-e LOW_RAM=on`, which maps the model's experts from the pack instead of
-   keeping them in RAM: setup.py measures the host's RAM, not the container's limit, so it cannot
-   see a cap. LOW_RAM runs on one card.
-   The server listens on `0.0.0.0:8080` by default; set `-e API_KEY=<secret>` before exposing the port
-   to a network. The image has a `HEALTHCHECK` on `/health`, so `docker ps` shows the container
-   healthy once the model is loaded, and `GET /v1/status` says what it is running.
+## Repository map
 
-## Using it
+| Path | Contents |
+|---|---|
+| `src/`, `include/strata/` | the engine (upstream) with the port's changes; **new:** `src/ds41`, `include/strata/ds41`, `src/platform/numa.cpp` |
+| `setup.py`, `setup.sh`, `SETUP.bat`, `START-HERE.bat`, `Dockerfile`, `docker-entrypoint.sh` | installers (V100 path added in `setup.py`, `Dockerfile`) |
+| `serve/`, `chat.py` | server, web app, terminal chat (upstream, unchanged) |
+| `tools/` | pack and benchmark tools (upstream); **new:** `tools/volta` (audit, parity, correctness, profiling), `tools/ds41` (GGUF tooling), `tools/test_setup_volta.py` |
+| `ref/` | `ref/load.py` (upstream); **new:** `ref/ds41`, the DeepSeek NumPy oracle |
+| `tests/`, `bench/`, `data/`, `cmake/` | upstream tests, benchmark results, data, CMake modules; **new:** `tests/core/numa_arena_test.cpp`, `cmake/ds41_*.cmake`, `cmake/check_no_vbmi.cmake` |
+| `third_party/` | `ggml/` (upstream, MIT); **new:** `deepseek-v41-flash-reference/` (DeepSeek's official reference, MIT) |
+| `docs/` | upstream docs plus `volta/`, `deepseek/`, `USAGE_LEDGER.md`, `PROVENANCE.md`, `STRATA_README.md` |
 
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
+## Documentation
 
-- **In the browser:** `http://127.0.0.1:8080` - the Strata app (it opens by itself when the model starts): **Chat**, a
-  live **Monitor** of the model and your GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Chat in the terminal:** `.venv\Scripts\python chat.py`
-- **Your apps and coding agents:** add it as an "OpenAI-compatible" provider with base URL
-  **`http://127.0.0.1:8080/v1`**, any API key and any model name. Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages`.
-- **Thinking:** the model thinks before it answers. Choose **off, low, medium or high** - in the chat page menu, with
-  `/think low` in `chat.py`, or with your app's "reasoning effort" setting. Off is fastest; high is best for hard questions.
-- **Pictures:** in the chat page click **Picture**; in `chat.py` type `/image <path>`; in apps just attach them.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`, then open the
-  address the server window prints; see the [details](docs/DETAILS.md#using-it).
-- **Experimental speed projection (off by default):** an experimental control vector that setup can turn on; it
-  changes how the model answers - read [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) first.
+| Document | What it is |
+|---|---|
+| [docs/STRATA_README.md](docs/STRATA_README.md) | upstream's README: install, models, usage, troubleshooting |
+| [docs/DETAILS.md](docs/DETAILS.md) | upstream's reference, with the port's "CPU kernels" and "NUMA mirroring" sections |
+| [docs/volta/VOLTA.md](docs/volta/VOLTA.md) | the V100 user guide: install, switches, NUMA, checks, known limits |
+| [docs/volta/PLAN.md](docs/volta/PLAN.md) | what upstream does on sm_70, the work packages, phases and gates |
+| [docs/volta/NINFER_STUDY.md](docs/volta/NINFER_STUDY.md) | what the ninfer V100 forks offer, and licensing |
+| [tools/volta/dispatch_audit.md](tools/volta/dispatch_audit.md) | every compute-capability decision in the code and what a V100 gets |
+| [docs/deepseek/PLAN.md](docs/deepseek/PLAN.md), [RESEARCH.md](docs/deepseek/RESEARCH.md), [CONTRACTS.md](docs/deepseek/CONTRACTS.md) | the DeepSeek port: plan and gates, the spec read from the primary files and the GGUF, the shared contracts |
+| [tools/ds41/README.md](tools/ds41/README.md), [ref/ds41/README.md](ref/ds41/README.md) | the GGUF tooling; the oracle and its tolerances |
+| [third_party/deepseek-v41-flash-reference/README.md](third_party/deepseek-v41-flash-reference/README.md) | what was vendored from DeepSeek |
+| [docs/USAGE_LEDGER.md](docs/USAGE_LEDGER.md) | design note: expert placement learned from use |
+| [docs/PROVENANCE.md](docs/PROVENANCE.md), [UPSTREAM.md](UPSTREAM.md) | where everything comes from |
+| [MULTI_GPU](docs/MULTI_GPU.md), [AMD_HIP](docs/AMD_HIP.md), [ORCA](docs/ORCA.md), [UNSLOTH_Q4](docs/UNSLOTH_Q4.md), [COMMUNITY_BENCHMARKS](docs/COMMUNITY_BENCHMARKS.md), [paper](docs/paper/Strata-Paper.pdf) | upstream's other guides, benchmarks and paper |
 
-**Good to know:** it answers one request at a time. The first message of a chat is read in full (about 1 minute per
-30,000 tokens); after that it keeps the conversation and reads only what is new, so follow-ups start in seconds.
+## Provenance and license
 
-### Where things are stored
+The tree is upstream Strata 0.1.31 (MIT) plus the port. llama.cpp / ggml (MIT, pinned commit `3cf0325`) is fetched at build
+time; `third_party/ggml/` and 17 source files carry ggml's MIT notice. DeepSeek's reference implementation is vendored
+unmodified under its MIT license. The ninfer forks, v100-skinny, 1Cat-vLLM and the llama.cpp DeepSeek pull requests were
+studied and nothing was copied from them. The models are not in the repository; each model's own license applies. The full
+table, with versions and what was checked: [docs/PROVENANCE.md](docs/PROVENANCE.md).
 
-- **Your chats: only in your browser.** The Chat tab keeps the conversation, its settings and the API key you typed
-  in the browser's local storage (`strata.*` keys) - not on the server and not in the Strata folder. Pictures are not
-  kept, only their names. Another browser or a private window starts empty; clearing the site's data deletes them.
-- **How the model starts:** `strata-<model>.json` in the Strata folder (context, GPUs, host, API key, ...), written
-  by setup; next to it `run-<model>.bat` / `.sh`, the log `strata-<model>.log` and, when you use "Use for other
-  apps too", `strata-<model>.shared-settings.json`.
-- **The model files** (`models/`, `packs/`, `mtp/`, 70-120 GB): in **`Strata-data` next to the Strata folder**, or
-  wherever `--data-dir` put them.
-- **Where that data folder is:** `%APPDATA%\Strata\settings.json` on Windows, `~/.config/strata/settings.json` on
-  Linux ([details](docs/DETAILS.md)).
-
-## Something went wrong?
-
-**My PC froze, or got very slow, the first time Strata started.**
-That's normal while it starts, most of all the first time. Strata loads 35-55 GB into your RAM, locks part of it for
-the graphics card, and works out how much of the model fits on your GPU. The mouse can freeze for a few minutes. **Wait, and don't close the
-window.** The next starts are much faster. Still frozen after 10 minutes? Restart the PC, close other programs
-(browsers use a lot of RAM) and try again. If it keeps happening, pick a smaller size (Q2_0 or IQ2_XS).
-
-**It stopped while downloading or installing.**
-Run `START-HERE.bat` again. It continues where it stopped.
-
-**It says the NVIDIA driver is too old.**
-Update it (NVIDIA App or [nvidia.com/drivers](https://www.nvidia.com/drivers)), restart the PC, and run
-`START-HERE.bat` again.
-
-**It says port 8080 is already in use.**
-Strata is already running. Look for its window.
-
-**It's very slow and the disk light keeps blinking.**
-Your PC is out of free RAM. Close other programs, or pick a smaller size (Q2_0 or IQ2_XS).
-
-**An answer stopped with "the engine stopped unexpectedly".**
-Usually not enough RAM (on Linux the system then stops the engine). Just send your message again: Strata starts the
-engine by itself. If it keeps happening, close other programs or pick a smaller size.
-
-**It says the prompt exceeds the context.**
-The conversation is longer than the context you chose. Start a new chat, or run `SETUP.bat` and pick more
-context.
-
-**Still stuck?** Look in the [full troubleshooting table](docs/DETAILS.md#troubleshooting), or open an issue and
-attach `strata-<model>.log` from the Strata folder.
-
-## How does it work?
-
-Models like this one normally run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes it fit by **sharing the work across your whole PC** - the same idea as a kitchen, where the
-things you use all the time stay on the counter and the rest waits in the pantry.
-
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
-
-- **The model is a team of 24,576 small specialists ("experts"),** and each word it writes needs only 10 of them.
-  So it doesn't have to have all of them on the graphics card at once.
-- **Your graphics card** does the part of the work needed for every word, and keeps the few thousand experts that
-  are asked most often. It keeps learning which ones those are while you use it.
-- **Your RAM** holds every expert. When a word needs one the card doesn't have, **your processor** works on it -
-  at the same time as the graphics card, so neither waits for the other.
-- **Your SSD** holds a big lookup table; the model only reads a few small rows of it per word.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-- **Guess, then check.** A small, fast helper built into the model guesses the next few words, and the big model
-  checks all the guesses in one go. It keeps the ones it agrees with and writes the next word itself - so one step
-  often produces several words. The helper only guesses - the big model decides every word - so you get the same
-  quality answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens - pieces of words - at a time), which is why a long
-  document or code base is read at over 1,000 tokens per second.
-
-Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every part and its numbers, and the
-[paper](docs/paper/Strata-Paper.pdf) tells the whole story, with the measurements behind it.
-
-## Credits
-
-- Model: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; compressed versions by
-  [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
-  [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI. Their licenses apply
-  to the model files.
-- Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
-  [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
-  [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](docs/DETAILS.md#credits-and-licenses).
-
-## License
-
-Strata is open source under the [MIT License](LICENSE). A few parts carry their own licenses: `third_party/ggml`
-(MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
-vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
-models are not part of this repository; each model's own license applies to its files.
+**License:** [MIT](LICENSE), upstream's file unchanged; the port's additions are released under it too. Exceptions with
+their own licenses: `third_party/ggml` (MIT, ggml authors), `third_party/deepseek-v41-flash-reference` (MIT, DeepSeek),
+the web app's font (SIL OFL 1.1) and the experimental speed projection's vector (Qwen Community License 1.0).
