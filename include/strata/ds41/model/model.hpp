@@ -10,8 +10,8 @@
 //   m->cache.slot_ptr(s) / residency() the GPU expert cache: n_slots blobs [gate][up][down], and the int32 [layer][expert] residency table
 //
 // Everything is geometry-checked: `load` refuses a file whose metadata or tensors differ from `G` (config.hpp, tensors.hpp), with a message
-// that names what it found and what it expects.  Device memory is reached only through `ModelDev` (alloc / release / h2d / d2h / fill): wrap
-// DS-D's `Dev` (parity lib) or DS1-G's shared one with `ModelDevAdapter`, or use `HostModelDev` (plain memory: the emulator build and the tests).
+// that names what it found and what it expects.  Device memory is reached only through `ModelDev` = DS1-G's shared `Dev`
+// (include/strata/ds41/cuda/ds41_dev.hpp: `CudaDev` on the V100, `HostDev` under the emulator and in the tests).
 //
 // Reading is streaming and bounded: shards are mmapped, a dense tensor is uploaded in 64 MiB pieces straight from the mapping, an expert slice
 // is copied once into the arena halves (and the pages of the expert tensors are then dropped from this process and the page cache so that
@@ -28,6 +28,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "strata/ds41/cuda/ds41_dev.hpp"
 #include "strata/ds41/geom.hpp"
 #include "strata/ds41/geometry.hpp"
 #include "strata/ds41/model/config.hpp"
@@ -41,79 +42,10 @@ namespace strata::ds41::model {
 using LogFn = std::function<void(const std::string&)>;
 
 // ================================================================================================ device access
-/// The device operations the loader needs.  Pointers are device pointers (host memory in the emulator).
-struct ModelDev {
-    virtual ~ModelDev() = default;
-    virtual void* alloc(size_t bytes) = 0;
-    virtual void release(void* p) = 0;
-    virtual void h2d(void* dst, const void* src, size_t n) = 0;
-    virtual void d2h(void* dst, const void* src, size_t n) = 0;
-    virtual void fill(void* p, int byte, size_t n) = 0;
-    virtual bool is_emulation() const { return false; }
-};
-
-/// Adapts anything with the parity `Dev` interface (src/ds41/cuda/ds41_parity_lib.hpp: alloc / release / h2d / d2h / fill, and optionally
-/// is_emulation) to ModelDev, without including it.  `D` must outlive the adapter.
-template <class D> class ModelDevAdapter final : public ModelDev {
-public:
-    explicit ModelDevAdapter(D& d) : d_(d) {}
-    void* alloc(size_t bytes) override { return d_.alloc(bytes); }
-    void release(void* p) override { d_.release(p); }
-    void h2d(void* dst, const void* src, size_t n) override { d_.h2d(dst, src, n); }
-    void d2h(void* dst, const void* src, size_t n) override { d_.d2h(dst, src, n); }
-    void fill(void* p, int byte, size_t n) override { d_.fill(p, byte, n); }
-    bool is_emulation() const override {
-        if constexpr (requires(const D& x) { x.is_emulation(); }) return d_.is_emulation();
-        else return false;
-    }
-
-private:
-    D& d_;
-};
-
-/// "Device" memory in plain host memory, 256-byte aligned, filled with 0xCD when allocated (fresh device memory is not zero): the emulator build
-/// and the tests.  Counts what is live, so a test can check that everything the model took was given back.
-class HostModelDev final : public ModelDev {
-public:
-    ~HostModelDev() override = default;
-    void* alloc(size_t bytes) override {
-        const size_t body = ((bytes ? bytes : 16) + 255) & ~(size_t) 255;
-#ifdef _MSC_VER
-        void* p = _aligned_malloc(body, 256);
-#else
-        void* p = std::aligned_alloc(256, body);
-#endif
-        if (!p) throw ModelError("HostModelDev: out of memory allocating " + std::to_string(bytes) + " bytes");
-        std::memset(p, 0xCD, body);
-        live_[p] = bytes;
-        live_bytes_ += bytes;
-        total_alloc_bytes_ += bytes;
-        return p;
-    }
-    void release(void* p) override {
-        if (!p) return;
-        const auto it = live_.find(p);
-        if (it == live_.end()) throw ModelError("HostModelDev: release of a pointer that is not live");
-        live_bytes_ -= it->second;
-        live_.erase(it);
-#ifdef _MSC_VER
-        _aligned_free(p);
-#else
-        std::free(p);
-#endif
-    }
-    void h2d(void* dst, const void* src, size_t n) override { std::memcpy(dst, src, n); }
-    void d2h(void* dst, const void* src, size_t n) override { std::memcpy(dst, src, n); }
-    void fill(void* p, int byte, size_t n) override { std::memset(p, byte, n); }
-    bool is_emulation() const override { return true; }
-    size_t n_live() const { return live_.size(); }
-    uint64_t live_bytes() const { return live_bytes_; }
-    uint64_t total_alloc_bytes() const { return total_alloc_bytes_; }
-
-private:
-    std::map<void*, size_t> live_;
-    uint64_t live_bytes_ = 0, total_alloc_bytes_ = 0;
-};
+/// The device the loader allocates on and uploads to: DS1-G's shared interface (include/strata/ds41/cuda/ds41_dev.hpp: `CudaDev` on a V100,
+/// `HostDev` in the emulator build and the tests).  Only alloc / release / h2d / d2h / fill / is_emulation are used.  Pointers are device pointers
+/// (host memory under the emulation).  The Dev must outlive every object that holds a device allocation of it (weights, cache).
+using ModelDev = ::strata::ds41::cuda::Dev;
 
 // ================================================================================================ tensors
 /// A tensor on the device: the GGUF bytes of the tensor, verbatim.  Q8_0 / MXFP4 / BF16 / F32 as the file has them; rows are `ne0` elements
@@ -127,6 +59,8 @@ struct DevTensor {
     int64_t rows() const { return ne1 * ne2; }
     uint64_t row_bytes() const { return rows() > 0 ? nbytes / (uint64_t) rows() : 0; }
     const uint8_t* row(int64_t r) const { return p + (uint64_t) r * row_bytes(); }
+    /// The device pointer as the type a kernel wrapper takes (`const void*` for Q8_0, `const uint16_t*` for BF16, `const float*` for F32).
+    template <class T> const T* as() const { return reinterpret_cast<const T*>(p); }
 };
 
 /// A tensor left in the mmapped GGUF (token_embd, the Engram tables, the expert tensors): a HOST pointer, valid while the model lives.
@@ -271,6 +205,17 @@ struct ArenaOptions {
     LogFn log;
     std::function<void(int layer)> layer_done;         ///< called (from a worker thread) when every expert of a layer has been copied
 };
+
+/// Which NUMA node holds which half.  Exactly two nodes with CPUs -> half 0 on the lower node id, half 1 on the other.  More nodes (sub-NUMA
+/// clustering): when the nodes sit on exactly two physical packages, half h goes to the lowest-numbered node of package h (a half then lives in
+/// ONE sub-node; the note says so).  Anything else (one node, no topology, a memory-only node, three sockets): not bound, and the note says why.
+struct ArenaNodes {
+    bool bind = false;
+    int node[2] = {-1, -1};            ///< node ids of half 0 / 1 (valid when `bind`)
+    std::vector<int> cpus[2];          ///< their CPUs (the prefault threads of a hugetlb mapping run there)
+    std::string note;                  ///< one line for the startup log
+};
+ArenaNodes choose_arena_nodes(const platform::NumaTopology& topo);
 
 /// Every routed expert of every layer as two CPU halves (one buffer per socket): half h of (layer l, expert e) is at
 /// `half(h, l, e)`, d.half_bytes() bytes, layout [gate rows][up rows][down rows] (CONTRACTS.md).  Built once from the GGUF slices.
