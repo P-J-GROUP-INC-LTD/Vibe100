@@ -33,7 +33,7 @@ Shared contract for all packages:
 * Runtime switches (env vars, read once per process):
   * `STRATA_VOLTA_ATTN` — prompt attention on sm_70: unset/`1` = the new Volta tensor-core kernel, `0` = the FP32
     fallback (the pre-port behaviour minus the crash). Used as the harness reference.
-  * `STRATA_PREFILL_F16_GEMM` — `auto` (default: FP16 tensor-core route when the current device has cc < 8.0),
+  * `STRATA_PREFILL_F16_GEMM` — `auto` (default: FP16 tensor-core route when the current device has 7.0 ≤ cc < 8.0 — FP16 tensor cores, no BF16 ones; Pascal keeps the upstream call),
     `0` = upstream cuBLAS bf16 everywhere, `1` = force the FP16 route on any arch (testing on newer cards).
 * Guard, don't replace: Ampere+/Turing code paths stay byte-identical in behaviour; Volta paths are added beside them.
 * No package edits a file owned by another. No `git commit` by agents — the integrator commits after review.
@@ -44,7 +44,7 @@ Shared contract for all packages:
 |---|---|---|---|
 | A — platform | Sonnet #1 | `CMakeLists.txt`, `src/core/device.cu`, `setup.py`, `Dockerfile`, `docker-entrypoint.sh`, `setup.sh`, `README.md`, `docs/volta/VOLTA.md` | sm_70 is a first-class target: CMake accepts 70 without the experimental flag and refuses CUDA ≥ 13 for it with a clear message; device check admits cc 7.0 and detects "binary has no code for this GPU"; setup.py builds from source with CUDA 12.8 for V100 (auto-install on Ubuntu/Windows), refuses V100 + RTX 50 in one engine; Docker build-arg for a CUDA 12.8 base; CMake target for `gemm_volta_parity`; user guide. |
 | B — audit & harness | Sonnet #2 | `tools/volta/*` (except `compile_one.py`), arch-dispatch fixes in files nobody else owns | `sass_audit.py` + `trap_allowlist.txt` (CI-style gate: no unexplained BPT.TRAP on sm_70), `dispatch_audit.md` (every compute-capability decision, what sm_70 gets), `golden_compare.py` (top-1 agreement, max\|Δlogit\|, KL, perplexity, NaN scan: Volta fast paths vs FP32 reference on the same card, or vs a reference logits file), `run_parity.sh`, `profile_decode.sh` + `summarize_profile.py` (Phase 0). |
-| C — prefill GEMM | Sonnet #3 | `src/prefill/gemm.cu`, `include/strata/prefill/gemm.hpp`, `src/prefill/gemm_volta_parity.cpp` | `Gemm::bf16` on cc < 8.0 converts bf16→fp16 (exact in range; power-of-two per-call scaling with device-side alpha so activations can never overflow FP16) and runs cuBLAS FP16 HMMA with FP32 accumulate, chunked to a bounded scratch; falls back to upstream bf16 if the scratch cannot be had. Parity program vs FP64. |
+| C — prefill GEMM | Sonnet #3 | `src/prefill/gemm.cu`, `include/strata/prefill/gemm.hpp`, `src/prefill/gemm_volta_parity.cpp` | `Gemm::bf16` on 7.0 ≤ cc < 8.0 converts bf16→fp16 (exact in range; power-of-two per-call scaling with device-side alpha so activations can never overflow FP16) and runs cuBLAS FP16 HMMA with FP32 accumulate, chunked to a bounded scratch; falls back to upstream bf16 if the scratch cannot be had. Parity program vs FP64. |
 | D — prompt attention | Sonnet #4 | `src/kernels/cuda/qsa_prompt_attn.cu`, `include/strata/kernels/qsa_prompt_attn.hpp`, `src/kernels/qsa_prompt_attn_parity.cpp` | Fix the dispatcher (cc = major·10+minor; never launch a trap stub). New WMMA (`nvcuda::wmma` m16n16k16, fp16 in / fp32 acc) port of the v1 kernel for KV modes 0, 1, 3 with identical math; HMMA verified in SASS; ≤ 96 KB smem; parity program covers it. |
 
 Integrator (Opus): review every diff against this plan, full sm_70 build + `sass_audit.py`, CPU-side tests that

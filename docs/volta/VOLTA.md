@@ -108,7 +108,7 @@ Volta paths can be switched off to compare against, and for testing.
 | Variable | Values | What it does |
 | --- | --- | --- |
 | `STRATA_VOLTA_ATTN` | unset or `1` (default) / `0` | **Prompt attention on a V100.** `1`: the new Volta tensor-core kernel. `0`: the older per-query FP32 kernel (what upstream falls back to when the tensor-core kernel cannot be used) - the reference the new kernel is checked against. Only matters while a prompt is read with a 16-bit, 8-bit or K8V4 KV cache; has no effect on other cards. |
-| `STRATA_PREFILL_F16_GEMM` | `auto` or unset (default) / `0` / `1` | **The dense GEMMs that read a prompt.** `auto`: on a card with FP16 but no BF16 tensor cores (compute capability below 8.0: the V100, and also an RTX 20) they run as FP16 tensor-core GEMMs with FP32 sums - the BF16 values are converted exactly, with a power-of-two scale per piece so nothing can overflow FP16. `0`: always upstream's BF16 cuBLAS call (on a V100 that runs on the ordinary cores, about 8x slower than the tensor cores). `1`: use the FP16 route on every card, to test it on a newer one. |
+| `STRATA_PREFILL_F16_GEMM` | `auto` or unset (default) / `0` / `1` | **The dense GEMMs that read a prompt.** `auto`: on a card with FP16 but no BF16 tensor cores (compute capability 7.0 to 7.5: the V100, and also an RTX 20; small GEMMs and Pascal cards keep the upstream call) they run as FP16 tensor-core GEMMs with FP32 sums - the BF16 values are converted exactly, with a power-of-two scale per piece so nothing can overflow FP16. `0`: always upstream's BF16 cuBLAS call (on a V100 that runs on the ordinary cores, about 8x slower than the tensor cores). `1`: use the FP16 route on every card, to test it on a newer one. |
 
 Set them for one run on the command line:
 
