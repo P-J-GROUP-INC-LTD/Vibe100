@@ -35,7 +35,7 @@ Read first: `docs/deepseek/RESEARCH.md` (§1-4, §10), `docs/deepseek/CONTRACTS.
 | every other GEMV (BF16 / F32 weights, and `wo_a`, which the reference keeps bf16 although the GGUF stores Q8_0) | FP32 activations × dequantised weights, FP32 accumulation | exact |
 | reduction order | fixed per output, **independent of T** (T = 1..8 give bit-identical rows; DS-D's router rule) and of the block/fiber order | - |
 | KV fake-quantisation (the model's KV is QAT'd) | runtime flags mirroring the oracle's `QuantConfig.window_kv` (fp8 e4m3 per 32, `act_quant_fp8`), `.compressed_kv` (fp4 e2m1, e4m3 scale per 16, `fp4_quant_e4m3`), `.index` (fp4, e8m0 per 32, `fp4_quant_e8m0`); **default all on**; values stored in FP32 caches (the fake-quantised values are exact there) | same flags |
-| RMSNorm | FP32, `eps = 1e-20` (the real value), `x * rsqrt(mean(x²) + eps) * w` | `ops.rmsnorm` |
+| RMSNorm | FP32, `eps = 1e-20` (the real value), the oracle's form `w * (x / sqrt(mean(x²) + eps))` (IEEE divide and sqrt; DS1-B) | `ops.rmsnorm` |
 | RoPE | tables computed on the host in double (`rope.py: rope_table`, YaRN per layer, theta 160000 + YaRN on the CSA2 layers, 10000 plain on L0-1), stored FP32; applied to the LAST `kRopeDim` channels, adjacent pairs; inverse on the attention output | `rope.py` |
 | softmax / sigmoid / softplus / exp | FP32 with `expf` etc.; softplus threshold 20 like torch; attention sink adds `exp(sink - max)` to the denominator only | `ops.py`, `attention.sparse_attn` |
 | routed experts | DS-C (CPU) / DS-D (GPU) as committed: CONTRACTS.md | `QuantConfig.int8_act` |
@@ -132,3 +132,10 @@ the mini model; the real-model half of the gate needs the owner's box (runbook s
   difference flips an int8 code (or an fp8 KV value), a 2.5e-3..6.2e-3 error that step - tolerance models and the end-to-end gate must
   count them, not fail on them. FP32 caches: ~6.4 KB/token + 40 x 256 KB rings (0.85 GB at 128K context). Performance (DS-2):
   `sparse_attn` uses 8 of 80 SMs; ~20 launches per layer-token. Emulator tests set glibc malloc options (otherwise 17x slower).
+- **DS1-B done** (b0a85ba + checkpoints): `dense.hpp` - `ds41_gemv_q8_int8` (+ `_pair` gate/up), `ds41_gemv_q8_f32`,
+  `ds41_wo_a<G>` / `ds41_gemv_q8_grouped_f32`, `ds41_gemv_bf16` / `_f32`, `ds41_head<G>`, `ds41_rmsnorm`, `ds41_rope` + host
+  `ds41_rope_table_host` / `ds41_layer_rope_params`, `ds41_shared_expert` (+ `_q`, `ds41_swiglu`), `ds41_argmax` / `ds41_topk`,
+  `ds41_embed_rows<G>`, `ds41_f32_add` / `_scale`; raw device pointers + shapes, no allocation. Q8_0's 2-byte-misaligned quants are read
+  with aligned LDG.128 + `prmt` (k % 256 == 0) or a bit-identical 16-bit path. NaN ranks above every number in argmax / top-k (the router
+  treats NaN as -inf). V100 program `ds41_dense_parity [--bench]` (not in ctest): add to run_parity. Estimates at T = 1: wq_b ~80-88 % of
+  900 GB/s, the head ~1.65 ms.
