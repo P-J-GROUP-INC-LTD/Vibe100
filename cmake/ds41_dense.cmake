@@ -8,7 +8,7 @@
 #                            strata_ds41_dense; such a program also compiles src/ds41/cuda/ds41_emu_impl.cpp (DS-D's emulated kernels, which provide
 #                            ds41_quantize_acts<G>) into itself, as ds41_cuda_emu_test does.  EXCLUDE_FROM_ALL unless STRATA_BUILD_TESTS.
 #   ds41_dense_emu_test      the emulated kernels against C++ FP64 references at both geometries, T-invariance, forward / reverse / shuffled scheduling; registered
-#                            with ctest (CPU only).  See the header of src/ds41/cuda/dense_emu_test.cpp for the options.
+#                            with ctest (CPU only).  See the header of src/ds41/cuda/dense_test.cpp for the options.
 set(_ds41b_src ${PROJECT_SOURCE_DIR}/src/ds41/cuda)
 
 # every target below is added only when its sources exist, so a configure of the whole tree never fails on a half-written package
@@ -25,17 +25,17 @@ if(NOT WIN32 AND EXISTS ${_ds41b_src}/dense_emu_impl.cpp)
     target_compile_options(strata_ds41_dense_emu PRIVATE -fno-strict-aliasing -ffp-contract=off -Wno-clobbered)
   endif()
 
-  if(EXISTS ${_ds41b_src}/dense_emu_test.cpp)
+  if(EXISTS ${_ds41b_src}/dense_test.cpp)
     # DS-D's emulated kernels (ds41_emu_impl.cpp: ds41_quantize_acts<G>, which the shared expert calls) are compiled into the test program itself, as
     # ds41_cuda_emu_test does; strata_ds41_cpu is the CPU quantiser the --quant suite cross-checks (cmake/ds41_cpu.cmake, included first)
-    add_executable(ds41_dense_emu_test ${_ds41b_all} ${_ds41b_src}/dense_emu_test.cpp ${_ds41b_src}/ds41_emu_impl.cpp)
+    add_executable(ds41_dense_emu_test ${_ds41b_all} ${_ds41b_src}/dense_test.cpp ${_ds41b_src}/ds41_emu_impl.cpp)
     target_include_directories(ds41_dense_emu_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${_ds41b_src})
     target_link_libraries(ds41_dense_emu_test PRIVATE strata_ds41_dense_emu strata_ds41_cpu)
     if(NOT MSVC)
       target_compile_options(ds41_dense_emu_test PRIVATE -fno-strict-aliasing -ffp-contract=off -Wno-clobbered)
     endif()
   endif()
-  if(STRATA_BUILD_TESTS AND EXISTS ${_ds41b_src}/dense_emu_test.cpp)
+  if(STRATA_BUILD_TESTS AND EXISTS ${_ds41b_src}/dense_test.cpp)
     # every suite in the forward scheduling order, the cheap ones also reversed and shuffled (the emulator exposes a kernel that is only right in one order)
     foreach(_s IN ITEMS quant gemv wide norm rope shared vocab)
       add_test(NAME ds41_dense_emu_${_s} COMMAND ds41_dense_emu_test --${_s})

@@ -58,6 +58,16 @@ using namespace strata::ds41::cuda;
 namespace {
 
 int g_fail = 0, g_pass = 0;
+
+/// HostDev whose fresh device memory is NaN bits (0xFF: a float NaN, an int -1) instead of HostDev's 0xCD: a kernel that reads a scratch element before anything wrote
+/// it shows up as a NaN / -1 in the results (the driver zero-fills what it means to be zero: the caches, the candidate flags)
+struct PoisonDev : HostDev {
+    void* alloc(size_t bytes) override {
+        void* p = HostDev::alloc(bytes);
+        std::memset(p, 0xFF, bytes ? bytes : 16);
+        return p;
+    }
+};
 #define CHECK(cond, ...)                                  \
     do {                                                  \
         if (cond) {                                       \
@@ -1483,7 +1493,7 @@ int main(int argc, char** argv) {
     std::printf("INFO emulator scheduling order: %s (seed %llu)\n", ds41_emu::order_name(), (unsigned long long) ds41_emu::g_order_seed);
     const auto t0 = std::chrono::steady_clock::now();
     {
-        HostDev dev;
+        PoisonDev dev;
         if (kernels) {
             KernelTests<MiniGeom>(dev, seed).run_all();
             std::printf("INFO MiniGeom kernels done (%d checks, %d failed)\n", g_pass + g_fail, g_fail);

@@ -251,7 +251,7 @@ class TokenizerError(Exception):
 
 class Ds41Tokenizer:
     def __init__(self, tokens, merges, token_types=None, *, pre: str = "joyai-llm", model: str = "gpt2", bos_id=None, eos_id=None, pad_id=None,
-                 add_bos: bool = False, add_eos: bool = False, chat_template: str | None = None, engine: str = "auto"):
+                 add_bos: bool = False, add_eos: bool = False, chat_template: str | None = None, engine: str = "auto", strict: bool = False):
         if model != "gpt2":
             raise TokenizerError(f"tokenizer.ggml.model {model!r}: only the byte-level BPE ('gpt2') is implemented")
         if pre not in PRE_TOKENIZERS:
@@ -274,9 +274,15 @@ class Ds41Tokenizer:
                 raise TokenizerError(f"merge #{r} {m!r} is not 'left right'")
             self.ranks[(a, b)] = r
         self.n_merges = len(self.ranks)
-        for (a, b) in self.ranks:                                     # every merge result must be a token (HF refuses otherwise)
-            if (a + b) not in self.vocab:
-                raise TokenizerError(f"merge {a!r} + {b!r} = {a + b!r} is not in the vocabulary")
+        # a merge whose result is not a token can never fire (Hugging Face refuses such a file; llama.cpp ignores it at run time): `strict` raises, otherwise it is
+        # dropped and counted (`bad_merges`; selfcheck reports it - the mini test GGUF has placeholder merges)
+        self.bad_merges = [(a, b) for (a, b) in self.ranks if (a + b) not in self.vocab]
+        if self.bad_merges:
+            if strict:
+                a, b = self.bad_merges[0]
+                raise TokenizerError(f"merge {a!r} + {b!r} = {a + b!r} is not in the vocabulary ({len(self.bad_merges)} such merges)")
+            for k in self.bad_merges:
+                del self.ranks[k]
         self.patterns = compile_pretokenizer(PRE_TOKENIZERS[pre], engine)
         # tokens matched literally in the text: control and user-defined, plus bos / eos / pad
         self.special_ids = {i for i, ty in enumerate(self.types) if ty in (TT_CONTROL, TT_USER_DEFINED)}
@@ -289,7 +295,7 @@ class Ds41Tokenizer:
 
     # ------------------------------------------------------------------ construction
     @classmethod
-    def from_metadata(cls, md: dict, engine: str = "auto") -> "Ds41Tokenizer":
+    def from_metadata(cls, md: dict, engine: str = "auto", strict: bool = False) -> "Ds41Tokenizer":
         """`md`: GGUF metadata (tools/gguf_reader.GGUFFile.metadata): tokenizer.ggml.* arrays and scalars."""
         for k in ("tokenizer.ggml.tokens", "tokenizer.ggml.merges"):
             v = md.get(k)
@@ -298,18 +304,18 @@ class Ds41Tokenizer:
         return cls(md["tokenizer.ggml.tokens"], md["tokenizer.ggml.merges"], md.get("tokenizer.ggml.token_type"), pre=md.get("tokenizer.ggml.pre", "joyai-llm"),
                    model=md.get("tokenizer.ggml.model", "gpt2"), bos_id=md.get("tokenizer.ggml.bos_token_id"), eos_id=md.get("tokenizer.ggml.eos_token_id"),
                    pad_id=md.get("tokenizer.ggml.padding_token_id"), add_bos=bool(md.get("tokenizer.ggml.add_bos_token", False)),
-                   add_eos=bool(md.get("tokenizer.ggml.add_eos_token", False)), chat_template=md.get("tokenizer.chat_template"), engine=engine)
+                   add_eos=bool(md.get("tokenizer.ggml.add_eos_token", False)), chat_template=md.get("tokenizer.chat_template"), engine=engine, strict=strict)
 
     @classmethod
-    def from_gguf(cls, path, engine: str = "auto") -> "Ds41Tokenizer":
+    def from_gguf(cls, path, engine: str = "auto", strict: bool = False) -> "Ds41Tokenizer":
         """From shard 1 of a (split) GGUF; only the metadata is read."""
         import gguf_reader
         paths = [path] if isinstance(path, (str, pathlib.Path)) else list(path)
-        return cls.from_metadata(gguf_reader.GGUFFile(pathlib.Path(paths[0])).metadata, engine)
+        return cls.from_metadata(gguf_reader.GGUFFile(pathlib.Path(paths[0])).metadata, engine, strict)
 
     @classmethod
-    def from_tokenizer_json(cls, path, chat_template: str | None = None, engine: str = "auto") -> "Ds41Tokenizer":
-        return cls.from_metadata(metadata_from_tokenizer_json(path, chat_template), engine)
+    def from_tokenizer_json(cls, path, chat_template: str | None = None, engine: str = "auto", strict: bool = False) -> "Ds41Tokenizer":
+        return cls.from_metadata(metadata_from_tokenizer_json(path, chat_template), engine, strict)
 
     # ------------------------------------------------------------------ queries
     @property
@@ -434,7 +440,7 @@ class Ds41Tokenizer:
 
     # ------------------------------------------------------------------ chat
     def apply_chat_template(self, messages, *, add_generation_prompt: bool = False, thinking: bool = False, tools=None, response_format=None,
-                            reasoning_effort=None, drop_thinking: bool = True, engine: str = "native") -> str:
+                            reasoning_effort=None, drop_thinking: bool = True, engine: str = "auto") -> str:
         """The GGUF's chat template rendered to text.  engine "native": the Python transcription below (needs the template to be the known DeepSeek-V4 one,
         checked by hash); "jinja": jinja2 on the template string in the GGUF (any template; needs jinja2); "auto": native when the hash matches, else jinja."""
         if self.chat_template is None and engine != "native":
@@ -733,6 +739,7 @@ def selfcheck(tok: Ds41Tokenizer, tokenizer_json=None, verbose: bool = True) -> 
 
     texts = SELFCHECK_TEXTS + _rand_texts()
     bad = [t for t in texts if tok.decode(tok.encode(t, parse_special=False)) != t.encode("utf-8", "replace").decode("utf-8", "replace")]
+    rec("every merge result is a token", not tok.bad_merges, f"{tok.n_merges} merges" + (f"; {len(tok.bad_merges)} dropped, first {tok.bad_merges[0]}" if tok.bad_merges else ""))
     rec("decode(encode(text)) == text (no special parsing)", not bad, f"{len(texts)} texts" + (f"; first failure {bad[0]!r}" if bad else ""))
     known = {k: v for k, v in KNOWN_IDS.items() if k in tok.vocab}
     if known and tok.vocab_size > 128000:
@@ -778,7 +785,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def src(p):
-        p.add_argument("--gguf", nargs="+", help="shard 1 of the GGUF (the tokenizer arrays live in its metadata)")
+        p.add_argument("--gguf", help="shard 1 of the GGUF (the tokenizer arrays live in its metadata)")
         p.add_argument("--tokenizer-json", help="a Hugging Face tokenizer.json instead of a GGUF")
     p = sub.add_parser("encode"); src(p)
     p.add_argument("text", nargs="?"); p.add_argument("--file"); p.add_argument("--no-special", action="store_true"); p.add_argument("--bos", action="store_true")
@@ -805,7 +812,7 @@ def main(argv=None) -> int:
             print(json.dumps(tok.encode(text, add_bos=False)) if a.ids else text)
         elif a.cmd == "info":
             print(json.dumps({"model": tok.model, "pre": tok.pre, "vocab_size": tok.vocab_size, "merges": tok.n_merges, "bos": tok.bos_id, "eos": tok.eos_id, "pad": tok.pad_id,
-                              "add_bos": tok.add_bos, "add_eos": tok.add_eos, "special_tokens": len(tok.special_ids), "has_chat_template": tok.chat_template is not None}, indent=1))
+                              "add_bos": tok.add_bos, "add_eos": tok.add_eos, "bad_merges": len(tok.bad_merges), "special_tokens": len(tok.special_ids), "has_chat_template": tok.chat_template is not None}, indent=1))
         elif a.cmd == "selfcheck":
             tj = a.tokenizer_json
             if tj is None:

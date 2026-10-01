@@ -1,8 +1,13 @@
-// src/ds41/cuda/dense_emu_test.cpp - DS1-B: the dense kernels (src/ds41/cuda/dense_impl.cuh, compiled for the host with -DDS41_EMU, see ds41_emu.hpp) against C++
-// references, at both geometries, on the CPU.  No GPU needed.
+// src/ds41/cuda/dense_test.cpp - DS1-B: the dense kernels (src/ds41/cuda/dense_impl.cuh) against C++ references.  Two programs are built from this one source:
+//   ds41_dense_emu_test   the kernels compiled for the HOST with -DDS41_EMU (the thread-model emulation, ds41_emu.hpp), at both geometries, on the CPU.  No GPU
+//                         needed; registered with ctest.
+//   ds41_dense_parity     (-DDS41_DENSE_GPU, STRATA_ENABLE_CUDA) the sm_70 kernels on the V100 through CudaDev, RealGeom only, plus --bench (GB/s per shape).  Run
+//                         by hand on the box; not registered with ctest.  The comparisons that are bit-exact in the emulator stay bit-exact on the card except the ones
+//                         that go through expf (SwiGLU's sigmoid), which compare within 4e-6 there (the device libm and the host's may differ in the last bit).
 //
 //   ds41_dense_emu_test [--quant] [--gemv] [--wide] [--norm] [--rope] [--shared] [--vocab] [--all] [--geom real|mini|both] [--seed N]
 //                       [--order forward|reverse|shuffle[:SEED]] [--big]
+//   ds41_dense_parity   [the same suites, --geom is ignored: real] [--big] [--bench]
 //
 // Every suite prints PASS / FAIL lines and "ALL PASS (n checks)".  What each one pins:
 //   --quant   the natural-order activation quantiser the GEMVs consume (DS-D / DS1-G's ds41_quantize_acts<G>, ActOrder::kNatural): byte for byte against an
@@ -28,14 +33,19 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "ds41_emu.hpp"
 #include "strata/ds41/cpu/mxfp4_expert.hpp"
 #include "strata/ds41/cuda/dense.hpp"
 #include "strata/ds41/cuda/ds41_cuda.hpp"
 #include "strata/ds41/cuda/ds41_dev.hpp"
+#if defined(DS41_DENSE_GPU)
+#include "strata/ds41/cuda/ds41_cuda_runtime.hpp"
+#else
+#include "ds41_emu.hpp"
+#endif
 
 namespace {
 
@@ -71,6 +81,15 @@ struct Report {
         return failures == 0 ? 0 : 1;
     }
 };
+[[maybe_unused]] std::string fmt_s(const char* f, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, f);
+    std::vsnprintf(buf, sizeof buf, f, ap);
+    va_end(ap);
+    return buf;
+}
+
 struct Rng {
     uint64_t s;
     explicit Rng(uint64_t seed) : s(seed * 0x9E3779B97F4A7C15ull + 0x1234567ull) {}
@@ -107,13 +126,16 @@ size_t count_diff(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 // the scheduling order the kernels run in (the emulator): a result must not depend on it
-struct OrderGuard {
-    std::string saved;
-    explicit OrderGuard(const std::string& o) { ds41_emu::set_order_from_string(o); }
-};
+#if defined(DS41_DENSE_GPU)
+constexpr bool kEmu = false;                           // the card: no scheduling order to choose (the sweeps below repeat the run), expf is the device's
+inline bool set_sched(const std::string&) { return true; }
+#else
+constexpr bool kEmu = true;
+inline bool set_sched(const std::string& o) { return ds41_emu::set_order_from_string(o); }
+#endif
 const char* const kOrders[3] = {"forward", "reverse", "shuffle:5"};
 std::string g_order = "forward";                       // the order the command line asked for (restored after the internal order sweeps)
-void set_cmdline_order() { ds41_emu::set_order_from_string(g_order); }
+void set_cmdline_order() { set_sched(g_order); }
 
 // ---- half precision (independent of the kernels' conversion) ------------------------------------------------------------------------------------
 double half_to_double(uint16_t h) {
@@ -194,15 +216,15 @@ void ref_quant(const float* x, int n, int8_t* q, float* d) {
 // ---- device helpers -----------------------------------------------------------------------------------------------------------------------------------
 /// The activation quantiser the int8 GEMVs consume: DS-D / DS1-G's, natural per-32 layout.
 template <class G>
-void quantize_nat(HostDev& dev, const float* x, int T, int width, int8_t* xq, float* xs) {
+void quantize_nat(Dev& dev, const float* x, int T, int width, int8_t* xq, float* xs) {
     ds41_quantize_acts<G>(dev, x, T, width, xq, xs, nullptr, ActOrder::kNatural);
 }
 template <class T>
-void upload(HostDev& dev, DevBuf<T>& b, const std::vector<T>& v) {
+void upload(Dev& dev, DevBuf<T>& b, const std::vector<T>& v) {
     dev.h2d(b.p, v.data(), v.size() * sizeof(T));
 }
 template <class T>
-std::vector<T> download(HostDev& dev, const T* p, size_t n) {
+std::vector<T> download(Dev& dev, const T* p, size_t n) {
     std::vector<T> v(n);
     dev.d2h(v.data(), p, n * sizeof(T));
     return v;
@@ -212,7 +234,7 @@ std::vector<T> download(HostDev& dev, const T* p, size_t n) {
 // --quant
 // =====================================================================================================================================================
 template <class G>
-void run_quant(HostDev& dev, Report& rep, Rng& rng) {
+void run_quant(Dev& dev, Report& rep, Rng& rng) {
     const std::string g = G::kName;
     // 1. the contract's special blocks, bit patterns included
     {
@@ -415,7 +437,7 @@ struct GemvCase {
 };
 
 template <class G>
-void check_q8_int8(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs, const std::vector<int>& Ts) {
+void check_q8_int8(Dev& dev, Report& rep, Rng& rng, const GemvCase& cs, const std::vector<int>& Ts) {
     const std::string g = G::kName;
     const Q8Mat m = make_q8(rng, cs.n, cs.k, 1);
     DevBuf<uint8_t> dw(dev, m.bytes.size());
@@ -463,7 +485,7 @@ void check_q8_int8(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs, cons
 }
 
 template <class G>
-void check_q8_int8_extra(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs) {
+void check_q8_int8_extra(Dev& dev, Report& rep, Rng& rng, const GemvCase& cs) {
     const std::string g = G::kName;
     const int T = 3, nb = cs.k / 32;
     const Q8Mat ma = make_q8(rng, cs.n, cs.k, 1), mb = make_q8(rng, cs.n, cs.k, 0);
@@ -497,7 +519,7 @@ void check_q8_int8_extra(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs
         const auto base = y1.down();
         size_t bad = 0;
         for (const char* o : kOrders) {
-            ds41_emu::set_order_from_string(o);
+            set_sched(o);
             DevBuf<float> yo(dev, (size_t) T * cs.n);
             ds41_gemv_q8_int8<G>(dev, wa.p, cs.n, cs.k, dq.p, ds.p, T, yo.p);
             bad += count_diff(base, yo.down());
@@ -527,7 +549,7 @@ void check_q8_int8_extra(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs
 }
 
 template <class G>
-void check_q8_f32(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs, const std::vector<int>& Ts) {
+void check_q8_f32(Dev& dev, Report& rep, Rng& rng, const GemvCase& cs, const std::vector<int>& Ts) {
     const std::string g = G::kName;
     const Q8Mat m = make_q8(rng, cs.n, cs.k, 1);
     DevBuf<uint8_t> dw(dev, m.bytes.size());
@@ -566,7 +588,7 @@ void check_q8_f32(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs, const
 }
 
 template <class G>
-void check_q8_f32_extra(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs) {
+void check_q8_f32_extra(Dev& dev, Report& rep, Rng& rng, const GemvCase& cs) {
     const std::string g = G::kName;
     const int T = 2;
     const Q8Mat m = make_q8(rng, cs.n, cs.k, 1);
@@ -589,7 +611,7 @@ void check_q8_f32_extra(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs)
     const auto base = y1.down();
     size_t bad = 0;
     for (const char* o : kOrders) {
-        ds41_emu::set_order_from_string(o);
+        set_sched(o);
         DevBuf<float> yo(dev, (size_t) T * cs.n);
         ds41_gemv_q8_f32<G>(dev, dw.p, cs.n, cs.k, dx.p, T, yo.p);
         bad += count_diff(base, yo.down());
@@ -599,7 +621,7 @@ void check_q8_f32_extra(HostDev& dev, Report& rep, Rng& rng, const GemvCase& cs)
 }
 
 template <class G>
-void check_grouped(HostDev& dev, Report& rep, Rng& rng, int groups, int R, int K, const std::vector<int>& Ts) {
+void check_grouped(Dev& dev, Report& rep, Rng& rng, int groups, int R, int K, const std::vector<int>& Ts) {
     const std::string g = G::kName;
     const Q8Mat m = make_q8(rng, groups * R, K, 1);
     DevBuf<uint8_t> dw(dev, m.bytes.size());
@@ -640,7 +662,7 @@ void check_grouped(HostDev& dev, Report& rep, Rng& rng, int groups, int R, int K
 }
 
 template <class G>
-void run_gemv(HostDev& dev, Report& rep, Rng& rng, bool big) {
+void run_gemv(Dev& dev, Report& rep, Rng& rng, bool big) {
     const std::string g = G::kName;
     const bool real = std::strcmp(G::kName, "real") == 0;
     using D = Derived<G>;
@@ -713,7 +735,7 @@ float model_wide(const float* w_row_f /* the weights as floats */, const float* 
     return butterfly(acc);
 }
 template <class G, bool BF16>
-void check_wide(HostDev& dev, Report& rep, Rng& rng, const char* what, int n, int k, const std::vector<int>& Ts) {
+void check_wide(Dev& dev, Report& rep, Rng& rng, const char* what, int n, int k, const std::vector<int>& Ts) {
     const std::string g = G::kName;
     std::vector<float> wf((size_t) n * k);
     std::vector<uint16_t> wb;
@@ -776,7 +798,7 @@ void check_wide(HostDev& dev, Report& rep, Rng& rng, const char* what, int n, in
         std::vector<float> base;
         size_t bad = 0;
         for (const char* o : kOrders) {
-            ds41_emu::set_order_from_string(o);
+            set_sched(o);
             DevBuf<float> dy(dev, (size_t) T * n);
             if (BF16) ds41_gemv_bf16<G>(dev, dwb.p, n, k, dx.p, T, dy.p);
             else ds41_gemv_f32<G>(dev, dwf.p, n, k, dx.p, T, dy.p);
@@ -804,7 +826,7 @@ void check_wide(HostDev& dev, Report& rep, Rng& rng, const char* what, int n, in
 }
 
 template <class G>
-void run_wide(HostDev& dev, Report& rep, Rng& rng, bool big) {
+void run_wide(Dev& dev, Report& rep, Rng& rng, bool big) {
     const bool real = std::strcmp(G::kName, "real") == 0;
     // the head (kVocab x kHidden): n reduced for the real geometry (a full pass is 662 M weights), the router-like / compressor / indexer projections
     const int head_n = real ? (big ? 6000 : 700) : G::kVocab;
@@ -852,7 +874,7 @@ float model_rmsnorm_row(const float* x, const float* w, int width, float eps, fl
     return r;
 }
 template <class G>
-void check_norm(HostDev& dev, Report& rep, Rng& rng, const char* what, int rows, int width) {
+void check_norm(Dev& dev, Report& rep, Rng& rng, const char* what, int rows, int width) {
     const std::string g = G::kName;
     std::vector<float> x((size_t) rows * width), w((size_t) width);
     for (auto& v : x) v = (float) (rng.gauss() * std::pow(10.0, rng.below(5) - 2));
@@ -916,7 +938,7 @@ void check_norm(HostDev& dev, Report& rep, Rng& rng, const char* what, int rows,
     }
 }
 template <class G>
-void run_norm(HostDev& dev, Report& rep, Rng& rng) {
+void run_norm(Dev& dev, Report& rep, Rng& rng) {
     check_norm<G>(dev, rep, rng, "hidden", 3, G::kHidden);
     check_norm<G>(dev, rep, rng, "hidden T=8", 8, G::kHidden);
     check_norm<G>(dev, rep, rng, "q lora", 3, G::kQLora);
@@ -934,7 +956,7 @@ void run_norm(HostDev& dev, Report& rep, Rng& rng) {
 #include "dense_rope_golden.inc"
 
 template <class G>
-void run_rope(HostDev& dev, Report& rep, Rng& rng) {
+void run_rope(Dev& dev, Report& rep, Rng& rng) {
     const std::string g = G::kName;
     const int rd = G::kRopeDim;
     // 1. the host table against an independent long double evaluation (any parameters), <= 1 ulp
@@ -1044,7 +1066,13 @@ double ref_silu_double(double g) {
     const double sig = g >= 0 ? 1.0 / (1.0 + e) : e / (1.0 + e);
     return g * sig;
 }
-// the kernel's h in float, operation by operation (the host libm's expf is the one the emulator calls, so this is bit-exact here)
+// the kernel's h in float, operation by operation (the host libm's expf is the one the emulator calls, so this is bit-exact there; on the card the device's
+// expf may differ in the last bit: h_same compares within 4e-6 then)
+bool h_same(float a, float b) {
+    if (kEmu) return same_f(a, b);
+    if (a != a || b != b) return a != a && b != b;
+    return std::fabs(a - b) <= 4e-6 * std::max(std::fabs(a), std::fabs(b)) + 1e-30;
+}
 float model_h(float g, float u, float limit) {
     if (limit > 0.0f) {
         u = u > limit ? limit : (u < -limit ? -limit : u);
@@ -1059,7 +1087,7 @@ float model_h(float g, float u, float limit) {
 }
 
 template <class G>
-void run_shared(HostDev& dev, Report& rep, Rng& rng, bool big) {
+void run_shared(Dev& dev, Report& rep, Rng& rng, bool big) {
     const std::string g = G::kName;
     (void) big;
     const bool real = std::strcmp(G::kName, "real") == 0;
@@ -1085,7 +1113,7 @@ void run_shared(HostDev& dev, Report& rep, Rng& rng, bool big) {
         const auto h = dg.down();
         size_t bad = 0, bad_ref = 0;
         for (int i = 0; i < n; ++i) {
-            bad += !same_f(h[(size_t) i], model_h(gv[(size_t) i], uv[(size_t) i], 10.0f));
+            bad += !h_same(h[(size_t) i], model_h(gv[(size_t) i], uv[(size_t) i], 10.0f));
             // the oracle's semantics in double: clamp with NaN propagation, silu of ops.py
             double gg = gv[(size_t) i], uu = uv[(size_t) i];
             if (!std::isnan(uu)) uu = std::min(10.0, std::max(-10.0, uu));
@@ -1101,7 +1129,7 @@ void run_shared(HostDev& dev, Report& rep, Rng& rng, bool big) {
         ds41_swiglu<G>(dev, dg.p, du.p, n, 0.0f);
         const auto h0 = dg.down();
         size_t bad0 = 0;
-        for (int i = 0; i < n; ++i) bad0 += !same_f(h0[(size_t) i], model_h(gv[(size_t) i], uv[(size_t) i], 0.0f));
+        for (int i = 0; i < n; ++i) bad0 += !h_same(h0[(size_t) i], model_h(gv[(size_t) i], uv[(size_t) i], 0.0f));
         rep.line(bad0 == 0, (g + " swiglu without a limit").c_str(), "%zu differ", bad0);
     }
     // 2. the whole shared expert, both modes
@@ -1158,10 +1186,18 @@ void run_shared(HostDev& dev, Report& rep, Rng& rng, bool big) {
         std::vector<int8_t> rhq(h.size());
         std::vector<float> rhs(h.size() / 32);
         ref_quant(h.data(), (int) h.size(), rhq.data(), rhs.data());
-        size_t badh = 0;
-        for (size_t i = 0; i < hq.size(); ++i) badh += hq[i] != rhq[i];
-        for (size_t i = 0; i < hs.size(); ++i) badh += f_bits(hs[i]) != f_bits(rhs[i]);
-        rep.line(badh == 0, (g + " shared expert: swiglu + quantise").c_str(), "T %d: %zu mismatches of h (int8 / scale) against the float model", T, badh);
+        size_t badh = 0, off_by_one = 0;
+        for (size_t i = 0; i < hq.size(); ++i) {
+            if (kEmu) badh += hq[i] != rhq[i];
+            else {                                                                      // on the card a last-bit difference of h may move a code by one
+                const int dq = std::abs((int) hq[i] - (int) rhq[i]);
+                badh += dq > 1;
+                off_by_one += dq == 1;
+            }
+        }
+        for (size_t i = 0; i < hs.size(); ++i) badh += kEmu ? f_bits(hs[i]) != f_bits(rhs[i]) : !h_same(hs[i], rhs[i]);
+        if (!kEmu && off_by_one * 100 > hq.size()) badh += off_by_one;                  // more than 1 % of the codes off by one: not a last-bit effect
+        rep.line(badh == 0, (g + " shared expert: swiglu + quantise").c_str(), "T %d: %zu mismatches of h (int8 / scale) against the float model (%zu codes off by one)", T, badh, off_by_one);
         // (d) down projection of the device's hq / hs
         size_t bady = 0, bady_ref = 0;
         for (int t = 0; t < T; ++t)
@@ -1223,13 +1259,13 @@ void run_shared(HostDev& dev, Report& rep, Rng& rng, bool big) {
                 for (int r = 0; r < kFF; ++r) {
                     const float a1 = model_f32(w1.row(r), x.data() + (size_t) t * kH, kH), a3 = model_f32(w3.row(r), x.data() + (size_t) t * kH, kH);
                     hm[(size_t) r] = model_h(a1, a3, 10.0f);
-                    bad_f += !same_f(gf[(size_t) t * kFF + r], hm[(size_t) r]);
+                    bad_f += !h_same(gf[(size_t) t * kFF + r], hm[(size_t) r]);
                 }
-                for (int r = 0; r < kH; ++r) {
-                    const float want = model_f32(w2.row(r), hm.data(), kFF);
+                for (int r = 0; r < kH; ++r) {                                           // the down projection of the DEVICE's h: bit-exact against the order model
+                    const float want = model_f32(w2.row(r), gf.data() + (size_t) t * kFF, kFF);
                     bad_f += !same_f(yf[(size_t) t * kH + r], want);
                     double v, a;
-                    ref_f32(w2.row(r), hm.data(), kFF, v, a);
+                    ref_f32(w2.row(r), gf.data() + (size_t) t * kFF, kFF, v, a);
                     num += (yf[(size_t) t * kH + r] - v) * (yf[(size_t) t * kH + r] - v);
                     den += v * v;
                 }
@@ -1289,7 +1325,7 @@ uint32_t ref_key(float v) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 template <class G>
-void run_vocab(HostDev& dev, Report& rep, Rng& rng) {
+void run_vocab(Dev& dev, Report& rep, Rng& rng) {
     const std::string g = G::kName;
     const int V = G::kVocab;
     for (int T : {1, 3}) {
@@ -1317,7 +1353,7 @@ void run_vocab(HostDev& dev, Report& rep, Rng& rng) {
         std::vector<int32_t> base;
         size_t bad_order = 0;
         for (const char* o : kOrders) {
-            ds41_emu::set_order_from_string(o);
+            set_sched(o);
             ds41_argmax<G>(dev, dx.p, T, di.p, dv.p);
             const auto idx = di.down();
             if (base.empty()) base = idx;
@@ -1351,7 +1387,7 @@ void run_vocab(HostDev& dev, Report& rep, Rng& rng) {
         std::vector<int32_t> base;
         size_t bad_order = 0;
         for (const char* o : kOrders) {
-            ds41_emu::set_order_from_string(o);
+            set_sched(o);
             ds41_topk<G>(dev, dx.p, T, k, di.p, dv.p, scratch.p, topk_scratch_bytes<G>(T, k));
             const auto idx = di.down();
             if (base.empty()) base = idx;
@@ -1432,11 +1468,113 @@ void run_vocab(HostDev& dev, Report& rep, Rng& rng) {
     }
 }
 
+
+// =====================================================================================================================================================
+// --bench (the card only): GB/s of weights per call, against the card's peak
+// =====================================================================================================================================================
+#if defined(DS41_DENSE_GPU)
+template <class G>
+void run_bench(Dev& dev, Report& rep, Rng& rng) {
+    int mem_clock = 0, bus = 0, sms = 0;
+    cudaDeviceGetAttribute(&mem_clock, cudaDevAttrMemoryClockRate, 0);
+    cudaDeviceGetAttribute(&bus, cudaDevAttrGlobalMemoryBusWidth, 0);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    const double peak = 2.0 * mem_clock * 1e3 * (bus / 8) / 1e9;                           // GB/s (HBM2: double data rate)
+    Report::info("BENCH device: %d SMs, peak %.0f GB/s (memory clock %d kHz, bus %d bits); weights are cycled through enough copies that no call finds its matrix in L2", sms, peak, mem_clock, bus);
+    auto say = [&](const char* name, const std::string& shape, double us, double bytes) {
+        const double gbs = bytes / (us * 1e-6) / 1e9;
+        Report::info("BENCH %-12s %-34s %9.1f us %8.1f GB/s %5.1f%% of peak", name, shape.c_str(), us, gbs, 100.0 * gbs / peak);
+    };
+    using D = Derived<G>;
+    struct S {
+        const char* name;
+        int n, k;
+    };
+    const S shapes[] = {{"wq_a", G::kQLora, G::kHidden},   {"wq_b", D::kQ, G::kQLora},       {"wkv", G::kHeadDim, G::kHidden}, {"wo_b", G::kHidden, D::kOMid},
+                        {"shexp gate", G::kFF, G::kHidden}, {"shexp down", G::kHidden, G::kFF}, {"idx wq_b", D::kIdxQ, G::kQLora}, {"engram wkv", D::kEngramOut, D::kEngramIn}};
+    for (const S& sh : shapes) {
+        const Q8Mat m = make_q8(rng, sh.n, sh.k, 0);
+        const double bytes = (double) m.bytes.size();
+        const int copies = (int) std::max(1.0, std::min(8.0, std::ceil(96e6 / bytes)));
+        std::vector<std::unique_ptr<DevBuf<uint8_t>>> w;
+        for (int c = 0; c < copies; ++c) {
+            w.emplace_back(new DevBuf<uint8_t>(dev, m.bytes.size()));
+            upload(dev, *w.back(), m.bytes);
+        }
+        for (int T : {1, 2, 4, 8}) {
+            const std::vector<float> x = make_x(rng, T, sh.k, 0);
+            DevBuf<float> dx(dev, x.size()), dy(dev, (size_t) T * sh.n);
+            upload(dev, dx, x);
+            DevBuf<int8_t> dq(dev, (size_t) T * sh.k);
+            DevBuf<float> ds(dev, (size_t) T * sh.k / 32);
+            quantize_nat<G>(dev, dx.p, T, sh.k, dq.p, ds.p);
+            int i = 0;
+            const double us = dev.time_us([&] { ds41_gemv_q8_int8<G>(dev, w[(size_t) (i++ % copies)]->p, sh.n, sh.k, dq.p, ds.p, T, dy.p); }, 30);
+            say("q8 int8", fmt_s("%s n=%d k=%d T=%d", sh.name, sh.n, sh.k, T), us, bytes);
+        }
+        {
+            const int T = 1;
+            const std::vector<float> x = make_x(rng, T, sh.k, 0);
+            DevBuf<float> dx(dev, x.size()), dy(dev, (size_t) T * sh.n);
+            upload(dev, dx, x);
+            int i = 0;
+            const double us = dev.time_us([&] { ds41_gemv_q8_f32<G>(dev, w[(size_t) (i++ % copies)]->p, sh.n, sh.k, dx.p, T, dy.p); }, 30);
+            say("q8 f32", fmt_s("%s n=%d k=%d T=%d", sh.name, sh.n, sh.k, T), us, bytes);
+        }
+    }
+    {   // wo_a: the grouped GEMV
+        const int groups = G::kOGroups, R = G::kOLora, K = D::kOGroupIn;
+        const Q8Mat m = make_q8(rng, groups * R, K, 0);
+        const double bytes = (double) m.bytes.size();
+        const int copies = 3;
+        std::vector<std::unique_ptr<DevBuf<uint8_t>>> w;
+        for (int c = 0; c < copies; ++c) {
+            w.emplace_back(new DevBuf<uint8_t>(dev, m.bytes.size()));
+            upload(dev, *w.back(), m.bytes);
+        }
+        for (int T : {1, 2, 4, 8}) {
+            const auto x = make_x(rng, T, groups * K, 0);
+            DevBuf<float> dx(dev, x.size()), dy(dev, (size_t) T * groups * R);
+            upload(dev, dx, x);
+            int i = 0;
+            const double us = dev.time_us([&] { ds41_wo_a<G>(dev, w[(size_t) (i++ % copies)]->p, dx.p, T, dy.p); }, 30);
+            say("wo_a", fmt_s("%d groups x %d x %d T=%d", groups, R, K, T), us, bytes);
+        }
+    }
+    {   // the head: BF16, 1.3 GB
+        const int N = G::kVocab, K = G::kHidden;
+        std::vector<uint16_t> pat(1 << 20);
+        for (auto& v : pat) v = (uint16_t) (0x3C00u + (rng.u32() & 0x3FFu) + ((rng.u32() & 1u) << 15));        // finite BF16 values around 2^-7
+        std::vector<uint16_t> host((size_t) N * K);
+        for (size_t i = 0; i < host.size(); ++i) host[i] = pat[i & (pat.size() - 1)];
+        DevBuf<uint16_t> w(dev, host.size());
+        upload(dev, w, host);
+        for (int T : {1, 2, 4, 8}) {
+            const auto x = make_x(rng, T, K, 0);
+            DevBuf<float> dx(dev, x.size()), dy(dev, (size_t) T * N);
+            upload(dev, dx, x);
+            const double us = dev.time_us([&] { ds41_head<G>(dev, w.p, dx.p, T, dy.p); }, 10);
+            say("head bf16", fmt_s("n=%d k=%d T=%d", N, K, T), us, (double) host.size() * 2);
+            DevBuf<int32_t> di(dev, T);
+            DevBuf<float> dv(dev, T);
+            const double ua = dev.time_us([&] { ds41_argmax<G>(dev, dy.p, T, di.p, dv.p); }, 20);
+            Report::info("BENCH %-12s %-34s %9.1f us", "argmax", fmt_s("T=%d vocab=%d", T, N).c_str(), ua);
+            DevBuf<unsigned char> scratch(dev, topk_scratch_bytes<G>(T, 64));
+            DevBuf<int32_t> ti(dev, (size_t) T * 64);
+            DevBuf<float> tv(dev, (size_t) T * 64);
+            const double ut = dev.time_us([&] { ds41_topk<G>(dev, dy.p, T, 64, ti.p, tv.p, scratch.p, topk_scratch_bytes<G>(T, 64)); }, 10);
+            Report::info("BENCH %-12s %-34s %9.1f us", "top-64", fmt_s("T=%d vocab=%d", T, N).c_str(), ut);
+        }
+    }
+    rep.line(true, "bench", "timings printed above (INFO BENCH lines)");
+}
+#endif
+
 // =====================================================================================================================================================
 // main
 // =====================================================================================================================================================
 template <class G>
-void run_geom(HostDev& dev, Report& rep, uint64_t seed, bool big, bool quant, bool gemv, bool wide, bool norm, bool rope, bool shared, bool vocab) {
+void run_geom(Dev& dev, Report& rep, uint64_t seed, bool big, bool bench, bool quant, bool gemv, bool wide, bool norm, bool rope, bool shared, bool vocab) {
     Rng rng(seed);
     const auto t0 = std::chrono::steady_clock::now();
     auto lap = [&](const char* what) {
@@ -1450,12 +1588,17 @@ void run_geom(HostDev& dev, Report& rep, uint64_t seed, bool big, bool quant, bo
     if (rope) run_rope<G>(dev, rep, rng), lap("rope");
     if (shared) run_shared<G>(dev, rep, rng, big), lap("shared");
     if (vocab) run_vocab<G>(dev, rep, rng), lap("vocab");
+#if defined(DS41_DENSE_GPU)
+    if (bench) run_bench<G>(dev, rep, rng), lap("bench");
+#else
+    (void) bench;
+#endif
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool quant = false, gemv = false, wide = false, norm = false, rope = false, shared = false, vocab = false, big = false;
+    bool quant = false, gemv = false, wide = false, norm = false, rope = false, shared = false, vocab = false, big = false, bench = false;
     std::string geom = "both";
     uint64_t seed = 1;
     for (int i = 1; i < argc; ++i) {
@@ -1469,11 +1612,12 @@ int main(int argc, char** argv) {
         else if (a == "--vocab") vocab = true;
         else if (a == "--all") quant = gemv = wide = norm = rope = shared = vocab = true;
         else if (a == "--big") big = true;
+        else if (a == "--bench") bench = true;
         else if (a == "--geom" && i + 1 < argc) geom = argv[++i];
         else if (a == "--seed" && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--order" && i + 1 < argc) {
             g_order = argv[++i];
-            if (!ds41_emu::set_order_from_string(g_order)) {
+            if (!set_sched(g_order)) {
                 std::fprintf(stderr, "--order: forward | reverse | shuffle[:SEED]\n");
                 return 2;
             }
@@ -1482,11 +1626,21 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (!(quant || gemv || wide || norm || rope || shared || vocab)) quant = gemv = wide = norm = rope = shared = vocab = true;
-    HostDev dev;
+    if (!(quant || gemv || wide || norm || rope || shared || vocab || bench)) quant = gemv = wide = norm = rope = shared = vocab = true;
     Report rep;
+#if defined(DS41_DENSE_GPU)
+    CudaDev dev;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess)
+        Report::info("device: %s (cc %d.%d, %d SMs, %.1f GB)%s", prop.name, prop.major, prop.minor, prop.multiProcessorCount, (double) prop.totalGlobalMem / 1e9,
+                     (prop.major == 7 && prop.minor == 0) ? "" : "  <-- NOT a Volta (sm_70) card: the numbers say nothing about the V100");
+    Report::info("dense kernels on the card, geometry real, seed %llu", (unsigned long long) seed);
+    run_geom<RealGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab);          // the nvcc library instantiates RealGeom only
+#else
+    HostDev dev;
     Report::info("dense kernels, emulated, order %s, geometry %s, seed %llu", g_order.c_str(), geom.c_str(), (unsigned long long) seed);
-    if (geom == "mini" || geom == "both") run_geom<MiniGeom>(dev, rep, seed, big, quant, gemv, wide, norm, rope, shared, vocab);
-    if (geom == "real" || geom == "both") run_geom<RealGeom>(dev, rep, seed, big, quant, gemv, wide, norm, rope, shared, vocab);
+    if (geom == "mini" || geom == "both") run_geom<MiniGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab);
+    if (geom == "real" || geom == "both") run_geom<RealGeom>(dev, rep, seed, big, bench, quant, gemv, wide, norm, rope, shared, vocab);
+#endif
     return rep.summary();
 }
