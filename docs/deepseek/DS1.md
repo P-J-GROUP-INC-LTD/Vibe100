@@ -90,3 +90,16 @@ On the mini model (here, emulated): every stage within its documented tolerance 
 On the real model (the owner's box): layer-by-layer within tolerance for 32 tokens of a real prompt; top-1 ≥ 99 % over 500 tokens
 against the oracle; no NaN / inf; then the llama.cpp comparison (tier 2 of `tools/volta/logit_identity.sh`, with the owner's
 mx-llama.cpp as reference) as information.
+
+## 8. Status (for whoever resumes this work)
+
+2026-10-01, evening: DS1-G, DS1-A, DS1-B, DS1-C, DS1-D and DS1-F were started in parallel by the cloud session (one agent each, the
+ownership of §4). Their files are checkpointed to the branch as they go: commits titled `DS1-<letter> checkpoint: ...` (the agent's
+own) and `DS-1 work in progress: automatic checkpoint` (every 20 minutes); both are UNREVIEWED and may not build. A reviewed package
+gets a commit titled `DS-1 <letter>: ...` once the integrator has checked it.
+
+To resume after an interruption: `git log --oneline -- src/ds41 include/strata/ds41 tools/ds41 ref/ds41 cmake` shows how far each
+package got; each package's acceptance criteria are its section above plus the agent brief's "Deliver" and "Verify" lists (the
+integrator's session transcript). Then: review and finish each package, swap the local stand-ins of DS1-C/D for DS1-B/G's real APIs,
+write DS1-E (session, CPU expert pool, CLI, the MiniGeom end-to-end ctest against the oracle with DS1-F's checker), and run Gate DS-1 on
+the mini model; the real-model half of the gate needs the owner's box (runbook step 9 + DS1-F's layer-by-layer tool).
