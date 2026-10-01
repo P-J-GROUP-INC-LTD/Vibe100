@@ -7,7 +7,9 @@ plus the start of a DeepSeek-V4.1-Flash port. `git diff 3906943` is the whole po
 upstream behaviour, and a failure playbook for each runbook step. The day-one steps are `docs/volta/RUNBOOK.md`.
 
 Rules that matter most:
-- Work on your own branch (`box/qwen-v100`), not on `claude/volta-v100-conversion-8f17vp` (the cloud session develops DeepSeek there).
+- Work on your own branch `box/qwen-v100`, created from commit **`da0ae45`** (the Qwen-ready state: clean sm_70 build, SASS audit
+  PASS, CPU tests PASS). Do NOT merge newer commits of `claude/volta-v100-conversion-8f17vp` while testing Qwen: the cloud session
+  pushes DeepSeek work-in-progress checkpoints there, which may not build.
 - Do not edit DeepSeek code (`src/ds41`, `include/strata/ds41`, `ref/ds41`, `tools/ds41`, `cmake/ds41_*`, `docs/deepseek`).
 - Never skip, disable or loosen a test to get green; a numerics change needs its parity program, `golden_compare` (Gate Q) and the
   SASS audit; a change meant to be bit-identical needs `golden_compare.py --exact`.

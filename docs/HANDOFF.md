@@ -50,10 +50,12 @@ Nothing else in upstream's engine was changed: decode kernels, ggml MMQ, server,
 
 ## 2. Ground rules for editing on the box
 
-1. **Branch.** Do box work on its own branch so it cannot collide with the cloud session, which keeps developing the DeepSeek engine
-   on `claude/volta-v100-conversion-8f17vp`:
-   `git fetch origin && git checkout -b box/qwen-v100 origin/claude/volta-v100-conversion-8f17vp`. Push it; the cloud session (or the
-   owner) merges. Before starting each day: `git fetch origin && git merge origin/claude/volta-v100-conversion-8f17vp`.
+1. **Branch.** Do box work on its own branch, created from commit **`da0ae45`** - the Qwen-ready state (a clean full sm_70 build of
+   all 268 targets, SASS audit PASS, every CPU-runnable test PASS):
+   `git fetch origin && git checkout -b box/qwen-v100 da0ae45`. Push it; the cloud session (or the owner) merges it back.
+   **Do not merge newer commits of `claude/volta-v100-conversion-8f17vp` while testing Qwen**: the cloud session pushes DeepSeek
+   work-in-progress checkpoints there (often, so nothing is lost), and they may not compile. If a later Qwen fix is announced, take that
+   one commit (`git cherry-pick <hash>`).
 2. **Do not edit** `src/ds41/**`, `include/strata/ds41/**`, `ref/ds41/**`, `tools/ds41/**`, `cmake/ds41_*.cmake`, `docs/deepseek/**`:
    the cloud session owns them while it writes DS-1. If a DeepSeek parity program fails on the box, record it (section 6), do not fix it.
 3. **Write down what you see.** Append every result and every change to `docs/volta/BOX_LOG.md` (create it; newest at the bottom; date,
