@@ -9,6 +9,7 @@
 #                            ds41_quantize_acts<G>) into itself, as ds41_cuda_emu_test does.  EXCLUDE_FROM_ALL unless STRATA_BUILD_TESTS.
 #   ds41_dense_emu_test      the emulated kernels against C++ FP64 references at both geometries, T-invariance, forward / reverse / shuffled scheduling; registered
 #                            with ctest (CPU only).  See the header of src/ds41/cuda/dense_test.cpp for the options.
+#   ds41_dense_parity        the same test source against the sm_70 kernels on the V100 (RealGeom) and --bench (GB/s per shape); run by hand, not in ctest.
 set(_ds41b_src ${PROJECT_SOURCE_DIR}/src/ds41/cuda)
 
 # every target below is added only when its sources exist, so a configure of the whole tree never fails on a half-written package
@@ -54,6 +55,23 @@ if(STRATA_ENABLE_CUDA AND EXISTS ${_ds41b_src}/dense.cu)
   # the shared expert calls DS-D's ds41_quantize_acts<G> (strata_ds41_cuda); everything else is in this library
   target_link_libraries(strata_ds41_dense PUBLIC CUDA::cudart strata_ds41_cuda)
   set_target_properties(strata_ds41_dense PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_SEPARABLE_COMPILATION OFF)
+
+  # The V100 program: the same test source against the sm_70 kernels through CudaDev (RealGeom), plus --bench.  Always defined; in `all` only with the tests or
+  # STRATA_DS41_CUDA_PARITY (ds41_cuda.cmake's option), `--target ds41_dense_parity` builds it on demand.  Not registered with ctest (a GPU-less machine would fail it).
+  #     ds41_dense_parity [--quant --gemv --wide --norm --rope --shared --vocab] [--big] [--bench]       (no flag: the seven suites)
+  if(EXISTS ${_ds41b_src}/dense_test.cpp)
+    set(_ds41b_parity_all EXCLUDE_FROM_ALL)
+    if(STRATA_BUILD_TESTS OR STRATA_DS41_CUDA_PARITY)
+      set(_ds41b_parity_all "")
+    endif()
+    add_executable(ds41_dense_parity ${_ds41b_parity_all} ${_ds41b_src}/dense_test.cpp)
+    target_compile_definitions(ds41_dense_parity PRIVATE DS41_DENSE_GPU)
+    target_include_directories(ds41_dense_parity PRIVATE ${PROJECT_SOURCE_DIR}/include ${_ds41b_src} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(ds41_dense_parity PRIVATE strata_ds41_dense strata_ds41_cuda strata_ds41_cpu CUDA::cudart)
+    if(NOT MSVC)
+      target_compile_options(ds41_dense_parity PRIVATE -ffp-contract=off -fno-strict-aliasing)
+    endif()
+  endif()
   # NOT --use_fast_math: the norm's divisions / sqrt and the activation quantiser's divisions are the IEEE ones; the kernels pin every product and sum that must not
   # be contracted (fmul_rn / fadd_rn / fma_rn, ds41_dev.cuh / dense_dev.cuh).
 endif()
