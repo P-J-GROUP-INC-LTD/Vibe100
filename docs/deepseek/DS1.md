@@ -125,3 +125,10 @@ the mini model; the real-model half of the gate needs the owner's box (runbook s
   Open: `Dev` has no memory query and `CudaDev` exits on a failed `cudaMalloc` (pass the VRAM total in `LoadOptions.plan.vram_total`; add
   `Dev::mem_info()` in DS1-E); KV is 6,400 B/token with FP32 caches; Q8_0 blocks are 34 B, so every other block's int8 payload is
   2 mod 4 aligned (DS1-B's dp4a loads realign; told).
+- **DS1-C done** (87b6c98): `Ds41Attention<G>(Dev&, AttnDenseOps&)` in `attn.hpp` (`init(roles, max_context, flags)`, `set_weights`,
+  `forward(layer, x_normed, T, pos0, out, stream)`, T = 1..8; layers in order per window), `ds41_attn_roles(cfg)` from DS1-A's config,
+  `Ds41AttnDense<G>` (`attn_dense.hpp`) binds DS1-B's GEMVs and DS1-G's quantiser; trace accessors for DS1-F. Oracle replay: 4,800
+  layer-steps, 89k checks, 0 failures; top-k identical. **Quantiser rounding flips are inherent**: ~1 per 800 layer-steps a 1-ulp input
+  difference flips an int8 code (or an fp8 KV value), a 2.5e-3..6.2e-3 error that step - tolerance models and the end-to-end gate must
+  count them, not fail on them. FP32 caches: ~6.4 KB/token + 40 x 256 KB rings (0.85 GB at 128K context). Performance (DS-2):
+  `sparse_attn` uses 8 of 80 SMs; ~20 launches per layer-token. Emulator tests set glibc malloc options (otherwise 17x slower).
