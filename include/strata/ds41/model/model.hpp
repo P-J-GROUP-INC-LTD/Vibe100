@@ -354,7 +354,7 @@ public:
     /// Puts expert (layer, expert) into `slot` from its three GGUF slices (three uploads straight from the mapping); the slot's previous
     /// tenant, if any, becomes non-resident.  Updates the device table entry (a 4-byte upload) unless `defer_upload`.
     void fill_from_gguf(ModelDev& dev, int slot, int layer, int expert, const ExpertSlices& s, bool defer_upload = false);
-    /// The same from the CPU arena (the two halves reassembled into a host staging blob, one upload): what a promotion does at run time.
+    /// The same from the CPU arena (the two halves reassembled into a pinned host staging blob, one upload): what a promotion does at run time.
     void fill_from_arena(ModelDev& dev, int slot, int layer, int expert, const ExpertArena& a, bool defer_upload = false);
     /// Marks a slot free and its expert non-resident (-1).
     void evict(ModelDev& dev, int slot, bool defer_upload = false);
@@ -370,7 +370,7 @@ private:
     int32_t* residency_ = nullptr;
     std::vector<int32_t> res_;
     std::vector<ExpertId> owner_;
-    std::vector<uint8_t> staging_;
+    uint8_t* staging_ = nullptr;                       // one blob of MAPPED (pinned) host memory from Dev::alloc_mapped, taken by the first fill from the arena
     int n_resident_ = 0;
 };
 

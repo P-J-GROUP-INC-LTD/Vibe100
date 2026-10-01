@@ -259,7 +259,7 @@ std::vector<ExpertId> parse_expert_list(const std::string& spec, int n_layer, in
         if (!parse_range(item.substr(colon + 1), n_expert, e0, e1, err)) throw ModelError("expert list item `" + item + "`, expert: " + err);
         for (int l = l0; l <= l1; ++l)
             for (int e = e0; e <= e1; ++e)
-                { out.push_back({l, e}); seen.insert({l, e}); }
+                if (seen.insert({l, e}).second) out.push_back({l, e});
     }
     return out;
 }
@@ -292,7 +292,8 @@ GpuExpertCache& GpuExpertCache::operator=(GpuExpertCache&& o) noexcept {
         residency_ = o.residency_;
         res_ = std::move(o.res_);
         owner_ = std::move(o.owner_);
-        staging_ = std::move(o.staging_);
+        staging_ = o.staging_;
+        o.staging_ = nullptr;
         n_resident_ = o.n_resident_;
         o.dev_ = nullptr;
         o.slots_ = nullptr;
@@ -307,13 +308,13 @@ void GpuExpertCache::release() {
     if (dev_) {
         if (slots_) dev_->release(slots_);
         if (residency_) dev_->release(residency_);
+        if (staging_) dev_->release_mapped(staging_);
     }
     slots_ = nullptr;
     residency_ = nullptr;
     res_.clear();
     owner_.clear();
-    staging_.clear();
-    staging_.shrink_to_fit();
+    staging_ = nullptr;
     n_slots_ = 0;
     n_resident_ = 0;
 }
@@ -358,10 +359,10 @@ void GpuExpertCache::fill_from_arena(ModelDev& dev, int slot, int layer, int exp
     if (slot < 0 || slot >= n_slots_) throw ModelError("GpuExpertCache: slot " + std::to_string(slot) + " of " + std::to_string(n_slots_));
     if (layer < 0 || layer >= d_.n_layer || expert < 0 || expert >= d_.n_expert)
         throw ModelError("GpuExpertCache: expert " + std::to_string(layer) + ":" + std::to_string(expert) + " is outside the model");
-    staging_.resize((size_t) d_.blob_bytes());
-    a.assemble_blob(layer, expert, staging_.data());
+    if (!staging_) staging_ = static_cast<uint8_t*>(dev.alloc_mapped((size_t) d_.blob_bytes()));      // pinned on a GPU: the copy below is a plain DMA
+    a.assemble_blob(layer, expert, staging_);
     if (owner_[(size_t) slot].layer >= 0) evict(dev, slot, defer_upload);
-    dev.h2d(slot_ptr(slot), staging_.data(), (size_t) d_.blob_bytes());
+    dev.h2d(slot_ptr(slot), staging_, (size_t) d_.blob_bytes());
     set_owner(dev, slot, layer, expert, defer_upload);
 }
 

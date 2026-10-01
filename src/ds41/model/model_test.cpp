@@ -746,7 +746,7 @@ void test_cache() {
         GpuExpertCache moved = std::move(none);
         CHECK(moved.residency() != nullptr && none.residency() == nullptr);
     }
-    CHECK(dev.live.empty());           // everything given back (HostDev also checked its guard zones on each release)
+    CHECK(dev.live.empty() && dev.mapped.empty());           // everything given back (HostDev also checked its guard zones on each release)
     expect_refusal("negative slots", [&] { GpuExpertCache c(dev, d, -1); }, {"-1 slots"});
     expect_refusal("more slots than experts", [&] { GpuExpertCache c(dev, d, 13); }, {"13 slots", "12 experts"});
     expect_refusal("an invalid shape", [&] { GpuExpertCache c(dev, ExpertDims{1, 1, 100, 256}, 1); }, {"not valid"});
@@ -1029,7 +1029,7 @@ void test_load(const Fx& fx, const GgufSet& g) {
         CHECK(m->plan().in.n_slots == 20 && m->plan().cache_slots_fit == 128 && m->plan().gpu_fits && m->plan().tally.n_tensors == 218);
         CHECK(m->plan().ram_experts == 8ull * 16 * d.blob_bytes());
     }
-    CHECK(dev.live.empty());    // the destructor gave back the weights block and the cache; HostDev checked every guard zone
+    CHECK(dev.live.empty() && dev.mapped.empty());    // the destructor gave back the weights block, the cache and its pinned staging buffer; HostDev checked every guard zone
 
     // ---- variants of the load
     {   // the cache allocated but not filled; no arena (a GPU-only or test run): residency all -1
