@@ -1,20 +1,39 @@
-// include/strata/ds41/cuda/ds41_cuda.hpp - DS-D: the GPU half of the DeepSeek-V4.1-Flash MoE layer, for the V100 (sm_70).
+// include/strata/ds41/cuda/ds41_cuda.hpp - DS-D / DS1-G: the GPU half of the DeepSeek-V4.1-Flash MoE layer, for the V100 (sm_70), as templates
+// over the geometry policy G (include/strata/ds41/geom.hpp: RealGeom, MiniGeom), and the activation quantiser every dp4a GEMV shares.
 //
-// THREE JOBS, IN THE ORDER A LAYER NEEDS THEM (shapes: include/strata/ds41/geometry.hpp, math: docs/deepseek/CONTRACTS.md):
+// EVERY FUNCTION HERE IS `template <class G>`: the shapes come from G (G::kHidden, G::kFF, G::kExperts, G::kTopK, G::kLayers) and Derived<G>
+// (kExpertBlobBytes ...); the numbers below are RealGeom's (5120 / 2304 / 384 / 6) and are examples, not constants.  The nvcc build (src/ds41/cuda/
+// ds41_{router,split,experts}.cu, library strata_ds41_cuda) instantiates RealGeom only; the CPU emulation (ds41_emu_impl.cpp, target
+// ds41_cuda_emu_test, and any test that is built with -DDS41_EMU against the emulator) instantiates RealGeom and MiniGeom.  Calling a G that the
+// build did not instantiate is a LINK error.  What G must satisfy is checked by static_asserts in the impl headers (see "CONSTRAINTS ON G").
 //
-//   1. ROUTER        router_forward():  x fp32 [T][5120], Wg bf16 [384][5120], bias fp32 [384]
+// THREE JOBS, IN THE ORDER A LAYER NEEDS THEM (math: docs/deepseek/CONTRACTS.md):
+//
+//   1. ROUTER        router_forward<G>():  x fp32 [T][5120], Wg bf16 [384][5120], bias fp32 [384]
 //                    -> ids int32 [T][6], weights fp32 [T][6]
 //                    logits in FP32, s = sqrt(softplus(logit)), top-6 of (s + bias) with the LOWEST index winning ties,
 //                    w = s[ids], w = w / (sum(w) + 1e-20) * 1.5.   Any T from 1 to a few thousand.
 //                    ONE REDUCTION ORDER FOR EVERY T: a token's logits are bit-identical whether it is routed alone (decode), in a
 //                    verify window or in a prompt chunk (CONTRACTS.md: otherwise a near-tie routes differently in prefill and decode).
-//   2. SPLIT         split_hits_misses():  the router's ids against the residency table of the layer ->
+//   2. SPLIT         split_hits_misses<G>():  the router's ids against the residency table of the layer ->
 //                    HIT list (GPU computes), MISS list (the CPU pool computes), counts, and the hits grouped by
 //                    cache slot.  Entirely on the device: the router's output never visits the host unless a host record is asked for.
-//   3. HIT EXPERTS   quantize_acts() -> experts_gate_up() -> experts_down()   (experts_hits() runs all three):
+//   3. HIT EXPERTS   quantize -> experts_gate_up<G>() -> experts_down<G>()   (experts_hits<G>() runs all three):
 //                    the MXFP4 blobs sitting in VRAM cache slots, T = 1..8 tokens, ALL hits of the layer in one launch
 //                    per phase (two for T >= 5: a lean and a wide specialisation over the same list), device-side lists only
 //                    (no host synchronisation between the router and the experts).
+// and, for everybody:  ds41_quantize_acts<G>()  the activation quantiser (any width that is a multiple of 32), see "ACTIVATION AND h LAYOUT".
+//
+// ---------------------------------------------------------------------------------------------------------------------
+// CONSTRAINTS ON G (what the kernels assume beyond geom_ok<G>(); every one is a static_assert at the point of use)
+// ---------------------------------------------------------------------------------------------------------------------
+//   router    kHidden % 256 == 0 (a row is a whole number of 32-lane x 16-byte chunk groups; 20 for RealGeom: 2 per warp, 10 warps; 1 for a row of 256: one
+//             warp), kExperts % 4 == 0 (the prefill kernel's 4 experts per block), kExperts <= 1024, kTopK <= kExperts and kTopK <= 32.  kExperts need NOT be a
+//             multiple of 32 (MiniGeom: 16): the selection kernel pads the lanes past the last expert.
+//   split     kTopK * 8 <= 64 (the grouped-hit arrays), kLayers >= 1.
+//   experts   kHidden % 256 == 0 and kFF % 256 == 0 (blocks of 32: 8 per gate/up row at least, so that a pair of rows is a whole number of 16-byte
+//             chunks; kHidden % 512 == 0 additionally stages half rows with 16-byte loads like RealGeom, otherwise a whole pair of rows is staged
+//             contiguously - MiniGeom's 8-block rows of 136 B), (kFF / 32) % 4 == 0, kHidden % 64 == 0 (the down tile), kHidden / 32 % 4 == 0.
 //
 // ---------------------------------------------------------------------------------------------------------------------
 // DEVICE-SIDE LIST FORMATS (all plain structs, 16-byte multiples, little endian; the miss list is meant to be read by
@@ -32,10 +51,10 @@
 //              expert for several tokens: n = how many (1..8), hit[j] = index into the HIT list (members in hit order).  The
 //              expert kernels stream the blob ONCE per group and use it for all n tokens.  Groups are numbered by DECREASING n
 //              (ties: order of first appearance): the expert kernels run the groups with 5..8 tokens in a wide specialisation.
-//   Capacity: hits, misses and groups each hold up to 6*T entries.  Nothing is zeroed beyond the counts.
+//   Capacity: hits, misses and groups each hold up to kTopK*T entries.  Nothing is zeroed beyond the counts.
 //
-//   Cache slots.  The residency table is int32 [40][384]: the slot (0 .. n_slots - 1) holding that expert's blob, or -1.  INITIALISE IT TO -1
-//   (every byte 0xFF, cudaMemset(table, 0xFF, bytes)), NEVER to 0: 0 is a valid slot.  A value r is a HIT only if 0 <= r < n_slots (the
+//   Cache slots.  The residency table is int32 [kLayers][kExperts] (40 x 384): the slot (0 .. n_slots - 1) holding that expert's blob, or -1.  INITIALISE
+//   IT TO -1 (every byte 0xFF, cudaMemset(table, 0xFF, bytes)), NEVER to 0: 0 is a valid slot.  A value r is a HIT only if 0 <= r < n_slots (the
 //   `n_slots` argument = the number of blobs the cache holds); any other value is a MISS (the CPU computes it), and if r is not the "not
 //   resident" marker -1 it is also COUNTED in counts->n_bad_slots / host->n_bad_slots, so a stale or corrupt table shows up as a number
 //   instead of as the expert kernels reading `cache + slot * kBlobBytes` outside the cache.
@@ -47,13 +66,13 @@
 //
 //   What the caller owns, per LAYER IN FLIGHT (the host may still be reading layer L's result while the stream is already running layer L+1's
 //   split, and a graph or a queue of 40 layers launches them all before the first one finishes):
-//       * one SplitHostRecord (cudaHostAlloc(..., cudaHostAllocMapped), zero-initialised: seq = 0),
-//       * one miss list `misses` of 6*T MissEntry in mapped host memory (any pinned buffer the kernel can address).
+//       * one SplitHostRecord (Dev::alloc_mapped / cudaHostAlloc(..., cudaHostAllocMapped), zero-initialised: seq = 0),
+//       * one miss list `misses` of kTopK*T MissEntry in mapped host memory (any pinned buffer the kernel can address).
 //     The device-side lists (hits, groups, counts) are scratch for the expert kernels of the SAME layer: stream order protects them, one set
 //     serves all layers.
 //   The protocol (a sequence number instead of the old "reserved = 0 means done", which could not tell layer L's result from layer L-1's):
 //       caller   picks seq = 1, 2, 3, ... for this record (0 is the cleared state; skip it on wrap, split_next_seq()), launches
-//                split_hits_misses(..., misses_of_layer, counts, &record, seq, stream)
+//                split_hits_misses<G>(..., misses_of_layer, counts, &record, seq, stream)
 //       kernel   writes the miss list; __syncthreads; thread 0 writes the counts into the device `counts` AND the host record, issues ONE
 //                fence.acq_rel.sys, then stores `seq` into record.seq with st.release.sys.global.u32 - the LAST store; no other thread fences
 //       host     split_host_wait(record, seq)  (an ACQUIRE load of record.seq until it equals the expected number), then reads the record's
@@ -62,39 +81,54 @@
 //   (cudaMemcpyAsync + event).  The expert kernels never look at the host record.
 //
 // ---------------------------------------------------------------------------------------------------------------------
-// EXPERT KERNELS: ACTIVATION AND h LAYOUT (internal, but the parity programs and the CPU-side checks need it)
+// ACTIVATION AND h LAYOUT (what ds41_quantize_acts<G>() writes and the dp4a kernels read; the other DS-1 packages read it too)
 // ---------------------------------------------------------------------------------------------------------------------
 //   An activation vector is quantised per 32 values (CONTRACTS.md "Activations"; bit-identical to the CPU's quantize_act() on EVERY input):
 //   amax = the largest |x| (an integer maximum of the magnitude bits); d = amax/127 (fp32), id = 127/amax, q = rint(x*id) (ties to EVEN)
 //   clamped to [-127,127]; a block with amax < 2^-100 (zero included) has d = 0, q = 0; a block holding an Inf or a NaN has d = NaN
 //   (0x7FC00000) and q = 0, so the NaN reaches y.  NaN also propagates through the SwiGLU clamps (min(g,10), clamp(u,-10,10)).
-//   The int8 values of one 32-block are stored in the "interleaved" order that the dp4a kernel wants:
-//       byte position of natural element j (0..31) = 8*((j&15)>>2) + 2*(j&3) + (j>>4)
-//   i.e. 8-byte groups [x[4k], x[4k+16], x[4k+1], x[4k+17], x[4k+2], x[4k+18], x[4k+3], x[4k+19]].
-//   xq: int8 [T][160][32] (x), xs: fp32 [T][160]; hq: int8 [6T][72][32] (h, indexed by HIT index), hs: fp32 [6T][72].
-//   (act_perm_pos() below is the single definition of the order.)
+//   The value a block stands for is  x[32 b + j] ~= q[b][j] * d[b].
+//
+//   A quantised matrix of T rows (tokens) of W values (W a multiple of 32, NB = W / 32 blocks per row) is TWO arrays:
+//       xq  int8  [T][NB][32]   token t, block b starts at byte (t * NB + b) * 32; inside the block the byte of natural element j (0..31 = column
+//                               32 b + j) is
+//                                 ActOrder::kInterleaved (the default)   byte 8*((j&15)>>2) + 2*(j&3) + (j>>4)   (act_perm_pos(j))
+//                                 ActOrder::kNatural                     byte j
+//       xs  fp32  [T][NB]       the block scales d, token-major (token t, block b at index t * NB + b)
+//   INTERLEAVED is what dp4a wants after the MXFP4 decode: the 8-byte groups are [x[4k], x[4k+16], x[4k+1], x[4k+17], x[4k+2], x[4k+18], x[4k+3],
+//   x[4k+19]] for k = 0..3, i.e. the 32-bit word 2m of a block holds the bytes of elements 4m..4m+3 interleaved... precisely: word w (0..7) holds bytes 4w..4w+3,
+//   and word 2k = [x[4k], x[4k+16], x[4k+1], x[4k+17]], word 2k+1 = [x[4k+2], x[4k+18], x[4k+3], x[4k+19]].  A GEMV whose weights are stored as Q8_0 (32 int8
+//   in natural order per block) wants NATURAL: word w = x[4w..4w+3], 8 dp4a per block with no permute.  One quantise call per (input, order); every GEMV that
+//   reads the same input in the same order shares it.
+//   Alignment: xq 16 bytes, xs 16 bytes when NB % 4 == 0 (else 4).  Sizes: quant_acts_q_bytes(T, W) = T*W bytes, quant_acts_s_floats(T, W) = T*W/32 floats.
+//   (act_perm_pos() below is the single definition of the interleaved order.)
+//
+//   The hot experts' own buffers (ExpertScratch): xq / xs = the quantised x with W = kHidden, INTERLEAVED; hq: int8 [kTopK*T][kFF/32][32] (h, indexed by
+//   HIT index, interleaved), hs: fp32 [kTopK*T][kFF/32].
 //
 // ---------------------------------------------------------------------------------------------------------------------
 // A DECODE LAYER (one stream; T = 1..8), and what the caller guarantees
 // ---------------------------------------------------------------------------------------------------------------------
-//   router_forward(x, wg, bias, T, logits_ws, ids, weights, s);
-//   split_hits_misses(ids, weights, T, residency, n_slots, layer, hits, misses, groups, counts, &record[layer], seq[layer], s);
+//   router_forward<G>(x, wg, bias, T, logits_ws, ids, weights, s);
+//   split_hits_misses<G>(ids, weights, T, residency, n_slots, layer, hits, misses, groups, counts, &record[layer], seq[layer], s);
 //   ... the host CPU pool: split_host_wait(record[layer], seq[layer]), then reads the record's counts and `misses` and computes the misses ...
-//   experts_hits(cache_base, x, hits, groups, counts, T, scratch, parts, s);     // parts rows of the misses stay untouched
+//   experts_hits<G>(cache_base, x, hits, groups, counts, T, scratch, parts, s);     // parts rows of the misses stay untouched
 //   ... out[t] = shared expert + sum over k of parts[t*6+k] (hits) + the CPU's partials (misses), FP32 ...
 //   * every pointer is a device pointer, except the optional host record and the miss list the caller wants the host to read (mapped pinned
-//     host memory is addressable by the kernels); `counts`, `hits` and `groups` are DEVICE memory; a null stream is the default stream;
+//     host memory is addressable by the kernels); `counts`, `hits` and `groups` are DEVICE memory; pass `dev.stream()` as the stream;
 //   * alignment: x, wg, logits, xq, xs, hq, hs, parts: 16 bytes; cache_base: 256 bytes (kBlobBytes is a multiple of 256, so every slot is);
 //   * the groups given to experts_gate_up / experts_down must be the ones split_hits_misses produced (sorted by decreasing size);
 //   * the cache slots must be complete and ordered before the experts kernels on the stream (fills on the same stream, or an event); the
 //     residency table names a slot only after its blob is complete, and is initialised to -1 (see "Cache slots");
-//   * the blobs are the GGUF layout of CONTRACTS.md: [gate][up][down], MXFP4 blocks of 17 bytes, rows 2720 / 1224 bytes;
+//   * the blobs are the GGUF layout of CONTRACTS.md: [gate][up][down], MXFP4 blocks of 17 bytes, rows 2720 / 1224 bytes (kHidden/32 and kFF/32 blocks);
 //   * experts_* work for T = 1..8 only; router_* and split_hits_misses (without groups) for any T (prefill).
 // Errors (bad T, a failed launch) throw std::invalid_argument / std::runtime_error.
 //
 // Everything here is plain C++ (void* streams) so that host code needs no CUDA headers.
 #pragma once
 
+#include "strata/ds41/cuda/ds41_dev.hpp"
+#include "strata/ds41/geom.hpp"
 #include "strata/ds41/geometry.hpp"
 
 #include <atomic>
@@ -107,12 +141,31 @@
 namespace strata::ds41::cuda {
 
 inline constexpr int kMaxExpertTokens = 8;               // expert kernels: T = 1..8 (decode / a verify window)
-inline constexpr int kActBlocks = kHidden / kQK;         // 160 blocks of 32 in x
-inline constexpr int kHBlocks = kFF / kQK;               // 72 blocks of 32 in h
 inline constexpr int kRouterSmallT = 32;                 // router: T <= 32 -> GEMV kernel, above -> the token-looping kernel (same reduction order, same bits)
 
-/// Byte position of natural element j (0..31) of a 32-block inside the kernel's int8 layout (see above).
+/// Byte position of natural element j (0..31) of a 32-block inside the kernel's INTERLEAVED int8 layout (see above).
 constexpr int act_perm_pos(int j) { return ((j & 15) >> 2) * 8 + (j & 3) * 2 + (j >> 4); }
+
+/// How the 32 int8 of a quantised block are ordered (see "ACTIVATION AND h LAYOUT").
+enum class ActOrder { kInterleaved, kNatural };
+
+/// The shapes of the hot-expert path at geometry G (RealGeom: 160 blocks of x, 72 of h, the 18,800,640-byte blob).
+template <class G> struct ExpertDims {
+    static_assert(geom_ok<G>(), "G violates the kernel constraints of geom.hpp");
+    static constexpr int kHidden = G::kHidden, kFF = G::kFF, kTopK = G::kTopK;
+    static constexpr int kActBlocks = G::kHidden / kQK;                       // 32-blocks of x            (160)
+    static constexpr int kHBlocks = G::kFF / kQK;                             // 32-blocks of h            (72)
+    static constexpr size_t kGateRowBytes = (size_t) kActBlocks * kBlockBytes;   // a gate / up row         (2720)
+    static constexpr size_t kDownRowBytes = (size_t) kHBlocks * kBlockBytes;     // a down row              (1224)
+    static constexpr size_t kGateBytes = Derived<G>::kExpertGateBytes;           // gate (and up) matrix    (6,266,880)
+    static constexpr size_t kDownBytes = Derived<G>::kExpertDownBytes;
+    static constexpr size_t kBlobGate = 0;                                    // blob = [gate][up][down]
+    static constexpr size_t kBlobUp = kGateBytes;
+    static constexpr size_t kBlobDown = 2 * kGateBytes;
+    static constexpr size_t kBlobBytes = Derived<G>::kExpertBlobBytes;        // 18,800,640
+    static_assert(kGateBytes == (size_t) kFF * kGateRowBytes && kDownBytes == (size_t) kHidden * kDownRowBytes && kBlobBytes % 256 == 0,
+                  "one cache slot is a whole number of 256-byte units");
+};
 
 struct HitEntry {
     int32_t token;
@@ -149,34 +202,34 @@ struct HitGroup {
 static_assert(sizeof(HitEntry) == 16 && sizeof(MissEntry) == 16 && sizeof(SplitCounts) == 16 && sizeof(HitGroup) == 40 && sizeof(SplitHostRecord) == 32);
 
 // ---- router -------------------------------------------------------------------------------------------------------
-/// Bytes of the logits workspace for T tokens (fp32 [T][384]).
-inline constexpr size_t router_workspace_bytes(int T) { return (size_t) T * kExperts * sizeof(float); }
+/// Bytes of the logits workspace for T tokens (fp32 [T][kExperts]).
+template <class G> inline constexpr size_t router_workspace_bytes(int T) { return (size_t) T * G::kExperts * sizeof(float); }
 
 /// logits[t][e] = sum_k x[t][k] * bf16_to_f32(wg[e][k]), FP32 accumulation in a fixed order (deterministic run to run) that does NOT
-/// depend on T: every (token, expert) logit is 10 warp slices of 2 x 8 chained FMAs per lane, a 32-lane butterfly per slice, then the ten slice
-/// totals added in order - the same bits whether the token is alone, in a verify window (T <= 32, the GEMV kernel) or in a prompt chunk (T > 32,
-/// the token-looping kernel that reads Wg from L2 once per token group).
-/// x [T][5120] fp32, wg [384][5120] raw bf16 bits, logits [T][384].
-void router_logits(const float* x, const uint16_t* wg_bf16, int T, float* logits, void* stream);
+/// depend on T: every (token, expert) logit is 10 warp slices of 2 x 8 chained FMAs per lane (RealGeom; a row of 256 is 1 slice of 1 x 8), a 32-lane
+/// butterfly per slice, then the slice totals added in order - the same bits whether the token is alone, in a verify window (T <= 32, the GEMV kernel)
+/// or in a prompt chunk (T > 32, the token-looping kernel that reads Wg from L2 once per token group).
+/// x [T][kHidden] fp32, wg [kExperts][kHidden] raw bf16 bits, logits [T][kExperts].
+template <class G> void router_logits(const float* x, const uint16_t* wg_bf16, int T, float* logits, void* stream);
 
 /// ids/weights from logits (see the header).  NaN logits are treated as -inf for selection.
-void router_select(const float* logits, const float* bias, int T, int32_t* ids, float* weights, void* stream);
+template <class G> void router_select(const float* logits, const float* bias, int T, int32_t* ids, float* weights, void* stream);
 
-/// router_logits + router_select.  `logits_ws` = router_workspace_bytes(T) of device memory (kept: the parity program
+/// router_logits + router_select.  `logits_ws` = router_workspace_bytes<G>(T) of device memory (kept: the parity program
 /// reads it to report near-ties).
-void router_forward(const float* x, const uint16_t* wg_bf16, const float* bias, int T, float* logits_ws, int32_t* ids,
-                    float* weights, void* stream);
+template <class G>
+void router_forward(const float* x, const uint16_t* wg_bf16, const float* bias, int T, float* logits_ws, int32_t* ids, float* weights, void* stream);
 
 // ---- hit / miss split ---------------------------------------------------------------------------------------------
-/// ids int32 [T][6], weights fp32 [T][6] (router output), residency_table int32 [40][384] (slot or -1; device; INITIALISED TO -1),
+/// ids int32 [T][kTopK], weights fp32 [T][kTopK] (router output), residency_table int32 [kLayers][kExperts] (slot or -1; device; INITIALISED TO -1),
 /// `n_slots` = the number of blobs in the cache (a residency value outside [0, n_slots) is a miss, and counted in n_bad_slots),
-/// `layer` 0..39.  Fills hits, misses, counts (DEVICE) and (only when `groups` != nullptr, requires T <= 8) groups.
-/// An id outside 0..383 is counted as a miss (and passed on unchanged).
+/// `layer` 0..kLayers-1.  Fills hits, misses, counts (DEVICE) and (only when `groups` != nullptr, requires T <= 8) groups.
+/// An id outside 0..kExperts-1 is counted as a miss (and passed on unchanged).
 /// `host` (optional, mapped host memory, one per layer in flight, see above) receives the counts and then `seq` (!= 0) with release semantics;
 /// pass nullptr when the host does not need the result before the stream is synchronised.
-void split_hits_misses(const int32_t* ids, const float* weights, int T, const int32_t* residency_table, int n_slots, int layer,
-                       HitEntry* hits, MissEntry* misses, HitGroup* groups, SplitCounts* counts, SplitHostRecord* host, uint32_t seq,
-                       void* stream);
+template <class G>
+void split_hits_misses(const int32_t* ids, const float* weights, int T, const int32_t* residency_table, int n_slots, int layer, HitEntry* hits,
+                       MissEntry* misses, HitGroup* groups, SplitCounts* counts, SplitHostRecord* host, uint32_t seq, void* stream);
 
 /// The next sequence number for a host record: 1, 2, ... and back to 1 after 0xFFFFFFFF (0 is the cleared state).
 inline uint32_t split_next_seq(uint32_t seq) { return seq + 1u == 0u ? 1u : seq + 1u; }
@@ -202,38 +255,70 @@ inline bool split_host_wait(const SplitHostRecord& rec, uint32_t seq, double tim
     }
 }
 
+// ---- the activation quantiser (all widths) --------------------------------------------------------------------------
+/// Bytes of xq and floats of xs for T rows of `width` values (a multiple of 32).
+constexpr size_t quant_acts_q_bytes(int T, int width) { return (size_t) T * width; }
+constexpr size_t quant_acts_s_floats(int T, int width) { return (size_t) T * (width / 32); }
+
+/// x fp32 [T][width] (row-major, contiguous; 4-byte aligned) -> xq int8 [T][width/32][32], xs fp32 [T][width/32] in the layout of "ACTIVATION AND h
+/// LAYOUT" (`order`: INTERLEAVED for the MXFP4 expert kernels, NATURAL for a Q8_0 GEMV).  `width` any multiple of 32 (the dense GEMVs: 1280, 5120,
+/// 8192, 32768 ...); T >= 1 (any); the rule is CONTRACTS.md's, bit-identical to the CPU's on every input.  Launched on `stream` (nullptr = dev.stream());
+/// stream-ordered, allocation-free.  With width == G::kHidden and the INTERLEAVED order this is the expert path's own kernel (compile-time width).
+/// Throws std::invalid_argument for width % 32 != 0, T < 1 or a misaligned pointer.
+template <class G>
+void ds41_quantize_acts(Dev& dev, const float* x, int T, int width, int8_t* xq, float* xs, Stream stream = nullptr, ActOrder order = ActOrder::kInterleaved);
+
 // ---- hit experts --------------------------------------------------------------------------------------------------
 struct ExpertScratch {
-    int8_t* xq;   // [T][160][32]
-    float* xs;    // [T][160]
-    int8_t* hq;   // [6T][72][32]
-    float* hs;    // [6T][72]
+    int8_t* xq;   // [T][kHidden/32][32]
+    float* xs;    // [T][kHidden/32]
+    int8_t* hq;   // [kTopK*T][kFF/32][32]
+    float* hs;    // [kTopK*T][kFF/32]
 };
+namespace detail {
+constexpr size_t up256(size_t v) { return (v + 255) & ~(size_t) 255; }
+}
 /// Device bytes of scratch for T tokens (T = 1..8), and the carving of one allocation (256-byte aligned parts).
-size_t expert_scratch_bytes(int T);
-ExpertScratch expert_scratch_carve(void* device_base, int T);
-
-/// x fp32 [T][5120] -> xq, xs (T = 1..8; any T works, the other expert kernels need T <= 8).
-void quantize_acts(const float* x, int T, int8_t* xq, float* xs, void* stream);
+template <class G> constexpr size_t expert_scratch_bytes(int T) {
+    using D = ExpertDims<G>;
+    return detail::up256((size_t) T * D::kActBlocks * 32) + detail::up256((size_t) T * D::kActBlocks * 4) + detail::up256((size_t) G::kTopK * T * G::kFF) +
+           detail::up256((size_t) G::kTopK * T * D::kHBlocks * 4);
+}
+template <class G> inline ExpertScratch expert_scratch_carve(void* device_base, int T) {
+    using D = ExpertDims<G>;
+    auto* p = static_cast<unsigned char*>(device_base);
+    ExpertScratch s;
+    s.xq = reinterpret_cast<int8_t*>(p);
+    p += detail::up256((size_t) T * D::kActBlocks * 32);
+    s.xs = reinterpret_cast<float*>(p);
+    p += detail::up256((size_t) T * D::kActBlocks * 4);
+    s.hq = reinterpret_cast<int8_t*>(p);
+    p += detail::up256((size_t) G::kTopK * T * G::kFF);
+    s.hs = reinterpret_cast<float*>(p);
+    return s;
+}
 
 /// Optional: sets the shared-memory attributes of all expert kernel specialisations (what the first launch does lazily), so that nothing
 /// but kernel launches happens inside a CUDA graph capture.  Idempotent.
-void experts_prepare();
+template <class G> void experts_prepare();
 
 /// Phase 1.  For every group in `groups` (counts->n_groups, read from DEVICE memory): h = silu(min(W1.x,10)) * clamp(W3.x,+-10) * w
 /// for every token of the group (NaN propagates through the clamps), quantised into hq/hs at the HIT index.  `cache_base`: slot s is the
 /// blob at cache_base + s * kBlobBytes (256-byte aligned; split_hits_misses only emits slots in [0, n_slots)).  `T` only sizes the grid and
 /// picks the specialisation (the maximum number of tokens per group).
-void experts_gate_up(const uint8_t* cache_base, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts,
-                     int T, const int8_t* xq, const float* xs, int8_t* hq, float* hs, void* stream);
+template <class G>
+void experts_gate_up(const uint8_t* cache_base, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts, int T, const int8_t* xq,
+                     const float* xs, int8_t* hq, float* hs, void* stream);
 
-/// Phase 2.  parts[(token*6 + k)][5120] = W2 . h for every hit; miss entries of `parts` are not touched.
-void experts_down(const uint8_t* cache_base, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts,
-                  int T, const int8_t* hq, const float* hs, float* parts, void* stream);
+/// Phase 2.  parts[(token*kTopK + k)][kHidden] = W2 . h for every hit; miss entries of `parts` are not touched.
+template <class G>
+void experts_down(const uint8_t* cache_base, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts, int T, const int8_t* hq, const float* hs,
+                  float* parts, void* stream);
 
-/// quantize_acts + experts_gate_up + experts_down.
-void experts_hits(const uint8_t* cache_base, const float* x, const HitEntry* hits, const HitGroup* groups,
-                  const SplitCounts* counts, int T, const ExpertScratch& scratch, float* parts, void* stream);
+/// quantize x (INTERLEAVED, width kHidden) + experts_gate_up + experts_down.
+template <class G>
+void experts_hits(const uint8_t* cache_base, const float* x, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts, int T,
+                  const ExpertScratch& scratch, float* parts, void* stream);
 
 // ---- test hooks ---------------------------------------------------------------------------------------------------
 /// What the compiler made of one expert kernel specialisation (NT = 1, 2, 4 or 8 tokens per group): registers per thread, static and
@@ -244,7 +329,7 @@ struct ExpertKernelInfo {
     int dyn_smem = 0;
     int blocks_per_sm = 0;
 };
-ExpertKernelInfo expert_kernel_info(int NT, bool down);
+template <class G> ExpertKernelInfo expert_kernel_info(int NT, bool down);
 
 /// out[e] = the kernels' decode of E8M0 byte e (0..255), as the float 2^(e-128) the way ggml_e8m0_to_fp32_half has it.
 void test_e8m0_table(float* out256, void* stream);

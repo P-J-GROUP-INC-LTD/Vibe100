@@ -1,5 +1,5 @@
-// src/ds41/cuda/ds41_split_impl.cuh - DS-D: the GPU-cache hit / miss split of one layer's routing (V100, sm_70).  Included by
-// ds41_split.cu (nvcc) and by the CPU emulation test (-DDS41_EMU).
+// src/ds41/cuda/ds41_split_impl.cuh - DS-D / DS1-G: the GPU-cache hit / miss split of one layer's routing (V100, sm_70), a template over the geometry G
+// (geom.hpp: kExperts, kTopK, kLayers).  Included by ds41_split.cu (nvcc: RealGeom) and by ds41_emu_impl.cpp (-DDS41_EMU: RealGeom and MiniGeom).
 //
 // ONE BLOCK, any T.  The router's ids [T][6] are walked in (token, k) order in chunks of blockDim.x entries; for every entry the
 // layer's residency row (int32 [384], slot or -1) says hit or miss - a value is a HIT only if 0 <= r < n_slots, anything else (-1 =
@@ -27,13 +27,15 @@
 
 namespace strata::ds41::cuda::dev {
 
-inline constexpr int kSpMaxGroupedHits = kMaxExpertTokens * kTopK;     // 48
-
+template <class G>
 DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTRICT ids, const float* DS41_RESTRICT weights, int T,
                                                        const int32_t* DS41_RESTRICT residency_row, int n_slots,
                                                        HitEntry* DS41_RESTRICT hits, MissEntry* DS41_RESTRICT misses,
                                                        HitGroup* DS41_RESTRICT groups, SplitCounts* DS41_RESTRICT counts,
                                                        SplitHostRecord* DS41_RESTRICT host, uint32_t seq) {
+    constexpr int kExperts = G::kExperts, kTopK = G::kTopK;
+    constexpr int kSpMaxGroupedHits = kMaxExpertTokens * kTopK;            // 48: the hits of 8 tokens (a group's members, the leader table)
+    static_assert(kSpMaxGroupedHits <= 64, "split: the grouping runs one thread per hit of a block of >= 64 threads (8 tokens x kTopK <= 64)");
     DS41_SHARED int s_wh[32];
     DS41_SHARED int s_wm[32];
     DS41_SHARED int s_wb[32];
@@ -164,27 +166,27 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(1024) void split_kernel(const int32_t* DS41_RESTR
 
 namespace strata::ds41::cuda {
 
+template <class G>
 void split_hits_misses(const int32_t* ids, const float* weights, int T, const int32_t* residency_table, int n_slots, int layer, HitEntry* hits,
                        MissEntry* misses, HitGroup* groups, SplitCounts* counts, SplitHostRecord* host, uint32_t seq, void* stream) {
     if (T < 1) throw std::invalid_argument("split_hits_misses: T must be >= 1");
-    if (layer < 0 || layer >= kLayers) throw std::invalid_argument("split_hits_misses: layer out of range");
+    if (layer < 0 || layer >= G::kLayers) throw std::invalid_argument("split_hits_misses: layer out of range");
     if (n_slots < 0) throw std::invalid_argument("split_hits_misses: n_slots must be >= 0 (the number of cache slots the residency table may name)");
     if (groups != nullptr && T > kMaxExpertTokens) throw std::invalid_argument("split_hits_misses: groups need T <= 8");
     if (host != nullptr && seq == 0) throw std::invalid_argument("split_hits_misses: seq 0 is the cleared state of a host record; start at 1");
     if (host != nullptr && reinterpret_cast<uintptr_t>(host) % 16 != 0) throw std::invalid_argument("split_hits_misses: the host record must be 16-byte aligned");
-    const int total = T * kTopK;
+    const int total = T * G::kTopK;
     int threads = (total + 31) & ~31;
     threads = threads < 64 ? 64 : (threads > 1024 ? 1024 : threads);
-    const int32_t* row = residency_table + (size_t) layer * kExperts;
-#if defined(DS41_EMU)
-    (void) stream;
-    ds41_emu::launch(dim3(1), dim3((unsigned) threads), 0,
-                     [&] { dev::split_kernel(ids, weights, T, row, n_slots, hits, misses, groups, counts, host, seq); });
-#else
-    dev::split_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(ids, weights, T, row, n_slots, hits, misses, groups, counts, host, seq);
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) throw std::runtime_error(std::string("ds41 split_hits_misses: ") + cudaGetErrorString(e));
-#endif
+    const int32_t* row = residency_table + (size_t) layer * G::kExperts;
+    dev::launch(dev::split_kernel<G>, dim3(1), dim3((unsigned) threads), 0, stream, ids, weights, T, row, n_slots, hits, misses, groups, counts, host, seq);
+    dev::check_launch("split_hits_misses");
 }
 
 }  // namespace strata::ds41::cuda
+
+/// Explicit instantiation of the split's host entry point for geometry G (the .cu: RealGeom; the emulator build: RealGeom and MiniGeom).
+#define DS41_INSTANTIATE_SPLIT(G)                                                                                                                        \
+    template void ::strata::ds41::cuda::split_hits_misses<G>(const int32_t*, const float*, int, const int32_t*, int, int, ::strata::ds41::cuda::HitEntry*, \
+                                                             ::strata::ds41::cuda::MissEntry*, ::strata::ds41::cuda::HitGroup*, ::strata::ds41::cuda::SplitCounts*, \
+                                                             ::strata::ds41::cuda::SplitHostRecord*, uint32_t, void*);

@@ -1,5 +1,6 @@
-// src/ds41/cuda/ds41_experts_impl.cuh - DS-D: the MXFP4 hit-expert kernels (V100, sm_70).  Included by ds41_experts.cu (nvcc)
-// and by the CPU emulation test (-DDS41_EMU).
+// src/ds41/cuda/ds41_experts_impl.cuh - DS-D / DS1-G: the MXFP4 hit-expert kernels (V100, sm_70), templates over the geometry G (geom.hpp).
+// Included by ds41_experts.cu (nvcc: RealGeom) and by ds41_emu_impl.cpp (-DDS41_EMU: RealGeom and MiniGeom).  The numbers in the comments are RealGeom's
+// (hidden 5120 = 160 blocks, ff 2304 = 72 blocks); every one of them is derived from G in ExCfg below, see "SHAPES AT OTHER G" there.
 //
 // =====================================================================================================================
 // WHAT THE THREE KERNELS DO (docs/deepseek/CONTRACTS.md has the math)
@@ -86,78 +87,129 @@ namespace strata::ds41::cuda::dev {
 // ---------------------------------------------------------------------------------------------------------------------
 inline constexpr int kExThreads = 256;                    // 8 warps
 inline constexpr int kExWarps = 8;
-inline constexpr int kGuTiles = kFF / 32;                 // 72 tiles of 32 rows per group (gate/up)
 inline constexpr int kDnTileRows = 64;                    // rows per block (down)
-inline constexpr int kDnTiles = kHidden / kDnTileRows;    // 80 tiles per group
-static_assert(kFF % 32 == 0 && kHidden % kDnTileRows == 0);
 
-// gate/up stage: 2 rows x 80 blocks (half a row) = 2 x 1360 B, each row's segment padded to 1472 B (368 words = 16 mod 32)
-inline constexpr int kGuSeg = 1472;
-inline constexpr int kGuStageBytes = 2 * kGuSeg + 16;
-inline constexpr int kGuHalfBlocks = kGateRowBlocks / 2;  // 80
-// down stage: 2 rows x 72 blocks, row 1 at 1344 (336 words = 16 mod 32)
-inline constexpr int kDnSeg = 1344;
-inline constexpr int kDnStageBytes = kDnSeg + 1224 + 32;
+/// Stage-buffer padding: the smallest word count >= `w` that is 16 (mod 32), so that the second row of a pair sits 16 banks away from the first (the
+/// 16 lanes of a row read 16 different banks, the other 16 lanes of the warp read the other 16).  w = 340 -> 368, 306 -> 336.
+constexpr int pad_bank16(int w) { return ((w - 16 + 31) / 32) * 32 + 16; }
 
-inline constexpr int kXBytesPerTok = kActBlocks * 36;     // 160 x (16 + 16 + 4) = 5760 smem bytes of activations per token (x)
-inline constexpr int kHBytesPerTok = kHBlocks * 36;       // 72 x 36 = 2592 (h)
+/// SHAPES AT OTHER G.  Everything the kernels index with, derived from G.  RealGeom: hidden 5120 (160 blocks, rows of 2720 B = 170 x 16), ff 2304 (72 blocks,
+/// down rows of 1224 B = 153 x 8).  A row of W2 must be a whole number of 8-byte pieces (kFF % 256 == 0); a pair of gate/up rows a whole number of 16-byte
+/// chunks (kHidden % 256 == 0).  When the gate/up row has a multiple of 32 blocks (kHidden % 1024 == 0, RealGeom) a stage is HALF a row of two rows
+/// (rows are 16-byte aligned, the halves too: 1360 B = 85 x 16) as always; otherwise (MiniGeom: 8 blocks = 136 B per row, not a multiple of 16) the whole
+/// PAIR of rows is contiguous in global memory (2 x 136 = 17 chunks) and is staged as one run: the second row follows the first in shared memory with no
+/// padding.  Same kernel, same arithmetic; only the staging constants differ (kGuSplits, kGuRowSplit, kGuGap, kGuSeg).
+template <class G>
+struct ExCfg {
+    using D = ExpertDims<G>;
+    static constexpr int kHidden = G::kHidden, kFF = G::kFF, kTopK = G::kTopK;
+    static constexpr int kActBlocks = D::kActBlocks;          // 160 blocks of 32 in x
+    static constexpr int kHBlocks = D::kHBlocks;              // 72 blocks of 32 in h
+    static constexpr size_t kGateRowBytes = D::kGateRowBytes, kDownRowBytes = D::kDownRowBytes;
+    static constexpr size_t kBlobGate = D::kBlobGate, kBlobUp = D::kBlobUp, kBlobDown = D::kBlobDown, kBlobBytes = D::kBlobBytes;
+    static constexpr int kGuTiles = kFF / 32;                 // 72 tiles of 32 rows per group (gate/up)
+    static constexpr int kDnTiles = kHidden / kDnTileRows;    // 80 tiles per group (down)
 
+    // ---- gate/up: a stage = 2 rows x (half a row | a whole row), the two rows of a pair
+    static constexpr bool kGuHalves = kActBlocks % 32 == 0;
+    static constexpr int kGuSplits = kGuHalves ? 2 : 1;       // stages per row
+    static constexpr int kGuSplitLog2 = kGuHalves ? 1 : 0;
+    static constexpr int kGuSegBlocks = kActBlocks / kGuSplits;                        // 80 blocks of a row per stage
+    static constexpr int kGuSegBytes = kGuSegBlocks * kBlockBytes;                     // 1360
+    static constexpr int kGuChunks = 2 * kGuSegBytes / 16;                             // 170 chunks of 16 B per stage (both rows)
+    static constexpr int kGuRowSplit = kGuHalves ? kGuSegBytes / 16 : kGuChunks;       // 85: the first chunk of row 1 (never reached when contiguous)
+    static constexpr int kGuGap = kGuHalves ? (int) kGateRowBytes - kGuSegBytes : 0;   // 1360: global bytes between row 0's segment and row 1's
+    static constexpr int kGuPF = (kGuChunks + 31) / 32;                                // 6 registers of 16 B per lane
+    static constexpr int kGuSeg = kGuHalves ? 4 * pad_bank16(kGuSegBytes / 4) : kGuSegBytes;   // 1472: row 1's segment in shared memory
+    static constexpr int kGuStageBytes = 2 * kGuSeg + 16;
 
-template <int NT>
-struct GuLayout {
-    static constexpr int lo = 0;                                  // uint4 [NT][160]
-    static constexpr int hi = lo + NT * kActBlocks * 16;          // uint4 [NT][160]
-    static constexpr int sc = hi + NT * kActBlocks * 16;          // float [NT][160]
-    static constexpr int h = sc + NT * kActBlocks * 4;            // float [NT][32]
-    static constexpr int stage = round16(h + NT * 32 * 4);        // 8 warps x kGuStageBytes
-    static constexpr int total = stage + kExWarps * kGuStageBytes;
+    // ---- down: a stage = 2 whole rows (contiguous in global memory), 8-byte pieces
+    static constexpr int kDnPieces = (int) (kDownRowBytes / 8);                        // 153 pieces of 8 B per row
+    static constexpr int kDnTotal = 2 * kDnPieces;                                     // 306
+    static constexpr int kDnPF = (kDnTotal + 31) / 32;                                 // 10 registers of 8 B per lane
+    static constexpr int kDnSeg = 4 * pad_bank16((int) (kDownRowBytes / 4));           // 1344
+    static constexpr int kDnStageBytes = kDnSeg + (int) kDownRowBytes + 32;
+
+    static constexpr int kXBytesPerTok = kActBlocks * 36;     // 160 x (16 + 16 + 4) = 5760 smem bytes of activations per token (x)
+    static constexpr int kHBytesPerTok = kHBlocks * 36;       // 72 x 36 = 2592 (h)
+
+    static_assert(kFF % 32 == 0 && kHidden % kDnTileRows == 0, "experts: kFF % 32 == 0 (an h block is a tile of 32 rows), kHidden % 64 == 0 (the down tile)");
+    static_assert(kHidden % 256 == 0, "experts: a pair of gate/up rows is a whole number of 16-byte chunks (kHidden % 256 == 0)");
+    static_assert(kFF % 256 == 0, "experts: a row of W2 is a whole number of 8-byte pieces (kFF % 256 == 0)");
+    static_assert(kActBlocks % 4 == 0 && kHBlocks % 4 == 0, "experts: the block scales are copied as float4");
+    static_assert(!kGuHalves || kGuSegBytes % 16 == 0, "experts: half rows are 16-byte aligned");
+    static_assert(kGateRowBytes % 16 == 0 || !kGuHalves, "experts: gate/up rows are 16-byte aligned when they are staged in halves");
+    static_assert((2 * kGateRowBytes) % 16 == 0, "experts: a pair of gate/up rows starts on a 16-byte boundary");
+    static_assert(kGuStageBytes % 16 == 0, "experts: the gate/up stage buffers are 16-byte aligned (ST.E.128)");
+    static_assert(kDnStageBytes % 8 == 0, "experts: the down stage buffers are 8-byte aligned (ST.E.64)");
+    static_assert(kBlobBytes % 256 == 0 && kBlobUp % 16 == 0 && kBlobDown % 16 == 0, "experts: slots and matrices keep their alignment");
 };
-template <int NT>
+
+template <class G, int NT>
+struct GuLayout {
+    using C = ExCfg<G>;
+    static constexpr int lo = 0;                                  // uint4 [NT][160]
+    static constexpr int hi = lo + NT * C::kActBlocks * 16;       // uint4 [NT][160]
+    static constexpr int sc = hi + NT * C::kActBlocks * 16;       // float [NT][160]
+    static constexpr int h = sc + NT * C::kActBlocks * 4;         // float [NT][32]
+    static constexpr int stage = round16(h + NT * 32 * 4);        // 8 warps x kGuStageBytes
+    static constexpr int total = stage + kExWarps * C::kGuStageBytes;
+};
+template <class G, int NT>
 struct DnLayout {
+    using C = ExCfg<G>;
     static constexpr int lo = 0;                                  // uint4 [NT][72]
-    static constexpr int hi = lo + NT * kHBlocks * 16;
-    static constexpr int sc = hi + NT * kHBlocks * 16;            // float [NT][72]
-    static constexpr int y = sc + NT * kHBlocks * 4;              // float [NT][64]
+    static constexpr int hi = lo + NT * C::kHBlocks * 16;
+    static constexpr int sc = hi + NT * C::kHBlocks * 16;         // float [NT][72]
+    static constexpr int y = sc + NT * C::kHBlocks * 4;           // float [NT][64]
     static constexpr int stage = round16(y + NT * kDnTileRows * 4);
-    static constexpr int total = stage + kExWarps * kDnStageBytes;
+    static constexpr int total = stage + kExWarps * C::kDnStageBytes;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // stage movement: global -> registers (one stage ahead) -> shared memory
 // ---------------------------------------------------------------------------------------------------------------------
 /// W1/W3: `base` = first byte of the stage's first row (+ half * 1360).  Chunk u of 16 B (0..169): row (u >= 85), offset.
-DS41_FI void gu_load(uint4 (&pf)[6], const uint8_t* base, int lane) {
+template <class G>
+DS41_FI void gu_load(uint4 (&pf)[ExCfg<G>::kGuPF], const uint8_t* base, int lane) {
+    using C = ExCfg<G>;
     DS41_UNROLL
-    for (int j = 0; j < 6; ++j) {
+    for (int j = 0; j < C::kGuPF; ++j) {
         const int u = lane + 32 * j;
-        if (u < 170) pf[j] = ldg4(base + 16 * u + (u >= 85 ? 1360 : 0));       // row 1 starts 2720 B on: 16u + 1360 = 2720 + 16 (u - 85)
+        if (u < C::kGuChunks) pf[j] = ldg4(base + 16 * u + (u >= C::kGuRowSplit ? C::kGuGap : 0));       // row 1 starts 2720 B on: 16u + 1360 = 2720 + 16 (u - 85)
     }
 }
-DS41_FI void gu_store(const uint4 (&pf)[6], unsigned char* stage, int lane) {
+template <class G>
+DS41_FI void gu_store(const uint4 (&pf)[ExCfg<G>::kGuPF], unsigned char* stage, int lane) {
+    using C = ExCfg<G>;
     DS41_UNROLL
-    for (int j = 0; j < 6; ++j) {
+    for (int j = 0; j < C::kGuPF; ++j) {
         const int u = lane + 32 * j;
-        if (u < 170) {
-            DS41_ASSERT_ALIGNED(stage + 16 * u + (u >= 85 ? kGuSeg - 1360 : 0), 16);          // ST.E.128 to shared memory: misaligned = a fault
-            *reinterpret_cast<uint4*>(stage + 16 * u + (u >= 85 ? kGuSeg - 1360 : 0)) = pf[j];
+        if (u < C::kGuChunks) {
+            DS41_ASSERT_ALIGNED(stage + 16 * u + (u >= C::kGuRowSplit ? C::kGuSeg - C::kGuSegBytes : 0), 16);          // ST.E.128 to shared memory: misaligned = a fault
+            *reinterpret_cast<uint4*>(stage + 16 * u + (u >= C::kGuRowSplit ? C::kGuSeg - C::kGuSegBytes : 0)) = pf[j];
         }
     }
 }
 /// W2: `base` = first byte of the stage's first row; the two rows are contiguous (2448 B = 306 pieces of 8 B).
-DS41_FI void dn_load(uint2 (&pf)[10], const uint8_t* base, int lane) {
+template <class G>
+DS41_FI void dn_load(uint2 (&pf)[ExCfg<G>::kDnPF], const uint8_t* base, int lane) {
+    using C = ExCfg<G>;
     DS41_UNROLL
-    for (int j = 0; j < 10; ++j) {
+    for (int j = 0; j < C::kDnPF; ++j) {
         const int p = lane + 32 * j;
-        if (p < 306) pf[j] = ldg2(base + 8 * p);
+        if (p < C::kDnTotal) pf[j] = ldg2(base + 8 * p);
     }
 }
-DS41_FI void dn_store(const uint2 (&pf)[10], unsigned char* stage, int lane) {
+template <class G>
+DS41_FI void dn_store(const uint2 (&pf)[ExCfg<G>::kDnPF], unsigned char* stage, int lane) {
+    using C = ExCfg<G>;
     DS41_UNROLL
-    for (int j = 0; j < 10; ++j) {
+    for (int j = 0; j < C::kDnPF; ++j) {
         const int p = lane + 32 * j;
-        if (p < 306) {
-            DS41_ASSERT_ALIGNED(stage + 8 * p + (p >= 153 ? kDnSeg - 1224 : 0), 8);           // ST.E.64 to shared memory
-            *reinterpret_cast<uint2*>(stage + 8 * p + (p >= 153 ? kDnSeg - 1224 : 0)) = pf[j];
+        if (p < C::kDnTotal) {
+            DS41_ASSERT_ALIGNED(stage + 8 * p + (p >= C::kDnPieces ? C::kDnSeg - (int) C::kDownRowBytes : 0), 8);           // ST.E.64 to shared memory
+            *reinterpret_cast<uint2*>(stage + 8 * p + (p >= C::kDnPieces ? C::kDnSeg - (int) C::kDownRowBytes : 0)) = pf[j];
         }
     }
 }
@@ -178,7 +230,7 @@ DS41_FI void stage_dot(const unsigned char* seg, int kk, int blk0, const uint4* 
     DS41_UNROLL
     for (int m = 0; m < (NB + 15) / 16; ++m) {
         const int bl = kk + 16 * m;
-        if (NB % 16 == 0 || bl < NB) {                     // only the 72-block rows of W2 have a ragged last step
+        if (NB % 16 == 0 || bl < NB) {                     // only the 72-block rows of W2 have a ragged last step (and rows of fewer than 16 blocks)
             const uint32_t* wp = wbase + ((17 * bl) >> 2);
             const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3], w4 = wp[4];
             const float d = e8m0_half(prmt(w0, 0u, sel_e));
@@ -214,14 +266,18 @@ DS41_FI void stage_dot(const unsigned char* seg, int kk, int blk0, const uint4* 
 // ---------------------------------------------------------------------------------------------------------------------
 // x -> int8
 // ---------------------------------------------------------------------------------------------------------------------
+/// One warp per (token, 32-block).  NB > 0: the row has NB blocks at COMPILE time (the expert path: ExpertDims<G>::kActBlocks, the same code as ever);
+/// NB == 0: `nb_rt` blocks per row at run time (the generic ds41_quantize_acts).  kInter: the interleaved (dp4a / MXFP4) byte order, else natural.
+template <int NB, bool kInter>
 DS41_KERNEL DS41_LAUNCH_BOUNDS(256) void quantize_acts_kernel(const float* DS41_RESTRICT x, int T, int8_t* DS41_RESTRICT xq,
-                                                              float* DS41_RESTRICT xs) {
+                                                              float* DS41_RESTRICT xs, int nb_rt) {
+    const int nb = NB > 0 ? NB : nb_rt;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int gw = blockIdx.x * kExWarps + warp;           // one warp per (token, 32-block)
-    if (gw >= T * kActBlocks) return;
-    const int t = gw / kActBlocks, b = gw - t * kActBlocks;
-    const float v = ldgf(x + (size_t) t * kHidden + b * 32 + lane);
-    quantize_block_warp(v, lane, xq + ((size_t) t * kActBlocks + b) * 32, xs + (size_t) t * kActBlocks + b);
+    if (gw >= T * nb) return;
+    const int t = gw / nb, b = gw - t * nb;
+    const float v = ldgf(x + (size_t) t * (nb * 32) + b * 32 + lane);
+    quantize_block_warp<kInter>(v, lane, xq + ((size_t) t * nb + b) * 32, xs + (size_t) t * nb + b);
 }
 
 DS41_KERNEL void e8m0_table_kernel(float* out) { out[threadIdx.x] = e8m0_half(threadIdx.x); }
@@ -229,14 +285,16 @@ DS41_KERNEL void e8m0_table_kernel(float* out) { out[threadIdx.x] = e8m0_half(th
 // ---------------------------------------------------------------------------------------------------------------------
 // phase 1: gate / up -> h (quantised)
 // ---------------------------------------------------------------------------------------------------------------------
-template <int NT>
+template <class G, int NT>
 DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void gate_up_kernel(const uint8_t* DS41_RESTRICT cache, const HitEntry* DS41_RESTRICT hits,
                                                            const HitGroup* DS41_RESTRICT groups,
                                                            const SplitCounts* DS41_RESTRICT counts,
                                                            const int8_t* DS41_RESTRICT xq, const float* DS41_RESTRICT xs,
                                                            int8_t* DS41_RESTRICT hq, float* DS41_RESTRICT hs, int n_lo,
                                                            int n_hi) {
-    using L = GuLayout<NT>;
+    using C = ExCfg<G>;
+    using L = GuLayout<G, NT>;
+    constexpr int kHidden = C::kHidden, kActBlocks = C::kActBlocks, kHBlocks = C::kHBlocks;
     const int g = blockIdx.y;
     if (g >= counts->n_groups) return;                     // uniform for the block
     const int tile = blockIdx.x;
@@ -251,16 +309,16 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void gate_up_kernel(const
     uint4* act_hi = reinterpret_cast<uint4*>(smem + L::hi);
     float* act_sc = reinterpret_cast<float*>(smem + L::sc);
     float* s_h = reinterpret_cast<float*>(smem + L::h);
-    unsigned char* stage = smem + L::stage + warp * kGuStageBytes;
+    unsigned char* stage = smem + L::stage + warp * C::kGuStageBytes;
 
     // this warp's 4 rows = two row PAIRS; the stage sequence is (pair p, half h) x (gate, up)
-    const uint8_t* blob = cache + (size_t) gp->slot * kBlobBytes;
+    const uint8_t* blob = cache + (size_t) gp->slot * C::kBlobBytes;
     const int row_base = tile * 32 + warp * 4;
-    const uint8_t* gate_rows = blob + kBlobGate + (size_t) row_base * kGateRowBytes;
-    const uint8_t* up_rows = blob + kBlobUp + (size_t) row_base * kGateRowBytes;
+    const uint8_t* gate_rows = blob + C::kBlobGate + (size_t) row_base * C::kGateRowBytes;
+    const uint8_t* up_rows = blob + C::kBlobUp + (size_t) row_base * C::kGateRowBytes;
 
-    uint4 pf[6];
-    gu_load(pf, gate_rows, lane);                          // stage (p0, h0, gate): in flight while the activations are copied
+    uint4 pf[C::kGuPF];
+    gu_load<G>(pf, gate_rows, lane);                       // stage (p0, h0, gate): in flight while the activations are copied
 
     // activations of the group's tokens -> shared memory (lo / hi 16-byte halves of every block, scales)
     for (int j = 0; j < n; ++j) {
@@ -280,29 +338,29 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void gate_up_kernel(const
     float acc_g[NT], acc_u[NT];
     DS41_UNROLL
     for (int t = 0; t < NT; ++t) acc_g[t] = acc_u[t] = 0.0f;
-    const unsigned char* seg = stage + rr * kGuSeg;
+    const unsigned char* seg = stage + rr * C::kGuSeg;
 
     DS41_UNROLL1
-    for (int ph = 0; ph < 4; ++ph) {
-        const int p = ph >> 1, half = ph & 1;
-        const size_t off = (size_t) (2 * p) * kGateRowBytes + (size_t) half * (kGuHalfBlocks * kBlockBytes);
+    for (int ph = 0; ph < 2 * C::kGuSplits; ++ph) {
+        const int p = ph >> C::kGuSplitLog2, half = ph & (C::kGuSplits - 1);
+        const size_t off = (size_t) (2 * p) * C::kGateRowBytes + (size_t) half * C::kGuSegBytes;
         // ---- gate stage of (p, half)
-        gu_store(pf, stage, lane);
+        gu_store<G>(pf, stage, lane);
         sync_warp();
-        gu_load(pf, up_rows + off, lane);
-        stage_dot<NT, kGuHalfBlocks, kActBlocks>(seg, kk, half * kGuHalfBlocks, act_lo, act_hi, act_sc, n, acc_g);
+        gu_load<G>(pf, up_rows + off, lane);
+        stage_dot<NT, C::kGuSegBlocks, kActBlocks>(seg, kk, half * C::kGuSegBlocks, act_lo, act_hi, act_sc, n, acc_g);
         sync_warp();
         // ---- up stage of (p, half)
-        gu_store(pf, stage, lane);
+        gu_store<G>(pf, stage, lane);
         sync_warp();
-        if (ph < 3) {
-            const int pn = (ph + 1) >> 1, hn = (ph + 1) & 1;
-            gu_load(pf, gate_rows + (size_t) (2 * pn) * kGateRowBytes + (size_t) hn * (kGuHalfBlocks * kBlockBytes), lane);
+        if (ph < 2 * C::kGuSplits - 1) {
+            const int pn = (ph + 1) >> C::kGuSplitLog2, hn = (ph + 1) & (C::kGuSplits - 1);
+            gu_load<G>(pf, gate_rows + (size_t) (2 * pn) * C::kGateRowBytes + (size_t) hn * C::kGuSegBytes, lane);
         }
-        stage_dot<NT, kGuHalfBlocks, kActBlocks>(seg, kk, half * kGuHalfBlocks, act_lo, act_hi, act_sc, n, acc_u);
+        stage_dot<NT, C::kGuSegBlocks, kActBlocks>(seg, kk, half * C::kGuSegBlocks, act_lo, act_hi, act_sc, n, acc_u);
         sync_warp();
 
-        if (half == 1) {
+        if (half == C::kGuSplits - 1) {
             // ---- the pair's rows are complete: reduce over the 16 lanes of each row, then h = silu(g) * u * w
             constexpr int S = ilog2(2 * NT);
             float v[2 * NT];
@@ -338,13 +396,15 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void gate_up_kernel(const
 // ---------------------------------------------------------------------------------------------------------------------
 // phase 2: down
 // ---------------------------------------------------------------------------------------------------------------------
-template <int NT>
+template <class G, int NT>
 DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void down_kernel(const uint8_t* DS41_RESTRICT cache, const HitEntry* DS41_RESTRICT hits,
                                                         const HitGroup* DS41_RESTRICT groups,
                                                         const SplitCounts* DS41_RESTRICT counts,
                                                         const int8_t* DS41_RESTRICT hq, const float* DS41_RESTRICT hs,
                                                         float* DS41_RESTRICT parts, int n_lo, int n_hi) {
-    using L = DnLayout<NT>;
+    using C = ExCfg<G>;
+    using L = DnLayout<G, NT>;
+    constexpr int kHidden = C::kHidden, kFF = C::kFF, kTopK = C::kTopK, kHBlocks = C::kHBlocks;
     const int g = blockIdx.y;
     if (g >= counts->n_groups) return;
     const int tile = blockIdx.x;
@@ -359,14 +419,14 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void down_kernel(const ui
     uint4* act_hi = reinterpret_cast<uint4*>(smem + L::hi);
     float* act_sc = reinterpret_cast<float*>(smem + L::sc);
     float* s_y = reinterpret_cast<float*>(smem + L::y);
-    unsigned char* stage = smem + L::stage + warp * kDnStageBytes;
+    unsigned char* stage = smem + L::stage + warp * C::kDnStageBytes;
 
-    const uint8_t* blob = cache + (size_t) gp->slot * kBlobBytes;
+    const uint8_t* blob = cache + (size_t) gp->slot * C::kBlobBytes;
     const int row0 = tile * kDnTileRows + warp * 8;        // this warp: 4 row pairs
-    const uint8_t* rows = blob + kBlobDown + (size_t) row0 * kDownRowBytes;
+    const uint8_t* rows = blob + C::kBlobDown + (size_t) row0 * C::kDownRowBytes;
 
-    uint2 pf[10];
-    dn_load(pf, rows, lane);
+    uint2 pf[C::kDnPF];
+    dn_load<G>(pf, rows, lane);
 
     for (int j = 0; j < n; ++j) {
         const int hit = gp->hit[j];
@@ -382,12 +442,12 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void down_kernel(const ui
     }
     sync_block();
 
-    const unsigned char* seg = stage + rr * kDnSeg;
+    const unsigned char* seg = stage + rr * C::kDnSeg;
     DS41_UNROLL1
     for (int p = 0; p < 4; ++p) {
-        dn_store(pf, stage, lane);
+        dn_store<G>(pf, stage, lane);
         sync_warp();
-        if (p < 3) dn_load(pf, rows + (size_t) (2 * (p + 1)) * kDownRowBytes, lane);
+        if (p < 3) dn_load<G>(pf, rows + (size_t) (2 * (p + 1)) * C::kDownRowBytes, lane);
         float acc[NT];
         DS41_UNROLL
         for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
@@ -411,53 +471,30 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(256, (NT == 1 ? 3 : 2)) void down_kernel(const ui
 // ---------------------------------------------------------------------------------------------------------------------
 // host side
 // ---------------------------------------------------------------------------------------------------------------------
-inline void check_launch(const char* what) {
-#if !defined(DS41_EMU)
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) throw std::runtime_error(std::string("ds41 ") + what + ": " + cudaGetErrorString(e));
-#else
-    (void) what;
-#endif
-}
-
-#if !defined(DS41_EMU)
-template <class K>
-inline void prepare_kernel(K kernel, size_t smem_bytes) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_bytes);
-    cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);   // as much shared memory as the kernel wants
-}
-#endif
-
 /// `groups_grid` = how many group slots the launch covers (grid.y); blocks whose group has n outside [n_lo, n_hi] return at once.
-template <int NT>
+template <class G, int NT>
 inline void launch_gate_up(const uint8_t* cache, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts, int groups_grid,
                            int n_lo, int n_hi, const int8_t* xq, const float* xs, int8_t* hq, float* hs, void* stream) {
-    const size_t smem = GuLayout<NT>::total;
-    const dim3 grid(kGuTiles, (unsigned) groups_grid);
-#if defined(DS41_EMU)
-    (void) stream;
-    ds41_emu::launch(grid, dim3(kExThreads), smem, [&] { gate_up_kernel<NT>(cache, hits, groups, counts, xq, xs, hq, hs, n_lo, n_hi); });
-#else
-    static const bool once = (prepare_kernel(gate_up_kernel<NT>, smem), true);
+    const size_t smem = GuLayout<G, NT>::total;
+    const dim3 grid(ExCfg<G>::kGuTiles, (unsigned) groups_grid);
+#if !defined(DS41_EMU)
+    static const bool once = (prepare_kernel(gate_up_kernel<G, NT>, smem), true);
     (void) once;
-    gate_up_kernel<NT><<<grid, kExThreads, smem, (cudaStream_t) stream>>>(cache, hits, groups, counts, xq, xs, hq, hs, n_lo, n_hi);
 #endif
+    launch(gate_up_kernel<G, NT>, grid, dim3(kExThreads), smem, stream, cache, hits, groups, counts, xq, xs, hq, hs, n_lo, n_hi);
     check_launch("gate_up");
 }
 
-template <int NT>
+template <class G, int NT>
 inline void launch_down(const uint8_t* cache, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts, int groups_grid,
                         int n_lo, int n_hi, const int8_t* hq, const float* hs, float* parts, void* stream) {
-    const size_t smem = DnLayout<NT>::total;
-    const dim3 grid(kDnTiles, (unsigned) groups_grid);
-#if defined(DS41_EMU)
-    (void) stream;
-    ds41_emu::launch(grid, dim3(kExThreads), smem, [&] { down_kernel<NT>(cache, hits, groups, counts, hq, hs, parts, n_lo, n_hi); });
-#else
-    static const bool once = (prepare_kernel(down_kernel<NT>, smem), true);
+    const size_t smem = DnLayout<G, NT>::total;
+    const dim3 grid(ExCfg<G>::kDnTiles, (unsigned) groups_grid);
+#if !defined(DS41_EMU)
+    static const bool once = (prepare_kernel(down_kernel<G, NT>, smem), true);
     (void) once;
-    down_kernel<NT><<<grid, kExThreads, smem, (cudaStream_t) stream>>>(cache, hits, groups, counts, hq, hs, parts, n_lo, n_hi);
 #endif
+    launch(down_kernel<G, NT>, grid, dim3(kExThreads), smem, stream, cache, hits, groups, counts, hq, hs, parts, n_lo, n_hi);
     check_launch("down");
 }
 
@@ -468,47 +505,45 @@ inline void check_align(const void* p, size_t a, const char* what) {
     if (reinterpret_cast<uintptr_t>(p) % a != 0) throw std::invalid_argument(std::string("ds41: ") + what + " must be " + std::to_string(a) + "-byte aligned");
 }
 
+/// The expert path's quantiser: x [T][kHidden] -> xq, xs, INTERLEAVED, compile-time width.
+template <class G>
+inline void quantize_x(const float* x, int T, int8_t* xq, float* xs, void* stream) {
+    if (T < 1) return;
+    check_align(x, 4, "x");
+    constexpr int NB = ExCfg<G>::kActBlocks;
+    const dim3 grid((unsigned) ((T * NB + kExWarps - 1) / kExWarps));
+    launch(quantize_acts_kernel<NB, true>, grid, dim3(kExThreads), 0, stream, x, T, xq, xs, 0);
+    check_launch("quantize_acts");
+}
+
 }  // namespace strata::ds41::cuda::dev
 
 namespace strata::ds41::cuda {
 
-size_t expert_scratch_bytes(int T) {
-    auto up256 = [](size_t v) { return (v + 255) & ~(size_t) 255; };
-    return up256((size_t) T * kActBlocks * 32) + up256((size_t) T * kActBlocks * 4) + up256((size_t) kTopK * T * kFF) +
-           up256((size_t) kTopK * T * kHBlocks * 4);
-}
-
-ExpertScratch expert_scratch_carve(void* device_base, int T) {
-    auto up256 = [](size_t v) { return (v + 255) & ~(size_t) 255; };
-    auto* p = static_cast<unsigned char*>(device_base);
-    ExpertScratch s;
-    s.xq = reinterpret_cast<int8_t*>(p);
-    p += up256((size_t) T * kActBlocks * 32);
-    s.xs = reinterpret_cast<float*>(p);
-    p += up256((size_t) T * kActBlocks * 4);
-    s.hq = reinterpret_cast<int8_t*>(p);
-    p += up256((size_t) kTopK * T * kFF);
-    s.hs = reinterpret_cast<float*>(p);
-    return s;
-}
-
-void quantize_acts(const float* x, int T, int8_t* xq, float* xs, void* stream) {
-    if (T < 1) return;
+template <class G>
+void ds41_quantize_acts(Dev& dev, const float* x, int T, int width, int8_t* xq, float* xs, Stream stream, ActOrder order) {
+    if (T < 1) throw std::invalid_argument("ds41_quantize_acts: T must be >= 1");
+    if (width < 32 || width % 32 != 0) throw std::invalid_argument("ds41_quantize_acts: width must be a positive multiple of 32");
     dev::check_align(x, 4, "x");
-    const dim3 grid((unsigned) ((T * kActBlocks + dev::kExWarps - 1) / dev::kExWarps));
-#if defined(DS41_EMU)
-    (void) stream;
-    ds41_emu::launch(grid, dim3(dev::kExThreads), 0, [&] { dev::quantize_acts_kernel(x, T, xq, xs); });
-#else
-    dev::quantize_acts_kernel<<<grid, dev::kExThreads, 0, (cudaStream_t) stream>>>(x, T, xq, xs);
-#endif
-    dev::check_launch("quantize_acts");
+    dev::check_align(xq, 16, "xq");
+    dev::check_align(xs, (width / 32) % 4 == 0 ? 16 : 4, "xs");
+    stream = stream_or_default(dev, stream);
+    const int nb = width / 32;
+    const dim3 grid((unsigned) (((size_t) T * nb + dev::kExWarps - 1) / dev::kExWarps));
+    if (order == ActOrder::kInterleaved && width == G::kHidden) {
+        dev::quantize_x<G>(x, T, xq, xs, stream);
+        return;
+    }
+    if (order == ActOrder::kInterleaved) dev::launch(dev::quantize_acts_kernel<0, true>, grid, dim3(dev::kExThreads), 0, stream, x, T, xq, xs, nb);
+    else dev::launch(dev::quantize_acts_kernel<0, false>, grid, dim3(dev::kExThreads), 0, stream, x, T, xq, xs, nb);
+    dev::check_launch("ds41_quantize_acts");
 }
 
 // Which specialisation runs which groups.  T = 1: NT = 1;  T = 2: NT = 2;  T = 3, 4: NT = 4;  T = 5..8: two launches over the SAME group
 // list (sorted by decreasing size, see split): NT = 4 for the groups of 1..4 tokens (47 KB shared memory per block, 2 blocks per SM) and
 // NT = 8 for the rare groups of 5..8 tokens (71 KB, 1 block per SM) - at most floor(6T/5) of them, so that launch covers only that many
 // group slots.  A group never has more tokens than T.
+template <class G>
 void experts_gate_up(const uint8_t* cache_base, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts, int T,
                      const int8_t* xq, const float* xs, int8_t* hq, float* hs, void* stream) {
     dev::check_T(T, "experts_gate_up");
@@ -517,58 +552,60 @@ void experts_gate_up(const uint8_t* cache_base, const HitEntry* hits, const HitG
     dev::check_align(xs, 16, "xs");
     dev::check_align(hq, 16, "hq");
     dev::check_align(hs, 16, "hs");
-    const int G = kTopK * T;
-    if (T == 1) dev::launch_gate_up<1>(cache_base, hits, groups, counts, G, 1, 1, xq, xs, hq, hs, stream);
-    else if (T == 2) dev::launch_gate_up<2>(cache_base, hits, groups, counts, G, 1, 2, xq, xs, hq, hs, stream);
-    else if (T <= 4) dev::launch_gate_up<4>(cache_base, hits, groups, counts, G, 1, 4, xq, xs, hq, hs, stream);
+    const int GR = G::kTopK * T;
+    if (T == 1) dev::launch_gate_up<G, 1>(cache_base, hits, groups, counts, GR, 1, 1, xq, xs, hq, hs, stream);
+    else if (T == 2) dev::launch_gate_up<G, 2>(cache_base, hits, groups, counts, GR, 1, 2, xq, xs, hq, hs, stream);
+    else if (T <= 4) dev::launch_gate_up<G, 4>(cache_base, hits, groups, counts, GR, 1, 4, xq, xs, hq, hs, stream);
     else {
-        dev::launch_gate_up<4>(cache_base, hits, groups, counts, G, 1, 4, xq, xs, hq, hs, stream);
-        dev::launch_gate_up<8>(cache_base, hits, groups, counts, G / 5, 5, 8, xq, xs, hq, hs, stream);
+        dev::launch_gate_up<G, 4>(cache_base, hits, groups, counts, GR, 1, 4, xq, xs, hq, hs, stream);
+        dev::launch_gate_up<G, 8>(cache_base, hits, groups, counts, GR / 5, 5, 8, xq, xs, hq, hs, stream);
     }
 }
 
+template <class G>
 void experts_down(const uint8_t* cache_base, const HitEntry* hits, const HitGroup* groups, const SplitCounts* counts, int T,
                   const int8_t* hq, const float* hs, float* parts, void* stream) {
     dev::check_T(T, "experts_down");
     dev::check_align(cache_base, 256, "cache_base");
     dev::check_align(hq, 16, "hq");
     dev::check_align(hs, 16, "hs");
-    const int G = kTopK * T;
-    if (T == 1) dev::launch_down<1>(cache_base, hits, groups, counts, G, 1, 1, hq, hs, parts, stream);
-    else if (T == 2) dev::launch_down<2>(cache_base, hits, groups, counts, G, 1, 2, hq, hs, parts, stream);
-    else if (T <= 4) dev::launch_down<4>(cache_base, hits, groups, counts, G, 1, 4, hq, hs, parts, stream);
+    const int GR = G::kTopK * T;
+    if (T == 1) dev::launch_down<G, 1>(cache_base, hits, groups, counts, GR, 1, 1, hq, hs, parts, stream);
+    else if (T == 2) dev::launch_down<G, 2>(cache_base, hits, groups, counts, GR, 1, 2, hq, hs, parts, stream);
+    else if (T <= 4) dev::launch_down<G, 4>(cache_base, hits, groups, counts, GR, 1, 4, hq, hs, parts, stream);
     else {
-        dev::launch_down<4>(cache_base, hits, groups, counts, G, 1, 4, hq, hs, parts, stream);
-        dev::launch_down<8>(cache_base, hits, groups, counts, G / 5, 5, 8, hq, hs, parts, stream);
+        dev::launch_down<G, 4>(cache_base, hits, groups, counts, GR, 1, 4, hq, hs, parts, stream);
+        dev::launch_down<G, 8>(cache_base, hits, groups, counts, GR / 5, 5, 8, hq, hs, parts, stream);
     }
 }
 
+template <class G>
 void experts_hits(const uint8_t* cache_base, const float* x, const HitEntry* hits, const HitGroup* groups,
                   const SplitCounts* counts, int T, const ExpertScratch& s, float* parts, void* stream) {
-    quantize_acts(x, T, s.xq, s.xs, stream);
-    experts_gate_up(cache_base, hits, groups, counts, T, s.xq, s.xs, s.hq, s.hs, stream);
-    experts_down(cache_base, hits, groups, counts, T, s.hq, s.hs, parts, stream);
+    dev::quantize_x<G>(x, T, s.xq, s.xs, stream);
+    experts_gate_up<G>(cache_base, hits, groups, counts, T, s.xq, s.xs, s.hq, s.hs, stream);
+    experts_down<G>(cache_base, hits, groups, counts, T, s.hq, s.hs, parts, stream);
 }
 
 namespace dev {
-template <int NT>
+template <class G, int NT>
 inline ExpertKernelInfo kernel_info(bool down) {
     ExpertKernelInfo r;
 #if !defined(DS41_EMU)
     cudaFuncAttributes a{};
-    const size_t smem = down ? DnLayout<NT>::total : GuLayout<NT>::total;
-    cudaError_t e = down ? cudaFuncGetAttributes(&a, down_kernel<NT>) : cudaFuncGetAttributes(&a, gate_up_kernel<NT>);
+    const size_t smem = down ? DnLayout<G, NT>::total : GuLayout<G, NT>::total;
+    cudaError_t e = down ? cudaFuncGetAttributes(&a, down_kernel<G, NT>) : cudaFuncGetAttributes(&a, gate_up_kernel<G, NT>);
     if (e != cudaSuccess) return r;
     r.regs = a.numRegs;
     r.static_smem = (int) a.sharedSizeBytes;
     r.dyn_smem = (int) smem;
     int blocks = 0;
     if (down) {
-        prepare_kernel(down_kernel<NT>, smem);
-        e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, down_kernel<NT>, kExThreads, smem);
+        prepare_kernel(down_kernel<G, NT>, smem);
+        e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, down_kernel<G, NT>, kExThreads, smem);
     } else {
-        prepare_kernel(gate_up_kernel<NT>, smem);
-        e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, gate_up_kernel<NT>, kExThreads, smem);
+        prepare_kernel(gate_up_kernel<G, NT>, smem);
+        e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, gate_up_kernel<G, NT>, kExThreads, smem);
     }
     r.blocks_per_sm = e == cudaSuccess ? blocks : 0;
 #else
@@ -578,37 +615,48 @@ inline ExpertKernelInfo kernel_info(bool down) {
 }
 }  // namespace dev
 
+template <class G>
 void experts_prepare() {
 #if !defined(DS41_EMU)
-    dev::prepare_kernel(dev::gate_up_kernel<1>, dev::GuLayout<1>::total);
-    dev::prepare_kernel(dev::gate_up_kernel<2>, dev::GuLayout<2>::total);
-    dev::prepare_kernel(dev::gate_up_kernel<4>, dev::GuLayout<4>::total);
-    dev::prepare_kernel(dev::gate_up_kernel<8>, dev::GuLayout<8>::total);
-    dev::prepare_kernel(dev::down_kernel<1>, dev::DnLayout<1>::total);
-    dev::prepare_kernel(dev::down_kernel<2>, dev::DnLayout<2>::total);
-    dev::prepare_kernel(dev::down_kernel<4>, dev::DnLayout<4>::total);
-    dev::prepare_kernel(dev::down_kernel<8>, dev::DnLayout<8>::total);
+    dev::prepare_kernel(dev::gate_up_kernel<G, 1>, dev::GuLayout<G, 1>::total);
+    dev::prepare_kernel(dev::gate_up_kernel<G, 2>, dev::GuLayout<G, 2>::total);
+    dev::prepare_kernel(dev::gate_up_kernel<G, 4>, dev::GuLayout<G, 4>::total);
+    dev::prepare_kernel(dev::gate_up_kernel<G, 8>, dev::GuLayout<G, 8>::total);
+    dev::prepare_kernel(dev::down_kernel<G, 1>, dev::DnLayout<G, 1>::total);
+    dev::prepare_kernel(dev::down_kernel<G, 2>, dev::DnLayout<G, 2>::total);
+    dev::prepare_kernel(dev::down_kernel<G, 4>, dev::DnLayout<G, 4>::total);
+    dev::prepare_kernel(dev::down_kernel<G, 8>, dev::DnLayout<G, 8>::total);
 #endif
 }
 
+template <class G>
 ExpertKernelInfo expert_kernel_info(int NT, bool down) {
     switch (NT) {
-        case 1: return dev::kernel_info<1>(down);
-        case 2: return dev::kernel_info<2>(down);
-        case 4: return dev::kernel_info<4>(down);
-        case 8: return dev::kernel_info<8>(down);
+        case 1: return dev::kernel_info<G, 1>(down);
+        case 2: return dev::kernel_info<G, 2>(down);
+        case 4: return dev::kernel_info<G, 4>(down);
+        case 8: return dev::kernel_info<G, 8>(down);
         default: throw std::invalid_argument("expert_kernel_info: NT must be 1, 2, 4 or 8");
     }
 }
 
 void test_e8m0_table(float* out256, void* stream) {
-#if defined(DS41_EMU)
-    (void) stream;
-    ds41_emu::launch(dim3(1), dim3(256), 0, [&] { dev::e8m0_table_kernel(out256); });
-#else
-    dev::e8m0_table_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(out256);
-#endif
+    dev::launch(dev::e8m0_table_kernel, dim3(1), dim3(256), 0, stream, out256);
     dev::check_launch("test_e8m0_table");
 }
 
 }  // namespace strata::ds41::cuda
+
+/// Explicit instantiation of the hot-expert host entry points for geometry G (the .cu: RealGeom; the emulator build: RealGeom and MiniGeom).
+#define DS41_INSTANTIATE_EXPERTS(G)                                                                                                                      \
+    template void ::strata::ds41::cuda::ds41_quantize_acts<G>(::strata::ds41::cuda::Dev&, const float*, int, int, int8_t*, float*, void*,                \
+                                                              ::strata::ds41::cuda::ActOrder);                                                          \
+    template void ::strata::ds41::cuda::experts_prepare<G>();                                                                                            \
+    template void ::strata::ds41::cuda::experts_gate_up<G>(const uint8_t*, const ::strata::ds41::cuda::HitEntry*, const ::strata::ds41::cuda::HitGroup*,   \
+                                                           const ::strata::ds41::cuda::SplitCounts*, int, const int8_t*, const float*, int8_t*, float*, void*); \
+    template void ::strata::ds41::cuda::experts_down<G>(const uint8_t*, const ::strata::ds41::cuda::HitEntry*, const ::strata::ds41::cuda::HitGroup*,      \
+                                                        const ::strata::ds41::cuda::SplitCounts*, int, const int8_t*, const float*, float*, void*);       \
+    template void ::strata::ds41::cuda::experts_hits<G>(const uint8_t*, const float*, const ::strata::ds41::cuda::HitEntry*,                              \
+                                                        const ::strata::ds41::cuda::HitGroup*, const ::strata::ds41::cuda::SplitCounts*, int,             \
+                                                        const ::strata::ds41::cuda::ExpertScratch&, float*, void*);                                        \
+    template auto ::strata::ds41::cuda::expert_kernel_info<G>(int, bool) -> ::strata::ds41::cuda::ExpertKernelInfo;

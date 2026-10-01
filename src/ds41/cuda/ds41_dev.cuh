@@ -12,6 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <utility>
 
 #if defined(DS41_EMU)
 #include "ds41_emu.hpp"
@@ -284,5 +288,52 @@ DS41_FI int lane_id() {
     return threadIdx.x & 31;
 #endif
 }
+
+// ---- host side: launching a kernel, the same call in both builds ------------------------------------------------------------
+// A kernel is a `DS41_KERNEL` function (a template over the geometry G and the tuning constants); the host wrapper launches it with
+//     dev::launch(kernel<G, NT>, grid, block, smem_bytes, stream, args...);       dev::check_launch("what");
+// nvcc: cudaLaunchKernel with the arguments converted to the kernel's parameter types (what <<<>>> does, minus the syntax, so it works for any
+// template kernel name without a macro).  Emulator: ds41_emu::launch runs every thread of every block on the host (ds41_emu.hpp); the stream
+// is ignored (the call returns when the kernel has run).  `stream` is a cudaStream_t / void* (include/strata/ds41/cuda/ds41_dev.hpp, `Stream`).
+#if defined(DS41_EMU)
+template <class... KArgs, class... Args>
+inline void launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem_bytes, void* stream, Args&&... args) {
+    (void) stream;
+    ds41_emu::launch(grid, block, smem_bytes, [&] { kernel(static_cast<KArgs>(args)...); });
+}
+#else
+template <class Tuple, size_t... I>
+inline cudaError_t launch_tuple(const void* fn, dim3 grid, dim3 block, size_t smem_bytes, cudaStream_t stream, Tuple& t, std::index_sequence<I...>) {
+    void* argv[] = {static_cast<void*>(&std::get<I>(t))..., nullptr};
+    return cudaLaunchKernel(fn, grid, block, argv, smem_bytes, stream);
+}
+template <class... KArgs, class... Args>
+inline void launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem_bytes, void* stream, Args&&... args) {
+    std::tuple<KArgs...> t(static_cast<KArgs>(args)...);
+    (void) launch_tuple(reinterpret_cast<const void*>(kernel), grid, block, smem_bytes, static_cast<cudaStream_t>(stream), t,
+                        std::index_sequence_for<KArgs...>{});
+}
+#endif
+
+/// After a launch: throws std::runtime_error if the launch itself failed (a bad configuration, too much shared memory...).  The emulator has
+/// nothing to check (an emulated fault aborts with its own diagnostic).
+inline void check_launch(const char* what) {
+#if !defined(DS41_EMU)
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("ds41 ") + what + ": " + cudaGetErrorString(e));
+#else
+    (void) what;
+#endif
+}
+
+#if !defined(DS41_EMU)
+/// The attributes a kernel with a big dynamic shared-memory footprint needs: the opt-in above 48 KB and the carveout that leaves the shared
+/// memory to it.  Call once per instantiation (a function-local static in the wrapper, or experts_prepare()).
+template <class K>
+inline void prepare_kernel(K kernel, size_t smem_bytes) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_bytes);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);   // as much shared memory as the kernel wants
+}
+#endif
 
 }  // namespace strata::ds41::cuda::dev

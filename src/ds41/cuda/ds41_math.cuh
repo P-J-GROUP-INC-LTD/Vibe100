@@ -81,8 +81,10 @@ inline constexpr uint32_t kQuantInfBits = 0x7F800000u;
 inline constexpr uint32_t kQuantTinyBits = 0x0D800000u;     // 2^-100
 inline constexpr uint32_t kQuantNaNBits = 0x7FC00000u;
 
-/// One warp = one 32-block: lane l holds element l.  Writes the 32 int8 (interleaved order, act_perm_pos) at `dst` (the
-/// block's 32 bytes) and the fp32 scale to *scale_dst (lane 0).
+/// One warp = one 32-block: lane l holds element l.  Writes the 32 int8 at `dst` (the block's 32 bytes) and the fp32 scale to *scale_dst
+/// (lane 0).  kInterleaved (the default): the dp4a-friendly order act_perm_pos of ds41_cuda.hpp "ACTIVATION AND h LAYOUT" (the hot-expert
+/// kernels and the MXFP4 decode); false: natural order, byte j = element j (a Q8_0 GEMV that reads its weights as they are stored).
+template <bool kInterleaved = true>
 DS41_FI void quantize_block_warp(float v, int lane, int8_t* DS41_RESTRICT dst, float* DS41_RESTRICT scale_dst) {
     int m = (int) (f2u(v) & 0x7FFFFFFFu);                  // magnitude bits, < 2^31: the signed max is the unsigned one
     DS41_UNROLL
@@ -96,7 +98,7 @@ DS41_FI void quantize_block_warp(float v, int lane, int8_t* DS41_RESTRICT dst, f
     const float id = special ? 0.0f : fdiv_rn(127.0f, amax);
     int q = special ? 0 : f2i_rn(fmul_rn(v, id));
     q = q > 127 ? 127 : (q < -127 ? -127 : q);
-    dst[perm_pos(lane)] = (int8_t) q;
+    dst[kInterleaved ? perm_pos(lane) : lane] = (int8_t) q;
     if (lane == 0) *scale_dst = d;
 }
 

@@ -1,5 +1,5 @@
-// src/ds41/cuda/ds41_router_impl.cuh - DS-D: the sqrt-softplus router (V100, sm_70).  Included by ds41_router.cu (nvcc) and by the
-// CPU emulation test (-DDS41_EMU).
+// src/ds41/cuda/ds41_router_impl.cuh - DS-D / DS1-G: the sqrt-softplus router (V100, sm_70), a template over the geometry G (geom.hpp).
+// Included by ds41_router.cu (nvcc: RealGeom) and by ds41_emu_impl.cpp (-DDS41_EMU: RealGeom and MiniGeom).  The numbers below are RealGeom's.
 //
 // WHAT (docs/deepseek/CONTRACTS.md, "Router"; reference: third_party/deepseek-v41-flash-reference/inference/model.py Gate):
 //     logit[e] = x . Wg[e]            FP32 accumulation, Wg is BF16 [384][5120] read as raw bits (bf16 -> fp32 is a 16-bit shift:
@@ -29,6 +29,9 @@
 //                  per lane gives the same tree; every lane ends with the same bits)
 //   logit          tot = 0; tot += total of warp 0, 1, ..., 9 in this order
 // Every reduction has a fixed order: the same input gives the same bits, run to run, and for every T.
+// THE SHAPE OF THE REDUCTION FOLLOWS G (RtCfg below): a row of kHidden bf16 is kHidden / 256 "chunk groups" (32 lanes x 16 B); a warp takes 2 of them (1 when the
+// count is odd), so there are kHidden / 512 warp slices (RealGeom: 10) and the formula above reads "the lane's GroupsPerWarp chunk groups" and "warp 0 ..
+// SliceWarps - 1".  MiniGeom (kHidden 256): one warp, one chunk group, 8 chained FMAs per lane.  The T-independence holds for every G.
 #pragma once
 
 #include <cstdint>
@@ -40,34 +43,44 @@
 
 namespace strata::ds41::cuda::dev {
 
-inline constexpr int kRtChunks = kHidden / 8;                 // 640 chunks of 8 bf16 (16 B) per expert row
-inline constexpr int kRtPerLane = kRtChunks / 32;             // 20
-inline constexpr int kRtWarps = 4;
-static_assert(kRtChunks % 32 == 0 && kExperts % kRtWarps == 0 && kExperts % 32 == 0);
+/// The router's shape constants at geometry G.
+template <class G> struct RtCfg {
+    static constexpr int kHidden = G::kHidden, kExperts = G::kExperts, kTopK = G::kTopK;
+    static constexpr int kChunks = kHidden / 8;                // 640 chunks of 8 bf16 (16 B) per expert row
+    static constexpr int kPerLane = kChunks / 32;              // 20 chunk groups of 32 lanes x 16 B (each lane owns one chunk per group)
+    // the K axis is split in warp slices: a warp takes 2 chunk groups (its lane 2 weight chunks and the matching 2 x 2 float4 of each token's x), or 1 when the
+    // row has an odd number of them; RealGeom: 20 groups -> 2 per warp, 10 warps
+    static constexpr int kGroupsPerWarp = kPerLane % 2 == 0 ? 2 : 1;
+    static constexpr int kSliceWarps = kPerLane / kGroupsPerWarp;       // 10 warps per block = slices of the K axis
+    static constexpr int kSelPer = (kExperts + 31) / 32;       // select: experts per lane, e = lane + 32 i (12); the last lanes pad when kExperts % 32 != 0
+    static constexpr bool kSelFull = kExperts % 32 == 0;
+    static_assert(kHidden % 256 == 0, "router: a row is a whole number of 32-lane x 16-byte chunk groups (kHidden % 256 == 0)");
+    static_assert(kSliceWarps >= 1 && kSliceWarps <= 32, "router: at most 32 warps per block (kHidden <= 16384)");
+    static_assert(kExperts >= 1 && kExperts <= 1024 && kTopK >= 1 && kTopK <= kExperts && kTopK <= 32, "router: kExperts <= 1024 (the select kernel's taken mask), kTopK <= min(kExperts, 32)");
+};
+inline constexpr int kRtWarps = 4;                            // select kernel: warps (tokens) per block
 
 // ---- logits, small T ------------------------------------------------------------------------------------------------------------
 // One BLOCK per expert and token group: 10 warps, each takes 2 of the row's 20 "chunk groups" (a chunk group = 32 lanes x 16 bytes =
 // 256 bf16 = 512 B of the row), so a lane owns 2 weight chunks and the matching 2 x 2 float4 of each token's x: everything it needs
 // is loaded up front (~1 KB per warp in flight, 50 warps per SM), multiplied, reduced over the warp with a shuffle tree, and the 10
 // warp totals are added in a fixed order through shared memory.
-inline constexpr int kRtSliceWarps = 10;                      // warps per block = slices of the K axis
-inline constexpr int kRtGroupsPerWarp = kRtPerLane / kRtSliceWarps;   // 2
-static_assert(kRtPerLane % kRtSliceWarps == 0);
-
-template <int NT>
-DS41_KERNEL DS41_LAUNCH_BOUNDS(320) void router_logits_gemv_kernel(const float* DS41_RESTRICT x, const uint16_t* DS41_RESTRICT wg, int T,
-                                                                   float* DS41_RESTRICT logits) {
-    DS41_SHARED float s_part[kRtSliceWarps][NT];
+template <class G, int NT>
+DS41_KERNEL DS41_LAUNCH_BOUNDS(32 * RtCfg<G>::kSliceWarps) void router_logits_gemv_kernel(const float* DS41_RESTRICT x, const uint16_t* DS41_RESTRICT wg, int T,
+                                                                                         float* DS41_RESTRICT logits) {
+    using C = RtCfg<G>;
+    constexpr int kHidden = G::kHidden, kExperts = G::kExperts, kSliceWarps = C::kSliceWarps, kGroupsPerWarp = C::kGroupsPerWarp;
+    DS41_SHARED float s_part[kSliceWarps][NT];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int e = blockIdx.x;
     const int t0 = blockIdx.y * NT;
     const unsigned char* wrow = reinterpret_cast<const unsigned char*>(wg + (size_t) e * kHidden);
 
-    uint4 wc[kRtGroupsPerWarp];
-    float4 xa[NT][kRtGroupsPerWarp][2];
+    uint4 wc[kGroupsPerWarp];
+    float4 xa[NT][kGroupsPerWarp][2];
     DS41_UNROLL
-    for (int g = 0; g < kRtGroupsPerWarp; ++g) {
-        const int c = lane + 32 * (warp * kRtGroupsPerWarp + g);       // chunk index 0..639 (8 elements each)
+    for (int g = 0; g < kGroupsPerWarp; ++g) {
+        const int c = lane + 32 * (warp * kGroupsPerWarp + g);       // chunk index 0..639 (8 elements each)
         wc[g] = ldg4(wrow + 16 * c);
         DS41_UNROLL
         for (int t = 0; t < NT; ++t) {
@@ -84,7 +97,7 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(320) void router_logits_gemv_kernel(const float* 
     // warp has ~3 loads in flight instead of ~10.  `zero` is 0 at run time (T < 2^20) but opaque to the compiler.
     uint32_t anyw = 0;
     DS41_UNROLL
-    for (int g = 0; g < kRtGroupsPerWarp; ++g) {
+    for (int g = 0; g < kGroupsPerWarp; ++g) {
         anyw |= wc[g].x | wc[g].w;
         DS41_UNROLL
         for (int t = 0; t < NT; ++t) anyw |= f2u(xa[t][g][0].x) | f2u(xa[t][g][1].w);
@@ -96,7 +109,7 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(320) void router_logits_gemv_kernel(const float* 
     for (int t = 0; t < NT; ++t) {
         float s = zero;
         DS41_UNROLL
-        for (int g = 0; g < kRtGroupsPerWarp; ++g) {
+        for (int g = 0; g < kGroupsPerWarp; ++g) {
             const float w0 = u2f(wc[g].x << 16), w1 = u2f(wc[g].x & 0xFFFF0000u);   // bf16 -> fp32: the bits are the top half
             const float w2 = u2f(wc[g].y << 16), w3 = u2f(wc[g].y & 0xFFFF0000u);
             const float w4 = u2f(wc[g].z << 16), w5 = u2f(wc[g].z & 0xFFFF0000u);
@@ -121,7 +134,7 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(320) void router_logits_gemv_kernel(const float* 
     if (threadIdx.x < NT && t0 + (int) threadIdx.x < T) {
         float tot = 0.0f;
         DS41_UNROLL
-        for (int w = 0; w < kRtSliceWarps; ++w) tot += s_part[w][threadIdx.x];       // fixed order
+        for (int w = 0; w < kSliceWarps; ++w) tot += s_part[w][threadIdx.x];       // fixed order
         logits[(size_t) (t0 + threadIdx.x) * kExperts + e] = tot;
     }
 }
@@ -133,24 +146,28 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(320) void router_logits_gemv_kernel(const float* 
 // warp totals in shared memory; after the last token the ten totals of every (token, expert) are added in order by one thread each.
 inline constexpr int kRtPfExperts = 4;                         // experts per block (grid.x = 384 / 4)
 inline constexpr int kRtPfTokens = 16;                         // tokens per block (grid.y = ceil(T / 16))
-static_assert(kExperts % kRtPfExperts == 0 && (kRtPfExperts & (kRtPfExperts - 1)) == 0);
+static_assert((kRtPfExperts & (kRtPfExperts - 1)) == 0);
 
-DS41_KERNEL DS41_LAUNCH_BOUNDS(32 * kRtSliceWarps) void router_logits_prefill_kernel(const float* DS41_RESTRICT x, const uint16_t* DS41_RESTRICT wg, int T,
-                                                                                    float* DS41_RESTRICT logits) {
-    constexpr int NE = kRtPfExperts, TB = kRtPfTokens, G = kRtGroupsPerWarp;
-    DS41_SHARED float s_part[TB][kRtSliceWarps][NE];
+template <class G>
+DS41_KERNEL DS41_LAUNCH_BOUNDS(32 * RtCfg<G>::kSliceWarps) void router_logits_prefill_kernel(const float* DS41_RESTRICT x, const uint16_t* DS41_RESTRICT wg, int T,
+                                                                                            float* DS41_RESTRICT logits) {
+    using C = RtCfg<G>;
+    static_assert(G::kExperts % kRtPfExperts == 0, "router prefill: kExperts % 4 == 0 (4 experts per block)");
+    constexpr int kHidden = G::kHidden, kExperts = G::kExperts, kSliceWarps = C::kSliceWarps;
+    constexpr int NE = kRtPfExperts, TB = kRtPfTokens, GP = C::kGroupsPerWarp;
+    DS41_SHARED float s_part[TB][kSliceWarps][NE];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int e0 = blockIdx.x * NE;
     const int t0 = blockIdx.y * TB;
     const int nt = T - t0 < TB ? T - t0 : TB;                      // tokens of this block, >= 1 (uniform)
 
-    float w[NE][G][8];                                             // this lane's weights, FP32, for the whole block
+    float w[NE][GP][8];                                             // this lane's weights, FP32, for the whole block
     DS41_UNROLL
     for (int ee = 0; ee < NE; ++ee) {
         const unsigned char* wrow = reinterpret_cast<const unsigned char*>(wg + (size_t) (e0 + ee) * kHidden);
         DS41_UNROLL
-        for (int g = 0; g < G; ++g) {
-            const int c = lane + 32 * (warp * G + g);              // chunk index 0..639 (8 elements each), as in the GEMV
+        for (int g = 0; g < GP; ++g) {
+            const int c = lane + 32 * (warp * GP + g);              // chunk index 0..639 (8 elements each), as in the GEMV
             const uint4 q = ldg4(wrow + 16 * c);
             w[ee][g][0] = u2f(q.x << 16);                          // bf16 -> fp32: the bits are the top half
             w[ee][g][1] = u2f(q.x & 0xFFFF0000u);
@@ -162,27 +179,27 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(32 * kRtSliceWarps) void router_logits_prefill_ke
             w[ee][g][7] = u2f(q.w & 0xFFFF0000u);
         }
     }
-    auto load_x = [&](float4 (&xa)[G][2], int tt) {
+    auto load_x = [&](float4 (&xa)[GP][2], int tt) {
         DS41_UNROLL
-        for (int g = 0; g < G; ++g) {
-            const int c = lane + 32 * (warp * G + g);
+        for (int g = 0; g < GP; ++g) {
+            const int c = lane + 32 * (warp * GP + g);
             const float* xp = x + (size_t) (t0 + tt) * kHidden + 8 * c;
             xa[g][0] = ldgf4(xp);
             xa[g][1] = ldgf4(xp + 4);
         }
     };
-    float4 xc[G][2];
+    float4 xc[GP][2];
     load_x(xc, 0);
     DS41_UNROLL1
     for (int tt = 0; tt < nt; ++tt) {
-        float4 xn[G][2];
+        float4 xn[GP][2];
         load_x(xn, tt + 1 < nt ? tt + 1 : tt);                     // the next token's x flies while this one is multiplied
         float acc[NE];
         DS41_UNROLL
         for (int ee = 0; ee < NE; ++ee) {
             float sacc = 0.0f;
             DS41_UNROLL
-            for (int g = 0; g < G; ++g) {
+            for (int g = 0; g < GP; ++g) {
                 const float4 a = xc[g][0], b = xc[g][1];
                 sacc = fmaf(w[ee][g][0], a.x, sacc);
                 sacc = fmaf(w[ee][g][1], a.y, sacc);
@@ -200,17 +217,17 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(32 * kRtSliceWarps) void router_logits_prefill_ke
         const int idx = lane >> (5 - S);
         if ((lane & ((1 << (5 - S)) - 1)) == 0) s_part[tt][warp][idx] = mine;
         DS41_UNROLL
-        for (int g = 0; g < G; ++g) {
+        for (int g = 0; g < GP; ++g) {
             xc[g][0] = xn[g][0];
             xc[g][1] = xn[g][1];
         }
     }
     sync_block();
-    for (int i = threadIdx.x; i < nt * NE; i += 32 * kRtSliceWarps) {
+    for (int i = threadIdx.x; i < nt * NE; i += 32 * kSliceWarps) {
         const int tt = i / NE, ee = i - tt * NE;
         float tot = 0.0f;
         DS41_UNROLL
-        for (int wi = 0; wi < kRtSliceWarps; ++wi) tot += s_part[tt][wi][ee];       // fixed order, as the GEMV
+        for (int wi = 0; wi < kSliceWarps; ++wi) tot += s_part[tt][wi][ee];       // fixed order, as the GEMV
         logits[(size_t) (t0 + tt) * kExperts + e0 + ee] = tot;
     }
 }
@@ -219,23 +236,41 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(32 * kRtSliceWarps) void router_logits_prefill_ke
 /// (value descending, index ascending) is a total order on distinct indices.
 DS41_FI bool better(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }
 
+template <class G>
 DS41_KERNEL DS41_LAUNCH_BOUNDS(128) void router_select_kernel(const float* DS41_RESTRICT logits, const float* DS41_RESTRICT bias, int T,
                                                               int32_t* DS41_RESTRICT ids, float* DS41_RESTRICT weights) {
+    using C = RtCfg<G>;
+    constexpr int kExperts = G::kExperts, kTopK = G::kTopK;
     const int lane = threadIdx.x & 31;
     const int t = blockIdx.x * kRtWarps + (threadIdx.x >> 5);
     if (t >= T) return;                                       // whole warp
-    constexpr int PER = kExperts / 32;                        // 12 experts per lane: e = lane + 32 i
+    constexpr int PER = C::kSelPer;                           // 12 experts per lane: e = lane + 32 i
     float s[PER], v[PER];
+    uint32_t taken = 0;
     DS41_UNROLL
     for (int i = 0; i < PER; ++i) {
         const int e = lane + 32 * i;
-        const float l = ldgf(logits + (size_t) t * kExperts + e);
-        const float sp = l > 20.0f ? l : log1pf(expf(l));     // torch softplus (beta 1, threshold 20)
-        s[i] = sqrtf(sp);
-        const float val = s[i] + ldgf(bias + e);
-        v[i] = val != val ? -INFINITY : val;                  // NaN never wins
+        if constexpr (C::kSelFull) {
+            const float l = ldgf(logits + (size_t) t * kExperts + e);
+            const float sp = l > 20.0f ? l : log1pf(expf(l));     // torch softplus (beta 1, threshold 20)
+            s[i] = sqrtf(sp);
+            const float val = s[i] + ldgf(bias + e);
+            v[i] = val != val ? -INFINITY : val;                  // NaN never wins
+        } else {
+            // kExperts is not a multiple of 32: the lanes past the last expert hold nothing (never selected: their `taken` bit starts set)
+            s[i] = 0.0f;
+            v[i] = -INFINITY;
+            if (e < kExperts) {
+                const float l = ldgf(logits + (size_t) t * kExperts + e);
+                const float sp = l > 20.0f ? l : log1pf(expf(l));
+                s[i] = sqrtf(sp);
+                const float val = s[i] + ldgf(bias + e);
+                v[i] = val != val ? -INFINITY : val;
+            } else {
+                taken |= 1u << i;
+            }
+        }
     }
-    uint32_t taken = 0;
     int isel[kTopK];
     float wsel[kTopK];
     DS41_UNROLL
@@ -277,69 +312,53 @@ DS41_KERNEL DS41_LAUNCH_BOUNDS(128) void router_select_kernel(const float* DS41_
 }
 
 // ---- host side --------------------------------------------------------------------------------------------------------------------
-inline void rt_check_launch(const char* what) {
-#if !defined(DS41_EMU)
-    const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) throw std::runtime_error(std::string("ds41 ") + what + ": " + cudaGetErrorString(e));
-#else
-    (void) what;
-#endif
-}
-
-template <int NT>
+template <class G, int NT>
 inline void launch_logits_gemv(const float* x, const uint16_t* wg, int T, float* logits, void* stream) {
-    const dim3 grid(kExperts, (unsigned) ((T + NT - 1) / NT));
-#if defined(DS41_EMU)
-    (void) stream;
-    ds41_emu::launch(grid, dim3(32 * kRtSliceWarps), 0, [&] { router_logits_gemv_kernel<NT>(x, wg, T, logits); });
-#else
-    router_logits_gemv_kernel<NT><<<grid, 32 * kRtSliceWarps, 0, (cudaStream_t) stream>>>(x, wg, T, logits);
-#endif
-    rt_check_launch("router_logits");
+    const dim3 grid(G::kExperts, (unsigned) ((T + NT - 1) / NT));
+    launch(router_logits_gemv_kernel<G, NT>, grid, dim3(32 * RtCfg<G>::kSliceWarps), 0, stream, x, wg, T, logits);
+    check_launch("router_logits");
 }
 
 }  // namespace strata::ds41::cuda::dev
 
 namespace strata::ds41::cuda {
 
+template <class G>
 void router_logits(const float* x, const uint16_t* wg_bf16, int T, float* logits, void* stream) {
     if (T < 1) return;
     if (reinterpret_cast<uintptr_t>(x) % 16 != 0 || reinterpret_cast<uintptr_t>(wg_bf16) % 16 != 0 || reinterpret_cast<uintptr_t>(logits) % 16 != 0)
         throw std::invalid_argument("ds41 router_logits: x, wg and logits must be 16-byte aligned");
     if (T > kRouterSmallT) {
-        const dim3 grid((unsigned) (kExperts / dev::kRtPfExperts), (unsigned) ((T + dev::kRtPfTokens - 1) / dev::kRtPfTokens));
-#if defined(DS41_EMU)
-        (void) stream;
-        ds41_emu::launch(grid, dim3(32 * dev::kRtSliceWarps), 0, [&] { dev::router_logits_prefill_kernel(x, wg_bf16, T, logits); });
-#else
-        dev::router_logits_prefill_kernel<<<grid, 32 * dev::kRtSliceWarps, 0, (cudaStream_t) stream>>>(x, wg_bf16, T, logits);
-#endif
-        dev::rt_check_launch("router_logits(prefill)");
+        const dim3 grid((unsigned) (G::kExperts / dev::kRtPfExperts), (unsigned) ((T + dev::kRtPfTokens - 1) / dev::kRtPfTokens));
+        dev::launch(dev::router_logits_prefill_kernel<G>, grid, dim3(32 * dev::RtCfg<G>::kSliceWarps), 0, stream, x, wg_bf16, T, logits);
+        dev::check_launch("router_logits(prefill)");
     } else if (T == 1) {
-        dev::launch_logits_gemv<1>(x, wg_bf16, T, logits, stream);
+        dev::launch_logits_gemv<G, 1>(x, wg_bf16, T, logits, stream);
     } else if (T == 2) {
-        dev::launch_logits_gemv<2>(x, wg_bf16, T, logits, stream);
+        dev::launch_logits_gemv<G, 2>(x, wg_bf16, T, logits, stream);
     } else {
-        dev::launch_logits_gemv<4>(x, wg_bf16, T, logits, stream);
+        dev::launch_logits_gemv<G, 4>(x, wg_bf16, T, logits, stream);
     }
 }
 
+template <class G>
 void router_select(const float* logits, const float* bias, int T, int32_t* ids, float* weights, void* stream) {
     if (T < 1) return;
     const dim3 grid((unsigned) ((T + dev::kRtWarps - 1) / dev::kRtWarps));
-#if defined(DS41_EMU)
-    (void) stream;
-    ds41_emu::launch(grid, dim3(128), 0, [&] { dev::router_select_kernel(logits, bias, T, ids, weights); });
-#else
-    dev::router_select_kernel<<<grid, 128, 0, (cudaStream_t) stream>>>(logits, bias, T, ids, weights);
-#endif
-    dev::rt_check_launch("router_select");
+    dev::launch(dev::router_select_kernel<G>, grid, dim3(128), 0, stream, logits, bias, T, ids, weights);
+    dev::check_launch("router_select");
 }
 
-void router_forward(const float* x, const uint16_t* wg_bf16, const float* bias, int T, float* logits_ws, int32_t* ids, float* weights,
-                    void* stream) {
-    router_logits(x, wg_bf16, T, logits_ws, stream);
-    router_select(logits_ws, bias, T, ids, weights, stream);
+template <class G>
+void router_forward(const float* x, const uint16_t* wg_bf16, const float* bias, int T, float* logits_ws, int32_t* ids, float* weights, void* stream) {
+    router_logits<G>(x, wg_bf16, T, logits_ws, stream);
+    router_select<G>(logits_ws, bias, T, ids, weights, stream);
 }
 
 }  // namespace strata::ds41::cuda
+
+/// Explicit instantiation of the router's host entry points for geometry G (the .cu: RealGeom; the emulator build: RealGeom and MiniGeom).
+#define DS41_INSTANTIATE_ROUTER(G)                                                                                                                      \
+    template void ::strata::ds41::cuda::router_logits<G>(const float*, const uint16_t*, int, float*, void*);                                           \
+    template void ::strata::ds41::cuda::router_select<G>(const float*, const float*, int, int32_t*, float*, void*);                                    \
+    template void ::strata::ds41::cuda::router_forward<G>(const float*, const uint16_t*, const float*, int, float*, int32_t*, float*, void*);
