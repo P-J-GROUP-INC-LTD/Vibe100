@@ -81,9 +81,10 @@ def engine_copy(src: TI.Trace, name: str, *, mutate: dict | None = None, drop=No
 
 
 def noise(rel: float, seed: int = 0):
-    """A mutation adding Gaussian noise of rms `rel` x the array's rms (an arbitrary, clearly wrong stage)."""
+    """A mutation adding Gaussian noise of rms `rel` x the array's rms (over its finite entries) to its finite entries (an arbitrary, clearly wrong stage)."""
     def f(a):
         r = np.random.default_rng(seed)
-        rms = float(np.sqrt(np.mean(np.asarray(a, dtype=np.float64) ** 2))) or 1.0
-        return (a + rel * rms * r.standard_normal(a.shape)).astype(a.dtype)
+        fin = np.isfinite(a)
+        rms = float(np.sqrt(np.mean(np.asarray(a[fin], dtype=np.float64) ** 2))) if fin.any() else 1.0
+        return np.where(fin, a + rel * (rms or 1.0) * r.standard_normal(a.shape), a).astype(a.dtype)
     return f

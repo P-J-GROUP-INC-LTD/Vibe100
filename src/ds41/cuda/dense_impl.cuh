@@ -8,6 +8,19 @@
 // 2: one byte-permute per word, shared by every token), d_B = high half of word 17q + 8, the quants of B are words 17q + 9 .. 17q + 16 (aligned).
 // One lane = one super-block of one row; P lanes (P = a power of two >= ceil(k / 256), at most 32) share a row and 32 / P rows share a warp.  The activations
 // of the block's tokens are staged in shared memory with 16 bytes of padding per super-block, so the 8 lanes of a LDS.128 quarter-warp hit 8 different bank groups.
+//
+// PERFORMANCE MODEL (arithmetic, T = 1, V100 900 GB/s; measure with `ds41_dense_parity --bench` on the card).  Both big consumers are memory bound by a wide margin:
+//   wq_b  (n = 32768, k = 1280): 44.56 MB of weights = 49.5 us at 900 GB/s.  P = 8 lanes per row (5 super-blocks), 4 rows per warp, 104 rows per block,
+//         316 blocks of 128 threads = one wave of 4 blocks per SM.  Per lane-super-block: 17 LDG.128 (all hoisted before the first use: 272 B in flight per lane),
+//         64 IDP.4A, 32 PRMT, ~100 other instructions = ~210 warp instructions per 4 rows -> 1.9 M warp instructions = ~7 us of issue at 2.5 IPC per SM (14 % of
+//         the memory time, overlapped); IDP.4A ~2.4 us.  Expected: 49.5 us / ~0.9 DRAM efficiency + ~3 us ramp = ~58 us, i.e. ~770 GB/s = 80-88 % of 900.
+//         The one open risk is the lane-strided LDG.128 pattern (each instruction touches up to 32 sectors, 16 B of each: the second half of a sector is the next
+//         instruction's load, an L1 hit); it costs L1 tag throughput (~64 B/clk/SM useful vs 8.2 B/clk/SM needed), not DRAM traffic.
+//   head  (n = 129280, k = 5120, BF16): 1.324 GB = 1.471 ms at 900 GB/s.  One warp per row, 20 fully coalesced LDG.128 per lane (512 B per instruction), the FP32
+//         activations in a 23 KB conflict-free shared tile, 404 rows per block, 320 blocks = one wave.  ~440 warp instructions per row = 57 M = ~0.2 ms of issue
+//         (14 %), 20.7 M warp FFMA = 0.09 ms, shared-memory reads 2.65 GB over 80 SMs = 0.19 ms: all hidden under the DRAM stream.  Expected 87-92 % (~800 GB/s,
+//         ~1.65 ms).
+// T up to 8 reads each weight once (the activations of all T tokens sit in shared memory); the FP32-activation modes are compute-bound above T ~ 2.
 #pragma once
 
 #include <algorithm>

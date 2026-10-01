@@ -107,6 +107,7 @@ REAL_DIMS = Dims()
 SUM_NOISE = 4.0e-8        # soft_rms = SUM_NOISE * sqrt(K) for a float32 sum of K terms: 2.2x the measured naive left-to-right sequential error
                           # (1.8e-8 * sqrt(K), K = 256 .. 20480); the engine's lane-strided sums are 3-6x better, numpy BLAS 4-7x
 SOFT_FLOOR = 2.0e-6       # nothing is held tighter than this (the measured float32-vs-float64 stage error on the mini model is <= 5e-7)
+SCORES_SOFT_MULT = 6.0    # the indexer's scores are sums of terms of both signs: relative error of the result (measured 8.5e-7 / 1.4e-6 rms on the mini model) is above a plain sum's
 SOFT_MAX_OVER_RMS = 2.5   # max_rel (max |E-O| / max |O|) vs rms_rel of a float32 sum error: measured 1.2 - 1.6
 HARD_NOFLIP = 50.0        # a stage without a quantiser inside has no excuse for a sample above 50 x soft (hard = 50 x soft)
 FLIP_RATE = 2.2e-5        # P(an int8 rounding decision flips) per element at the engine's pre-quantiser noise (5e-7 relative); 4.4e-5 at 1e-6
@@ -120,6 +121,7 @@ KV_MULT = 2.0
 BUDGET_BASE = 0.02        # a stage may always have this fraction of FLIP-level samples
 BUDGET_MULT = 2.0         # budget = BASE + MULT * P(at least one flip in a sample), capped
 BUDGET_CAP = 0.9
+BUDGET_FLOOR = 3.0        # ... and never fewer than this many FLIP-level samples per stage (DS1-C measured 8 flips in 4800 attention layer-steps, 1 per ~800)
 CHAOS_CEILING_RMS = 4.0   # full mode, downstream of the first deviation: rms_rel above this is a failure (an expert swap or a flipped selection gives ~1.0 - 1.4:
                           # two unrelated vectors of the same size; 4 means a blow-up, NaN / Inf always fails)
 TIE_FLOAT = 2.0e-5        # float32 noise of a router / indexer score relative to its scale, x ~10 safety (no quantiser flip involved)
@@ -149,8 +151,16 @@ def stage_models(d: Dims, q) -> dict:
         # compressor wkv / wgate are BF16 weights with float activations: a float32 sum of K = dim terms (DS1.md section 2)
         "latent": S(d.dim, (), "fp4e4m3" if q.compressed_kv else None, d.head_dim),
         "index_k": S(d.dim, (), "fp4e8m0" if q.index else None, d.index_head_dim),
-        # sparse attention (<= window + top-k terms), inverse RoPE, wo_a (float act, K = heads*head_dim/groups), int8 o_groups*o_lora (the site), wo_b
-        "attn_out": S(max(d.n_heads * d.head_dim // max(d.o_groups, 1), 640), (d.o_groups * d.o_lora,) if int8 else ()),
+        # the compressor's group latent before RoPE and the fp4 rounding (float only: BF16 wkv / wgate, softmax over the group, RMSNorm)
+        "latent_pre": S(d.dim),
+        # the indexer's scores: relu(q.k) over the index head dim summed over the index heads, weighted by weights_proj(x) (K = dim); q from the same int8 q_lora
+        # site as `q` and then fp4 fake-quantised (`index`); the index_k rows are the engine's
+        "index_scores": S(max(d.dim, d.index_n_heads * d.index_head_dim), (d.q_lora,) if int8 else (), "fp4e8m0" if q.index else None, d.index_n_heads * d.index_head_dim),
+        "block_scores": S(max(d.dim, d.index_n_heads * d.index_head_dim), (d.q_lora,) if int8 else (), "fp4e8m0" if q.index else None, d.index_n_heads * d.index_head_dim),
+        # the sparse attention reads the oracle's own q (from the engine's attn_in: the int8 q_lora site of `q` is inside this stage too): <= window + top-k terms
+        "attn_o": S(640, (d.q_lora,) if int8 else ()),
+        # ... then wo_a (float act, K = heads*head_dim/groups), int8 o_groups*o_lora (a second site), wo_b
+        "attn_out": S(max(d.n_heads * d.head_dim // max(d.o_groups, 1), 640), ((d.q_lora, d.o_groups * d.o_lora) if int8 else ())),
         "ffn_in": S(d.dim),
         "router_w": S(d.dim),
         # (top_k routed + 1 shared) x int8 of silu(g)*u (the site, K = ff) -> w2
@@ -179,6 +189,8 @@ class Tolerances:
         d, q = self.dims, self.quant
         for stage, m in stage_models(d, q).items():
             soft = max(SOFT_FLOOR, SUM_NOISE * math.sqrt(m.k_float)) if m.k_float else 1e-12
+            if stage in ("index_scores", "block_scores"):          # a weighted sum of relu terms of both signs cancels: measured 1.4e-6 on the mini model (3.7x the sum model's)
+                soft *= SCORES_SOFT_MULT
             soft_max = soft * SOFT_MAX_OVER_RMS if m.k_float else 1e-12
             lam, hard, hard_max = 0.0, soft * HARD_NOFLIP if m.k_float else 1e-9, 0.0
             hard_max = hard * SOFT_MAX_OVER_RMS if m.k_float else 1e-9
@@ -194,7 +206,9 @@ class Tolerances:
             budget = _budget(lam) if stage != "embed" else 0.0
             self.lam[stage] = lam
             self.stages[stage] = FloatTol(soft * self.scale, soft_max * self.scale, hard * self.scale, hard_max * self.scale, budget)
-        tie_idx = TIE_INDEX_FP4 if q.index else TIE_FLOAT
+        int8 = bool(q.int8_act or q.linear_act)
+        # the indexer's q passes the same int8 q_lora site as `q`: one flip moves the scores by ~FLIP_RMS / sqrt(q_lora) of their scale
+        tie_idx = max(TIE_FLOAT, 4.0 * FLIP_RMS / math.sqrt(d.q_lora) if int8 else 0.0, TIE_INDEX_FP4 if q.index else 0.0)
         self.stages["router_idx"] = SetTol(TIE_FLOAT, 0.2, 0.02)
         self.stages["topk"] = SetTol(tie_idx, 0.10, _budget(0.0) + (0.03 if q.index else 0.0))
         self.stages["cand_blocks"] = SetTol(tie_idx, 0.25, _budget(0.0) + (0.03 if q.index else 0.0))
@@ -381,6 +395,19 @@ def compare_one(stage: str, layer, pos: int, e, o, ref: Source, tols: Tolerances
                 s.extra.update({"top1_match": int(np.argmax(ea)) == int(np.argmax(oa)), "gap": float(top2[1] - top2[0]),
                                 "kl": _softmax_kl(oa, ea), "max_logit": float(np.max(np.abs(oa)))})
         return s
+    if st.kind == "scores":
+        tol = tols[stage]
+        ea, oa = np.asarray(e, dtype=np.float64).reshape(-1), np.asarray(o, dtype=np.float64).reshape(-1)
+        if ea.shape != oa.shape:
+            return Sample(stage, layer, pos, Level.FAIL, note=f"shape mismatch: {ea.shape} vs {oa.shape}")
+        mm = int(np.sum((np.isneginf(ea) != np.isneginf(oa)) | (np.isposinf(ea) != np.isposinf(oa))))
+        fin = np.isfinite(ea) & np.isfinite(oa)
+        m = float_metrics(ea[fin], oa[fin])
+        bad_nan = bool(np.isnan(ea).any() and not np.isnan(oa).any())
+        if mm or bad_nan:
+            return Sample(stage, layer, pos, Level.FAIL, m["rms_rel"], m["max_rel"], m["max_abs"], m["cos"],
+                          (f"{mm} entries differ in reachability (-inf / +inf mask)" if mm else "NaN in the engine's scores"))
+        return Sample(stage, layer, pos, float_level(m, tol), m["rms_rel"], m["max_rel"], m["max_abs"], m["cos"])
     if st.kind == "set":
         mg = ref.get(SELECTION_MARGIN[stage], pos, layer)
         margin, scale = (None, None) if mg is None else (float(mg[0]), float(mg[1]))
@@ -402,7 +429,7 @@ def _router_w_sample(eng: Source, ref: Source, pos, layer, tols: Tolerances) -> 
 
 
 # stages whose error persists in the cache: later positions of the same layer read them
-CACHE_FEEDERS = ("engram_out", "attn_in", "kv_win", "latent", "index_k")
+CACHE_FEEDERS = ("engram_out", "attn_in", "kv_win", "latent_pre", "latent", "index_k")
 
 
 def downstream_of(onset, pos: int, layer, stage: str) -> bool:
@@ -472,7 +499,7 @@ class Report:
             if stage in self.tols:
                 b = self.tols[stage].budget
                 n = r["n"] - r["down"]
-                allowed = max(b * n, 1.0 if n < 10 else 0.0)        # a handful of samples can't establish a rate: one FLIP is tolerated
+                allowed = max(b * n, BUDGET_FLOOR)                    # a handful of samples can't establish a rate: a few isolated flips are always tolerated
                 if r["flip"] > allowed:
                     out.append((stage, r["flip"], n, b))
         return out
@@ -512,6 +539,13 @@ class Report:
             kls = [s.extra["kl"] for s in lg]
             L.append(f"logits: top-1 agreement {top1}/{len(lg)} ({100.0 * top1 / len(lg):.2f} %), KL(oracle||engine) mean {np.mean(kls):.3e} max {np.max(kls):.3e}"
                      f"; mismatches: " + (", ".join(f"p{s.pos} (oracle gap {s.extra['gap']:.3g})" for s in lg if not s.extra["top1_match"])[:300] or "none"))
+        flips = [s for s in self.samples if s.level == Level.FLIP and not s.extra.get("near_tie") and not s.extra.get("downstream")]
+        if flips and self.mode == "layer":
+            expect = sum(self.tols.lam.get(st, 0.0) * r["n"] for st, r in rows.items()) if self.tols is not None else 0.0
+            L.append(f"quantiser flips (above soft, within hard: one int8 / fp8 / fp4 rounding decision inside the stage fell the other way): {len(flips)} "
+                     f"(the flip model expects up to {expect:.1f} for this many samples at the engine's noise level; the oracle against itself on the mini model: ~0.1 % of samples)")
+            for s in sorted(flips, key=lambda x: x.key)[:8]:
+                L.append(f"    {s.where()}: rms_rel {s.rms_rel:.2e}, max_rel {s.max_rel:.2e}")
         if self.tie_events:
             L.append(f"near-ties (a selection that differs where the oracle's margin is within the tie window): {len(self.tie_events)}")
             for (p, l, st, txt) in self.tie_events[:8]:
@@ -671,9 +705,10 @@ def compare_traces(eng: Trace, ref: Trace, *, positions=None, layers=None, stage
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def trace_cost(summary: dict) -> dict:
+def trace_cost(summary: dict, context: int = 1024) -> dict:
     """Bytes per token position the engine writes for each stage, from a `trace_io.model_summary` dict (vocab_size included): -> {stage: bytes}.
-    `latent` / `index_k` count the positions that publish a row (1 / ratio of them, FULL layers only); `topk` its maximum."""
+    `latent` / `latent_pre` / `index_k` count the positions that publish a row (1 / ratio of them, FULL layers only); `topk` its maximum; `index_scores` and
+    `block_scores` (optional, they grow with the position) and `cand_blocks` are estimated at `context` positions."""
     d = Dims.from_summary(summary)
     n_layers, ratios, modes = int(summary["n_layers"]), summary["compress_ratios"], summary["layer_modes"]
     out = {st: 0.0 for st in TI.STAGE if TI.STAGE[st].role != "oracle"}
@@ -686,12 +721,20 @@ def trace_cost(summary: dict) -> dict:
             out["engram_out"] += 4.0 * d.hc * d.dim
         out["attn_in"] += 4.0 * d.dim
         out["q"] += 4.0 * d.n_heads * d.head_dim
+        out["attn_o"] += 4.0 * d.n_heads * d.head_dim
         out["kv_win"] += 4.0 * d.head_dim
         if r:
             out["topk"] += 4.0 * int(summary["index_topk"])
             if modes[l] == "full":
                 out["latent"] += 4.0 * d.head_dim / r
+                out["latent_pre"] += 4.0 * d.head_dim / r
                 out["index_k"] += 4.0 * d.index_head_dim / r
+            if modes[l] in ("full", "reindex"):
+                out["index_scores"] += 4.0 * (context // r)
+            if l == int(summary["candidate_source_layer"]):
+                bs = int(summary["candidate_block_size"])
+                out["block_scores"] += 4.0 * -(-(context // r) // bs)
+                out["cand_blocks"] += 4.0 * min(int(summary["candidate_topk_blocks"]), -(-(context // r) // bs))
         out["attn_out"] += 4.0 * d.dim
         out["ffn_in"] += 4.0 * d.dim
         out["router_idx"] += 4.0 * d.top_k
@@ -862,8 +905,10 @@ def _cmd_cost(a) -> int:
     print(f"{'stage':14s} {'bytes / position':>18s}   role")
     for st in sorted(cost, key=lambda n: STAGE_ORDER[n]):
         print(f"{st:14s} {cost[st]:18,.0f}   {TI.STAGE[st].role}")
-    needed = total - sum(cost[st] for st in ("q",))
-    print(f"{'total':14s} {total:18,.0f}   = {total / 1e6:.2f} MB per token; {32 * total / 1e6:.0f} MB for 32 tokens; without q (never read by the replay): {needed / 1e6:.2f} MB per token")
+    required = sum(c for st, c in cost.items() if TI.STAGE[st].required)
+    needed = required - cost["q"]
+    print(f"{'all':14s} {total:18,.0f}   = {total / 1e6:.2f} MB per token with every optional stage ({32 * total / 1e6:.0f} MB for 32 tokens)")
+    print(f"{'required':14s} {required:18,.0f}   = {required / 1e6:.2f} MB per token ({32 * required / 1e6:.0f} MB for 32 tokens); without q (compared only, never read by the replay): {needed / 1e6:.2f} MB")
     return 0
 
 

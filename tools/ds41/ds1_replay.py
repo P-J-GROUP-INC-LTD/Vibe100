@@ -262,10 +262,20 @@ class Replayer:
         ratio = cfg.compress_ratios[L]
         out["q"] = c["q"][0]
         out["kv_win"] = c["kv_new"][0]
+        out["attn_o"] = c["attn_o"][0]
         if ratio:
             out["topk"] = c["topk"][0]
             if p in c.get("pub", {}):
-                out["latent"], out["index_k"] = c["pub"][p]
+                out["latent"], out["index_k"], lpre = c["pub"][p]
+                if lpre is not None:
+                    out["latent_pre"] = lpre
+            width = (p + 1) // ratio
+            if "index_scores" in c and width:
+                out["index_scores"] = c["index_scores"][0][:width]
+            if "block_scores" in c and width:
+                out["block_scores"] = c["block_scores"][0][:-(-width // cfg.candidate_block_size)]
+            if "cand" in c:
+                out["cand_blocks"] = c["cand"][0]
         mg = c.get("margins", {})
         if "index" in mg:
             out["index_margin"] = np.array([mg["index"][0][0], mg["index"][1][0]], dtype=np.float32)

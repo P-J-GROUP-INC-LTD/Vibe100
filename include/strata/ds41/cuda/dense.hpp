@@ -48,6 +48,9 @@
 //     FFN: ds41_rmsnorm; router (DS-D); ds41_shared_expert<G>(dev, w, xn, 1, y_shared, scratch, true, 10.f, s); ... ds41_f32_add<G>(...);
 //     head: ds41_rmsnorm<G>(final hidden); ds41_head<G>(dev, output_bf16, xn, 1, logits, s); ds41_argmax<G>(dev, logits, 1, tok, val, s);
 //
+// GRAPHS: a launch needing more than 48 KB of dynamic shared memory (T >= 5 at k = 8192, FP32 activations at T >= 4 ...) first calls cudaFuncSetAttribute for its
+// kernel; call such a shape once before capturing a CUDA graph.  The T = 1 shapes of a decode step never need it.
+//
 // NO OVERLAP: y (and any scratch) must not overlap an input of the same call (except where an op says `out may equal x`).
 //
 // ALIGNMENT (the emulator asserts it): FP32 activations and every FP32 / BF16 weight array 16 bytes; Q8_0 weights 2 bytes (16 when k % 256 == 0: the fast

@@ -42,6 +42,11 @@ class ToleranceModel(unittest.TestCase):
         self.assertAlmostEqual(mini["ffn_out"].hard_rms, C.FLIP_MULT * C.FLIP_RMS / math.sqrt(256), places=9)
         self.assertGreater(real["ffn_out"].budget, mini["ffn_out"].budget)               # more sites of more elements: more flips per sample
         self.assertAlmostEqual(real.lam["ffn_out"], C.FLIP_RATE * 7 * 2304, places=9)
+        self.assertAlmostEqual(real.lam["attn_out"], C.FLIP_RATE * (1280 + 8192), places=9)          # the q_lora site (the oracle recomputes q) and the wo_a -> wo_b site
+        self.assertAlmostEqual(real["index_scores"].soft_rms, C.SCORES_SOFT_MULT * 4.0e-8 * math.sqrt(5120), delta=1e-12)
+        self.assertAlmostEqual(real["topk"].tie_rel, C.TIE_INDEX_FP4)                                  # fp4 indexer flips dominate the int8 q_lora flip window
+        self.assertAlmostEqual(C.Tolerances(MINI, QuantConfig(int8_act=True))["topk"].tie_rel, 4 * C.FLIP_RMS / math.sqrt(64))
+        self.assertEqual(C.Tolerances(MINI, QuantConfig.exact())["topk"].tie_rel, C.TIE_FLOAT)
         self.assertGreaterEqual(real["ffn_out"].hard_rms, C.FLIP_FLOOR)
         self.assertEqual(real["embed"].budget, 0.0)
         self.assertLessEqual(max(t.budget for t in real.stages.values()), C.BUDGET_CAP)
@@ -205,13 +210,14 @@ class Injection(unittest.TestCase):
     def layer_report(self, eng):
         return R.replay_compare(self.m, eng, list(range(8)), list(range(self.n)), include_head=True, strict=True)
 
-    CASES = [("attn_in", 6, 5), ("q", 6, 5), ("kv_win", 6, 2), ("attn_out", 6, 3), ("ffn_in", 9, 1), ("router_w", 6, 5), ("ffn_out", 6, 6), ("block_out", 6, 4),
-             ("pre_mix", 6, 4), ("latent", 7, 2), ("index_k", 7, 2), ("embed", 6, None), ("final_hidden", 6, None), ("logits", 6, None)]
+    CASES = [("attn_in", 6, 5), ("q", 6, 5), ("kv_win", 6, 2), ("attn_o", 6, 5), ("attn_out", 6, 3), ("ffn_in", 9, 1), ("router_w", 6, 5), ("ffn_out", 6, 6), ("block_out", 6, 4),
+             ("pre_mix", 6, 4), ("latent_pre", 7, 2), ("latent", 7, 2), ("index_k", 7, 2), ("index_scores", 12, 6), ("block_scores", 12, 4), ("embed", 6, None),
+             ("final_hidden", 6, None), ("logits", 6, None)]
 
     def test_each_stage_is_named_in_layer_mode_and_in_whole_run_mode(self):
         for stage, pos, layer in self.CASES:
             with self.subTest(stage=stage, pos=pos, layer=layer):
-                eng = T.engine_copy(self.ref, f"inj_{stage}", mutate={(stage, pos, layer): T.noise(0.4 if stage in ("latent", "index_k") else 0.2)})
+                eng = T.engine_copy(self.ref, f"inj_{stage}", mutate={(stage, pos, layer): T.noise(0.4 if stage in ("latent", "index_k", "index_scores", "block_scores") else 0.2)})
                 full = C.compare_traces(eng, self.ref)
                 self.assertFalse(full.ok)
                 ff = full.first_failure()
@@ -240,6 +246,8 @@ class Injection(unittest.TestCase):
         lay = self.layer_report(one)
         self.assertTrue(lay.ok, lay.text())
         self.assertEqual([(s.stage, s.layer, s.pos) for s in lay.samples if s.level == C.Level.FLIP], [("q", 3, 6)])
+        self.assertIn("quantiser flips", lay.text())                                       # reported, with the position
+        self.assertIn("position 6, layer 3, stage q", lay.text())
         every = {("q", p, 3): (lambda a: a * np.float32(1.0 + 1e-3)) for p in range(self.n)}
         many = T.engine_copy(self.ref, "inj_small_all", mutate=every)
         lay = self.layer_report(many)
@@ -250,6 +258,19 @@ class Injection(unittest.TestCase):
         # an error beyond the hard tolerance fails at once
         big = T.engine_copy(self.ref, "inj_big_one", mutate={("q", 6, 3): lambda a: a * np.float32(1.05)})
         self.assertFalse(self.layer_report(big).ok)
+
+    def test_a_wrong_reachability_mask_in_the_scores_fails(self):
+        def unreachable(a):
+            a = a.copy()
+            a[3] = -np.inf
+            return a
+        eng = T.engine_copy(self.ref, "inj_mask", mutate={("index_scores", 12, 6): unreachable})
+        ff = C.compare_traces(eng, self.ref).first_failure()
+        self.assertEqual((ff.stage, ff.layer, ff.pos), ("index_scores", 6, 12))
+        self.assertIn("reachability", ff.note)
+        # a score that is -inf in both (masked out of the candidate pool) is not an error
+        self.assertTrue(np.isneginf(self.ref.get("index_scores", 12, 6)).any())
+        self.assertTrue(C.compare_traces(self.ref, self.ref, stages=["index_scores"]).ok)
 
     def test_nan_and_inf_always_fail(self):
         def poison(a):

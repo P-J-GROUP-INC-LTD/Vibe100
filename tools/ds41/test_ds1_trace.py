@@ -31,6 +31,9 @@ class Format(unittest.TestCase):
             self.assertIn(name, TI.STAGE, name)
             self.assertTrue(TI.STAGE[name].required, name)
         self.assertTrue(TI.STAGE["index_k"].required)
+        for name in ("latent_pre", "index_scores", "block_scores", "attn_o", "cand_blocks"):          # optional: DS1-C's trace_latent / trace_scores / trace_block_scores / trace_o / trace_cand
+            self.assertIn(name, TI.STAGE, name)
+            self.assertFalse(TI.STAGE[name].required, name)
         self.assertEqual({n for n, s in TI.STAGE.items() if s.role == "oracle"}, {"router_margin", "index_margin", "cand_margin"})
         self.assertEqual({s.dtype for s in TI.STAGES if s.kind == "set"}, {"i4"})
         self.assertEqual(set(TI.PER_POSITION), {"embed", "final_hidden", "logits"})
@@ -157,6 +160,13 @@ class OracleTrace(unittest.TestCase):
                 published = modes[l] is Mode.FULL and (p + 1) % ratio == 0 if ratio else False
                 self.assertEqual(t.has("latent", p, l), published, (p, l))
                 self.assertEqual(t.has("index_k", p, l), published, (p, l))
+                self.assertEqual(t.has("latent_pre", p, l), published, (p, l))
+                self.assertTrue(t.has("attn_o", p, l))
+                scored = modes[l] in (Mode.FULL, Mode.REINDEX) and (p + 1) // ratio > 0 if ratio else False
+                self.assertEqual(t.has("index_scores", p, l), scored, (p, l))
+                at_c0 = l == cfg.candidate_source_layer and (p + 1) // ratio > 0
+                self.assertEqual(t.has("block_scores", p, l), at_c0, (p, l))
+                self.assertEqual(t.has("cand_blocks", p, l), at_c0, (p, l))
 
     def test_shapes_and_dtypes(self):
         t, c = self.tr, self.cfg
@@ -204,6 +214,46 @@ class OracleTrace(unittest.TestCase):
                     q = (j + 1) * ratio - 1
                     np.testing.assert_array_equal(lc.comp_kv[j], t.get("latent", q, l), err_msg=f"latent layer {l} group {j}")
                     np.testing.assert_array_equal(lc.index_k[j], t.get("index_k", q, l), err_msg=f"index_k layer {l} group {j}")
+
+    def test_the_optional_stages_are_what_the_oracle_computed(self):
+        """attn_o -> wo_a / wo_b gives attn_out; latent_pre -> RoPE / fp4 gives latent and (via wk) index_k; index_scores -> top-k gives topk; block_scores pins the newest block."""
+        from ref.ds41.attention import apply_rope_tail
+        from ref.ds41.ops import linear, rmsnorm
+        from ref.ds41.quant import fp4_quant_e4m3, fp4_quant_e8m0
+        m, t, c = self.m, self.tr, self.cfg
+        get = lambda l, n: m.p(f"layers.{l}.attn.{n}")                                        # noqa: E731
+        for l, p in ((0, 3), (3, 9), (6, 12), (7, 15)):
+            o = t.get("attn_o", p, l)[None].astype(np.float32)
+            g = c.o_groups
+            wo_a = get(l, "wo_a.weight").reshape(g, c.o_lora_rank, -1)
+            h = np.einsum("sgd,grd->sgr", o.reshape(1, g, -1), wo_a)
+            out = linear(h.reshape(1, -1), get(l, "wo_b.weight"), act_quant=True, quant=m.quant)
+            np.testing.assert_array_equal(out[0].astype(np.float32), t.get("attn_out", p, l), err_msg=f"attn_out layer {l} position {p}")
+        for l, p in ((2, 9), (4, 12)):                                                        # FULL layers (ratio 2 and 1)
+            ratio = c.compress_ratios[l]
+            cos, sin = m._rope_tables(l)
+            pre = t.get("latent_pre", p, l)[None].astype(np.float32)
+            pos = np.array([p + 1 - ratio])
+            lat = fp4_quant_e4m3(apply_rope_tail(pre, cos[pos], sin[pos], c.rope_head_dim), 16)
+            np.testing.assert_array_equal(lat[0], t.get("latent", p, l), err_msg=f"latent layer {l}")
+            k = rmsnorm(pre @ get(l, "indexer.wk.weight").T, get(l, "indexer.k_norm.weight"), c.norm_eps)
+            k = fp4_quant_e8m0(apply_rope_tail(k, cos[pos], sin[pos], c.rope_head_dim), 32)
+            np.testing.assert_array_equal(k[0], t.get("index_k", p, l), err_msg=f"index_k layer {l}")
+        for l, p in ((2, 9), (4, 12), (6, 12)):                                               # the indexer layers
+            ratio = c.compress_ratios[l]
+            sc = t.get("index_scores", p, l)
+            self.assertEqual(sc.shape, ((p + 1) // ratio,))
+            k = min(c.index_topk, (p + 1) // ratio)
+            pick = np.argsort(-sc.astype(np.float64), kind="stable")[:k]
+            pick = np.sort(pick[np.isfinite(sc[pick])])
+            np.testing.assert_array_equal(pick, t.get("topk", p, l))
+        bs = t.get("block_scores", 12, 4)
+        self.assertEqual(bs.shape, (-(-13 // c.candidate_block_size),))
+        self.assertEqual(int(np.argmax(bs)), 12 // c.candidate_block_size)                    # the block of the newest position is +inf
+        self.assertTrue(np.isposinf(bs[12 // c.candidate_block_size]))
+        kept = t.get("cand_blocks", 12, 4)
+        self.assertTrue((np.diff(kept) > 0).all() and 12 // c.candidate_block_size in kept)
+        self.assertLessEqual(len(kept), c.candidate_topk_blocks)
 
     def test_attn_in_is_the_normed_pre_mixed_stream(self):
         from ref.ds41.mhc import hc_pre

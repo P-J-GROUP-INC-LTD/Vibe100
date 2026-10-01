@@ -58,7 +58,7 @@ class Stage:
     name: str
     layered: bool              # one file per (layer, position) instead of per position
     dtype: str                 # "f4" | "i4"
-    kind: str                  # float | kvq (fake-quantised cache row) | set (integer set) | weights | logits | margin
+    kind: str                  # float | kvq (fake-quantised cache row) | set (integer set) | scores (+-inf mask + floats) | weights | logits | margin
     required: bool             # the engine must write it (DS1.md section 6); False = optional / oracle-only
     role: str                  # state (cache row: needed at every position <= p to replay position p), input, check, oracle
     doc: str
@@ -70,12 +70,21 @@ STAGES: tuple = (
     Stage("attn_in", True, "f4", "float", True, "state", "[dim] attention input: hc_pre(stream, pre_mix) then attn_norm (kept at every position of a ratio>1 FULL layer: it rebuilds the compressor's group state)"),
     Stage("q", True, "f4", "float", True, "check", "[heads, head_dim] queries after wq_a, q_norm, wq_b and RoPE: the q the sparse attention reads"),
     Stage("kv_win", True, "f4", "kvq", True, "state", "[head_dim] the sliding-window KV row written at the position (kv_norm, RoPE on the tail, fp8 fake-quant when window_kv)"),
+    Stage("latent_pre", True, "f4", "float", False, "check", "[head_dim] OPTIONAL: the normalised group latent BEFORE RoPE and the fp4 fake-quant, at the positions where `latent` is published (FULL layers); "
+                                                            "with `latent` it separates a compressor error from a RoPE / quantiser error"),
     Stage("latent", True, "f4", "kvq", True, "state", "[head_dim] the compressed-KV cache row published at this position, i.e. when a group of `ratio` tokens completes (FULL layers only): "
                                                       "RMSNorm, RoPE at group*ratio, fp4 fake-quant when compressed_kv: exactly what the cache holds"),
     Stage("index_k", True, "f4", "kvq", True, "state", "[index_head_dim] the index-K cache row published together with `latent` (FULL layers): RMSNorm of wk(PRE-RoPE latent), RoPE, fp4 fake-quant when index "
                                                          "(not recoverable from `latent`, which is post-RoPE and fp4: the layer replay of every indexer layer needs it)"),
+    Stage("index_scores", True, "f4", "scores", False, "check", "[(p+1)//ratio] OPTIONAL: the indexer's scores of this position over the compressed positions (FULL / REINDEX layers), after the candidate mask: -inf = "
+                                                                "unreachable (a position is reachable once its group completed); the selection `topk` is made from these"),
+    Stage("block_scores", True, "f4", "scores", False, "check", "[ceil(((p+1)//ratio)/block)] OPTIONAL: the candidate source's score per block of `candidate_block_size` positions (its best position; the block of the "
+                                                                "newest reachable position is +inf)"),
     Stage("topk", True, "i4", "set", True, "input", "int32 [<= index_topk] the compressed-cache positions this layer attends to (ratio>0 layers, REUSE layers included): "
                                                     "ascending, entries < 0 are padding and are ignored by the reader; order is irrelevant"),
+    Stage("cand_blocks", True, "i4", "set", False, "input", "int32 candidate-pool block ids at the candidate-source layer (optional; lets REINDEX layers be replayed with the engine's pool)"),
+    Stage("attn_o", True, "f4", "float", False, "check", "[heads, head_dim] OPTIONAL: the sparse attention's output after the inverse RoPE (the input of `wo_a`): with `attn_out` it separates an "
+                                                         "attention-core error from an output-projection error"),
     Stage("attn_out", True, "f4", "float", True, "check", "[dim] attention sub-layer output (after wo_b), before hc_post"),
     Stage("ffn_in", True, "f4", "float", True, "check", "[dim] FFN input: hc_pre(stream, attn pre) then ffn_norm; what the router and the experts read"),
     Stage("router_idx", True, "i4", "set", True, "check", "int32 [top_k] the selected routed experts (order irrelevant)"),
@@ -89,7 +98,6 @@ STAGES: tuple = (
     Stage("router_margin", True, "f4", "margin", False, "oracle", "[2] (k-th minus (k+1)-th best of s + bias, max |s + bias|): how close the router's choice was to a tie"),
     Stage("index_margin", True, "f4", "margin", False, "oracle", "[2] (k-th minus (k+1)-th best indexer score, max |score|) of the top-k selection; inf = no choice was made"),
     Stage("cand_margin", True, "f4", "margin", False, "oracle", "[2] the same for the candidate-pool block selection (candidate-source layer)"),
-    Stage("cand_blocks", True, "i4", "set", False, "input", "int32 candidate-pool block ids at the candidate-source layer (optional; lets REINDEX layers be replayed with the engine's pool)"),
 )
 STAGE = {s.name: s for s in STAGES}
 STAGE_ORDER = {s.name: i for i, s in enumerate(STAGES)}
@@ -316,7 +324,7 @@ class _Capture:
     def __enter__(self):
         A, M, model = self.A, self.M, self.model
         cap = self
-        self.orig = {"window_kv": A.window_kv, "sparse_attn": A.sparse_attn, "note_margin": A.note_margin,
+        self.orig = {"window_kv": A.window_kv, "sparse_attn": A.sparse_attn, "note_margin": A.note_margin, "apply_rope_tail": A.apply_rope_tail, "compressor": A.compressor,
                      "attention_layer": M.attention_layer, "moe": M.moe, "router": M.router}
         o = self.orig
 
@@ -333,6 +341,22 @@ class _Capture:
         def note_margin(shared, key, scores, k):
             o["note_margin"](shared, key, scores, k)
             cap.cur.setdefault("margins", {})[key.split(".")[0]] = _margin_pair(scores, k)
+            if key.startswith("index."):                       # the indexer's scores after the candidate mask; the block scores of the candidate source
+                cap.cur["index_scores"] = np.array(scores, copy=True)
+            elif key.startswith("blocks."):
+                cap.cur["block_scores"] = np.array(scores, copy=True)
+
+        def apply_rope_tail(*a, **kw):
+            out = o["apply_rope_tail"](*a, **kw)
+            if kw.get("inverse") and cap.cur is not None:      # the attention output after the inverse RoPE: the input of wo_a
+                cap.cur["attn_o"] = np.array(out, copy=True)
+            return out
+
+        def compressor(*a, **kw):
+            out = o["compressor"](*a, **kw)
+            if out is not None and cap.cur is not None:        # the pre-RoPE normalised group latent(s) of this call
+                cap.cur["latent_pre"] = np.array(out, copy=True)
+            return out
 
         def attention_layer(cfg, layer, mode, x, start_pos, rope, get, *, lc, caches, shared, quant, stale_index_k=False):
             cap.cur = cap.per_layer[layer] = {"x": np.array(x, copy=True), "start": start_pos, "s": x.shape[0]}
@@ -348,7 +372,9 @@ class _Capture:
                 if mode.value == "full":
                     # the cache rows published by this call: group j completes at position (j + 1) * ratio - 1
                     done = range(start_pos // ratio, (start_pos + s) // ratio)
-                    cap.cur["pub"] = {(j + 1) * ratio - 1: (np.array(lc.comp_kv[j], copy=True), np.array(lc.index_k[j], copy=True)) for j in done}
+                    lp = cap.cur.get("latent_pre")
+                    cap.cur["pub"] = {(j + 1) * ratio - 1: (np.array(lc.comp_kv[j], copy=True), np.array(lc.index_k[j], copy=True),
+                                                            None if lp is None else np.array(lp[i], copy=True)) for i, j in enumerate(done)}
             return out
 
         def moe(y, **kw):
@@ -360,13 +386,14 @@ class _Capture:
             cap.cur["router_scale"] = np.max(np.abs(np.asarray(r.scores, dtype=np.float64) + np.asarray(bias, dtype=np.float64)), axis=-1)
             return r
 
-        A.window_kv, A.sparse_attn, A.note_margin = window_kv, sparse_attn, note_margin
+        A.window_kv, A.sparse_attn, A.note_margin, A.apply_rope_tail, A.compressor = window_kv, sparse_attn, note_margin, apply_rope_tail, compressor
         M.attention_layer, M.moe, M.router = attention_layer, moe, router
         return self
 
     def __exit__(self, *exc):
         A, M, o = self.A, self.M, self.orig
         A.window_kv, A.sparse_attn, A.note_margin = o["window_kv"], o["sparse_attn"], o["note_margin"]
+        A.apply_rope_tail, A.compressor = o["apply_rope_tail"], o["compressor"]
         M.attention_layer, M.moe, M.router = o["attention_layer"], o["moe"], o["router"]
 
 
@@ -389,11 +416,20 @@ def _emit_call(w: TraceWriter, model, cap: _Capture, tr: dict, ids, start_pos: i
             if ratio:
                 w.put("topk", p, c["topk"][t], l)
                 if p in c.get("pub", {}):
-                    lat, ik = c["pub"][p]
+                    lat, ik, lpre = c["pub"][p]
                     w.put("latent", p, lat, l)
                     w.put("index_k", p, ik, l)
+                    if lpre is not None:
+                        w.put("latent_pre", p, lpre, l)
+                width = (p + 1) // ratio
+                if "index_scores" in c and width:
+                    w.put("index_scores", p, c["index_scores"][t][:width], l)
+                if "block_scores" in c and width:
+                    w.put("block_scores", p, c["block_scores"][t][:-(-width // cfg.candidate_block_size)], l)
             if "cand" in c:
                 w.put("cand_blocks", p, c["cand"][t], l)
+            if "attn_o" in c:
+                w.put("attn_o", p, c["attn_o"][t], l)
             w.put("attn_out", p, tr["attn_out"][l][t], l)
             w.put("ffn_in", p, c["ffn_in"][t], l)
             w.put("router_idx", p, tr["router_idx"][l][t], l)
