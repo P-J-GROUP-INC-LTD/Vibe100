@@ -20,6 +20,10 @@
 #        kv_hybrid_parity                                                  (also registered with ctest; run here too when ctest is skipped)
 #        ds41_router_parity | ds41_split_parity | ds41_expert_parity --selftest     the DeepSeek DS-D programs: router, hit/miss split,
 #                               MXFP4 hot-expert kernels vs FP64 references on synthetic data (PASS = "ALL PASS (n checks)")
+#        ds41_dense_parity --all --big                                     DeepSeek DS-1 dense kernels (Q8_0 / BF16 GEMV, norms, RoPE,
+#                               shared expert, vocabulary ops) at the real shapes vs FP64 references
+#        ds41_mhc_gpu_test | ds41_engram_gpu_test --golden DIR            DeepSeek DS-1 mHC and Engram vs the NumPy oracle's golden data
+#                               (DIR written first by src/ds41/engram/golden/gen_golden.py; needs python3 + numpy, else SKIPPED)
 #   6. tools/volta/sass_audit.py over the whole build: no unexplained BPT.TRAP, the Volta kernels really contain HMMA (with the
 #      cuobjdump next to the nvcc that built it)
 #
@@ -228,7 +232,8 @@ print(" ".join(dict.fromkeys(names)))
 
   # the GPU parity programs BY NAME: a target that is EXCLUDE_FROM_ALL is not in `all`.  One CMake does not know is skipped with a note.
   EXTRA=()
-  for n in qsa_prompt_attn_parity gemm_volta_parity kv_hybrid_parity ds41_router_parity ds41_split_parity ds41_expert_parity strata-device; do
+  for n in qsa_prompt_attn_parity gemm_volta_parity kv_hybrid_parity ds41_router_parity ds41_split_parity ds41_expert_parity \
+           ds41_dense_parity ds41_mhc_gpu_test ds41_engram_gpu_test strata-device; do
     if [[ "$KNOWN_TARGETS" == *" $n "* ]]; then EXTRA+=("$n"); else echo "note: no CMake target $n in this configuration: not built"; fi
   done
   if [[ ${#EXTRA[@]} -gt 0 ]]; then
@@ -362,6 +367,32 @@ if [[ "$SKIP_EXTRA" == 0 ]]; then
       record "$prog --selftest" SKIP 0 "no such target in this build"
     fi
   done
+
+  # DeepSeek DS-1: the dense kernels at the real shapes, and mHC / Engram against the NumPy oracle's golden data.  PASS needs exit 0,
+  # "ALL PASS" in the log and no "FAILED" line (the mHC / Engram programs print one ALL PASS line per suite).
+  if [[ -x "$BUILD/ds41_dense_parity" ]]; then
+    run_check "ds41_dense_parity --all --big" "ds41_dense_parity" -- "$BUILD/ds41_dense_parity" --all --big
+    if [[ "$CHECK_STATUS" == PASS ]] && { ! grep -q "ALL PASS" "$LOGS/ds41_dense_parity.log" || grep -q "FAILED" "$LOGS/ds41_dense_parity.log"; }; then CHECK_STATUS=FAIL; fi
+    record "ds41_dense_parity --all --big" "$CHECK_STATUS" "$CHECK_SECS" "$(grep -E 'ALL PASS|FAILED' "$LOGS/ds41_dense_parity.log" | tail -1 || true)"
+  else
+    record "ds41_dense_parity" SKIP 0 "no such target in this build"
+  fi
+  DS1D_PY=python3
+  [[ -x "$ROOT/.venv/bin/python" ]] && DS1D_PY="$ROOT/.venv/bin/python"
+  DS1D_GOLDEN="$BUILD/ds1d_golden"
+  if [[ -x "$BUILD/ds41_mhc_gpu_test" || -x "$BUILD/ds41_engram_gpu_test" ]]; then
+    if [[ ! -d "$DS1D_GOLDEN" ]] && ! "$DS1D_PY" "$ROOT/src/ds41/engram/golden/gen_golden.py" --out "$DS1D_GOLDEN" > "$LOGS/ds1d_golden.log" 2>&1; then
+      echo "note: the mHC / Engram golden data could not be generated (python3 with numpy? see $LOGS/ds1d_golden.log)"
+      record "ds41_mhc_gpu_test / ds41_engram_gpu_test" SKIP 0 "no golden data: $LOGS/ds1d_golden.log"
+    else
+      for prog in ds41_mhc_gpu_test ds41_engram_gpu_test; do
+        [[ -x "$BUILD/$prog" ]] || { record "$prog" SKIP 0 "no such target in this build"; continue; }
+        run_check "$prog --golden" "$prog" -- "$BUILD/$prog" --golden "$DS1D_GOLDEN"
+        if [[ "$CHECK_STATUS" == PASS ]] && { ! grep -q "ALL PASS" "$LOGS/$prog.log" || grep -q "FAILED" "$LOGS/$prog.log"; }; then CHECK_STATUS=FAIL; fi
+        record "$prog --golden" "$CHECK_STATUS" "$CHECK_SECS" "$(grep -cE 'ALL PASS' "$LOGS/$prog.log" || true) suites passed"
+      done
+    fi
+  fi
 fi
 
 # ----------------------------------------------------------------------------------------------- 6. the SASS audit

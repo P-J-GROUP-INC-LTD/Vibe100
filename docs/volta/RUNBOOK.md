@@ -408,8 +408,46 @@ Each node has 12 cores (24 hardware threads with Hyper-Threading on). The bench 
 40 half-experts (376 MB: far past the 19 MB of L3) so the weights come from DRAM, and its tok/s lines use `--box-gbps` (default 100): give it
 the node-local read bandwidth that `mlc_bandwidth_matrix.txt` shows once you have it.
 
-**Send back:** the manifest's `RESULT:` line and printed findings and memory plan, the output of each `ds41_*_parity` run, and the three
-`ds41_cpu_mxfp4_bench` outputs.
+**9e. The DeepSeek engine (DS-1: one correct token)** - needs a checkout that contains DS-1 (commit `DS-1 integrated` or later on
+`claude/volta-v100-conversion-8f17vp`, NOT the Qwen-ready `da0ae45`): do it after the Qwen tests, on its own branch
+(`git checkout -b box/deepseek origin/claude/volta-v100-conversion-8f17vp`). The engine decodes one token at a time (prompts too: DS-1 has no
+batched prefill), so expect it to be slow; this step checks correctness, not speed (`docs/deepseek/DS1.md`, `DS1_VERIFY.md`).
+
+```
+.venv/bin/cmake --build build-sm70 --target ds41_model_info strata-ds41 ds41_dense_parity ds41_mhc_gpu_test ds41_engram_gpu_test -j24
+SHARD1=$GGUF/DeepSeek-V4.1-Flash-MXFP4-00001-of-00012.gguf
+
+# 1. the file against the engine's geometry, the tensor table and the memory plan (headers only, seconds)
+build-sm70/ds41_model_info $SHARD1
+
+# 2. the tokenizer from the GGUF against the official one (once)
+.venv/bin/python tools/ds41/ds1_tokenizer.py selfcheck --gguf $SHARD1 --tokenizer-json tokenizer.json
+
+# 3. the DS-1 GPU programs (also run by tools/volta/run_parity.sh): dense kernels at the real shapes, mHC / Engram vs the oracle
+build-sm70/ds41_dense_parity --all --big
+.venv/bin/python src/ds41/engram/golden/gen_golden.py --out build-sm70/ds1d_golden
+build-sm70/ds41_mhc_gpu_test --golden build-sm70/ds1d_golden
+build-sm70/ds41_engram_gpu_test --golden build-sm70/ds1d_golden
+
+# 4. a short prompt, every expert on the CPU first (--n-slots 0), with a trace for the layer-by-layer check
+IDS=$(.venv/bin/python tools/ds41/ds1_tokenizer.py chat --gguf $SHARD1 --messages '[{"role":"user","content":"What is 2+2?"}]' --ids | tr -d '[] ')
+build-sm70/strata-ds41 --gguf $SHARD1 --tokens $IDS --max-new 8 --n-slots 0 --max-context 64 \
+    --trace ~/ds41/tr0 --dump-logits ~/ds41/tr0/logits.bin --stats
+# then with the GPU expert cache (as many slots as fit)
+build-sm70/strata-ds41 --gguf $SHARD1 --tokens $IDS --max-new 8 --n-slots -1 --max-context 64 --trace ~/ds41/tr1 --stats
+
+# 5. layer by layer against the NumPy oracle on the real weights (~2 min per layer for 32 positions; ~12 GB RAM)
+.venv/bin/python tools/ds41/ds1_compare.py layers --engine ~/ds41/tr0 --gguf $SHARD1 --positions 0,3,15,31 \
+    --layers 0,1,2,14,20,24,39,head --baseline
+```
+
+A text front end: `.venv/bin/python src/ds41/program/strata_ds41.py --gguf $SHARD1 --chat '[...]' --max-new 32 --stats --engine
+build-sm70/strata-ds41`. `--kv-quant on|off`, `--threads-per-socket N`, `--numa auto|off`, `--fill LIST` and `--cpu-isa` are the knobs.
+
+**Send back:** the manifest's `RESULT:` line and printed findings and memory plan, the output of each `ds41_*_parity` run, the three
+`ds41_cpu_mxfp4_bench` outputs; for 9e the `ds41_model_info` output, the tokenizer selfcheck, the three DS-1 GPU programs' outputs, both
+`strata-ds41 --stats` outputs (with the generated text) and the `ds1_compare.py layers` report. Not the trace directories (12.7 MB per token):
+only if asked.
 
 ---
 
