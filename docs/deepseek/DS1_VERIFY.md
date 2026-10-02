@@ -155,8 +155,8 @@ Relative error (rms over outputs / rms of the result) of a float32 dot product o
 The naive sum grows as `1.8e-8 sqrt(K)`; the engine's lane-strided sums and numpy's BLAS are 3–6x better. The soft tolerance is set from the **naive** sum (the worst
 reasonable engine) with a factor 2.2: `soft_rms = max(2e-6, 4e-8 sqrt(K))`, K the longest float32 sum feeding the stage (`dim` for the norm/hc stages and the BF16
 router/compressor GEMVs, `hc*dim` = 20480 for `pre_mix`, `heads*head_dim/o_groups` = 4096 for `wo_a`, ...); `soft_max = 2.5 x soft_rms` (measured max/rms of a sum error: 1.2–1.6).
-The indexer's scores (`index_scores`, `block_scores`) get 30x that: they are sums of terms of both signs over a short vector at the first positions, and measured up to 1.0e-5 rms on the
-mini model; their only consumer, the selection, has its own near-tie window.
+The indexer's scores (`index_scores`, `block_scores`) get 100x that: they are sums of terms of both signs over a short vector at the first positions, so the relative error has a heavy
+tail (up to 5.0e-5 rms on the mini model, 3 seeds x 3 presets, 25x the plain-sum noise); their only consumer, the selection, has its own near-tie window.
 
 The **float32 oracle against the float64 oracle**, stage-isolated, on three mini models x 64 tokens x three quantiser presets (`ds1_noise.py mini`; 9 runs of 6 943 stage samples): the
 worst stage error without a flip is **5.2e-7 rms** (`attn_out`), 1e-7 .. 4e-7 for most stages (`q` 2.6e-7, `attn_in` 1.2e-7, `ffn_out` 3.0e-7), so the soft tolerance (2e-6 on the mini
@@ -190,7 +190,7 @@ The consequences for the tolerance model (class `Tolerances`, constants at the t
   `q` moves its scores by 1–4 % of their scale), with at most 10 % (top-k) / 20 % (router) / 25 % (candidate blocks) of the selection differing.
 
 Measured on the mini model (3 seeds x 3 presets x 64 tokens, stage-isolated, float64 oracle replaying the float32 oracle's inputs, `ds1_noise.py mini`): every stage within the tolerances in
-all 9 runs (0 FAIL, 9 x 6 943 samples). FLIP-level samples per run: `int8-kv` 3 / 3 / 4, `int8` 2 / 5 / 9, `exact` 0 (after the scores' soft tolerance was set; they are the stages of §3.1). Worst
+all 9 runs (0 FAIL, 9 x 6 943 samples). FLIP-level samples per run: `int8-kv` 3 / 3 / 4, `int8` 2 / 5 / 8, `exact` 0 (per seed; every one of them at a stage with an internal quantiser site, §3.1). Worst
 flips against their hard tolerance: `attn_out` 6.7e-3 (1.9e-2), `ffn_out` 3.0e-3 (9.5e-3), `block_scores` 4.9e-3 (1.9e-2), `q` 2.7e-3 (1.9e-2), `attn_o` 2.5e-3 (1.9e-2), `index_scores`
 2.1e-3 (1.9e-2): 2.9x–9x below hard. The measured flip frequency of `ffn_out` (0.4 % of samples) is the model's prediction at the oracle's own noise (eps ~ 1.5e-7).
 
@@ -217,7 +217,7 @@ Mini model (the C++ MiniGeom end-to-end test; `ds1_noise.py tolerances`), flags 
 | kv_win | 2.0e-6 | 5.0e-6 | 6.2e-2 | 2.0e-1 | 0.001 | 0.02 |
 | latent | 2.0e-6 | 5.0e-6 | 1.6e-1 | 5.0e-1 | 0.001 | 0.02 |
 | index_k | 2.0e-6 | 5.0e-6 | 1.6e-1 | 3.0e-1 | 0.000 | 0.02 |
-| index_scores, block_scores | 6.0e-5 | 1.5e-4 | 8.0e-2 | 3.0e-1 | 0.003 | 0.03 |
+| index_scores, block_scores | 2.0e-4 | 5.0e-4 | 8.0e-2 | 3.0e-1 | 0.003 | 0.03 |
 | attn_out | 2.0e-6 | 5.0e-6 | 1.9e-2 | 3.8e-2 | 0.003 | 0.03 |
 | ffn_out | 2.0e-6 | 5.0e-6 | 9.5e-3 | 1.9e-2 | 0.017 | 0.05 |
 | router_idx | near-tie window 2e-5 of the score scale; <= 20 % of the selection may differ; budget 0.02 | | | | | |
@@ -235,7 +235,7 @@ Real model (`ds1_noise.py tolerances --real`; the tolerance object is built from
 | kv_win | 2.0e-6 | 5.0e-6 | 2.2e-2 | 2.0e-1 | 0.005 | 0.03 |
 | latent | 2.9e-6 | 7.2e-6 | 5.7e-2 | 5.0e-1 | 0.005 | 0.03 |
 | index_k | 2.9e-6 | 7.2e-6 | 8.0e-2 | 3.0e-1 | 0.001 | 0.02 |
-| index_scores, block_scores | 8.6e-5 | 2.1e-4 | 1.4e-2 | 3.0e-1 | 0.069 | 0.15 |
+| index_scores, block_scores | 2.9e-4 | 7.2e-4 | 1.4e-2 | 3.0e-1 | 0.069 | 0.15 |
 | attn_out | 2.6e-6 | 6.4e-6 | 5.0e-3 | 1.0e-2 | 0.208 | 0.40 |
 | ffn_out | 2.0e-6 | 5.0e-6 | 5.0e-3 | 1.0e-2 | 0.355 | 0.62 |
 | router_idx / topk / cand_blocks | as above (the top-k window on the real model: 5e-2, set by the fp4 index flips) | | | | | |
@@ -396,10 +396,16 @@ Requests to the integrator (files DS1-F does not own): DS1.md §6 should list `i
 
 ## 8. Tests
 
-`tools/ds41/test_ds1_trace.py` (18: format, naming, round trip, truncated / corrupt files, oracle trace bit-identical to the untraced run, stage contents = the oracle's cache rows, prefill vs
-token-by-token), `test_ds1_compare.py` (27: tolerance formulas, metrics, levels, near-ties, the taint rule, oracle against itself, float32 against float64 with margin >= 2 below soft,
-an error injected into each of 14 stages named by stage / layer / position in both modes, layer-mode isolation, flip band vs budget, NaN/Inf, wrong selection, missing stages, the
-CLI exit codes), `test_ds1_replay.py` (10: replay equals the full run bit for bit, the minimal file set and the necessity of each file, missing input is an error, REUSE layers use the
-engine's selection, head, KV flags), `test_ds1_tokenizer.py` (34: pre-tokenizer pieces, BPE rank / tie rules, specials, decode, the 960-way chat-template equivalence, the GGUF header
-facts, the mini GGUF, and against the official tokenizer.json: metadata, known ids, 1 500 random texts + sources, the Unicode patch), `test_ds1_e2e.py` (12: fixture, determinism, exit codes,
-injections, the greedy rule). Results: see the DS1-F entry of the final report / `git log` (all pass with `pytest` in the reference venv and with `unittest` in the system Python).
+105 tests, all passing (`python3 -m pytest` in the reference venv: 104 passed, 1 skipped = the optional `regex` module, 2 min 13 s; `python3 -m unittest` in the system Python: 105 ran, 4 skipped =
+the `tokenizers`-library comparisons, 2 min 15 s). Helpers: `ds1_testlib.py` (cached mini oracles and traces, fake "engine" traces with injected errors).
+
+* `test_ds1_trace.py` (19): format, naming, round trip, truncated / corrupt files, the oracle trace bit-identical to the untraced run, stage contents = the oracle's cache rows, the optional
+  stages are what the oracle computed (`attn_o` -> `wo_a` / `wo_b` reproduces `attn_out` bit for bit, `latent_pre` -> RoPE / fp4 reproduces `latent` and `index_k`, `index_scores` -> top-k reproduces
+  `topk`), prefill vs token-by-token.
+* `test_ds1_compare.py` (28): tolerance formulas, metrics, levels, near-ties, the taint rule, oracle against itself, float32 against float64 with margin >= 2 below soft, an error injected into each of
+  18 stages named by stage / layer / position in both modes, layer-mode isolation, flip band vs budget, the score masks, NaN/Inf, wrong selection, missing stages, the CLI exit codes.
+* `test_ds1_replay.py` (10): replay equals the full run bit for bit, the minimal file set and the necessity of each file, a missing input is an error, REUSE layers use the engine's selection, the head,
+  the KV flags.
+* `test_ds1_tokenizer.py` (34): pre-tokenizer pieces, BPE rank / tie rules, specials, decode, the 960-way chat-template equivalence, the GGUF header facts, the mini GGUF, and against the official
+  tokenizer.json: metadata, known ids, 1 500 random texts + sources, the Unicode patch.
+* `test_ds1_e2e.py` (14): fixture, determinism, exit codes, injections, the greedy rule, the quantisation flags, optional stages.

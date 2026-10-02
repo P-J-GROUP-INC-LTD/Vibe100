@@ -107,8 +107,8 @@ REAL_DIMS = Dims()
 SUM_NOISE = 4.0e-8        # soft_rms = SUM_NOISE * sqrt(K) for a float32 sum of K terms: 2.2x the measured naive left-to-right sequential error
                           # (1.8e-8 * sqrt(K), K = 256 .. 20480); the engine's lane-strided sums are 3-6x better, numpy BLAS 4-7x
 SOFT_FLOOR = 2.0e-6       # nothing is held tighter than this (the measured float32-vs-float64 stage error on the mini model is <= 5e-7)
-SCORES_SOFT_MULT = 30.0   # the indexer's scores are sums of terms of both signs (and a short vector at the first positions): relative error of the result, measured 1.0e-5 rms worst
-                          # on the mini model (3 seeds x 3 presets), 17x the soft floor of a plain sum; their only consumer is a selection with its own near-tie window
+SCORES_SOFT_MULT = 100.0  # the indexer's scores are sums of terms of both signs over a short vector at the first positions: the relative error of the result has a heavy tail, measured
+                          # up to 5.0e-5 rms on the mini model (3 seeds x 3 presets), 25x the soft floor of a plain sum; their only consumer is a selection with its own near-tie window
 SOFT_MAX_OVER_RMS = 2.5   # max_rel (max |E-O| / max |O|) vs rms_rel of a float32 sum error: measured 1.2 - 1.6
 HARD_NOFLIP = 50.0        # a stage without a quantiser inside has no excuse for a sample above 50 x soft (hard = 50 x soft)
 FLIP_RATE = 2.2e-5        # P(an int8 rounding decision flips) per element at the engine's pre-quantiser noise (5e-7 relative); 4.4e-5 at 1e-6
