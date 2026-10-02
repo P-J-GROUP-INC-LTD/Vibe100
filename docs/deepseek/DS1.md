@@ -164,8 +164,9 @@ the mini model; the real-model half of the gate needs the owner's box (runbook s
 ### Status after integration (2026-10-02)
 
 DS-1 is integrated: a clean full build of the whole tree (Qwen engine + DS-1, 343 targets) for sm_70 with CUDA 12.8, the SASS audit
-PASS (no stack frame in any DS-1 kernel; the 160 that have one are upstream Strata / ggml); the 83 `ds41` / `ds1` ctests on that
-build: running at the time of writing (each package's suite passed in its own build; the result is recorded in the next commit).
+PASS (no stack frame in any DS-1 kernel; the 160 that have one are upstream Strata / ggml); all 83 `ds41` / `ds1` ctests on that
+build pass (495 s; emulator suites in forward / reverse / shuffled order, the oracle replays, the mini end-to-end runs with the KV
+flags on and off and its variants).
 The mini half of Gate DS-1 is met in emulation. The real half needs the owner's box: runbook step 9e (`ds41_model_info`, the DS-1 GPU
 programs, `strata-ds41` on a short prompt with a trace, `ds1_compare.py layers` against the oracle on the real weights), then the
 500-token top-1 run. Nothing has run on a GPU yet.
