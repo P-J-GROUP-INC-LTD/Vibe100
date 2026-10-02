@@ -53,7 +53,12 @@ enum class Want { kNone, kArgmax, kLogits };
 /// Per-stage wall time (seconds; with SessionOptions::stage_timing every stage is synchronised, otherwise the host-side issue time plus the waits) and counters.
 struct SessionStats {
     enum Stage { kEmbed, kEngram, kAttnIn, kAttention, kAttnOut, kFfnIn, kRouterSplit, kExperts, kCombine, kHead, kStageCount };
-    static const char* stage_name(int s);
+    static const char* stage_name(int s) {
+        static const char* const names[kStageCount] = {"embed",     "engram",         "attn_in (mHC + norm)", "attention",
+                                                       "attn_out (mHC)", "ffn_in (mHC + norm)", "router + split", "experts (GPU hits || CPU misses + shared)",
+                                                       "combine + ffn mHC", "head + argmax"};
+        return s >= 0 && s < kStageCount ? names[s] : "?";
+    }
     double seconds[kStageCount] = {};
     double doorbell_wait_s = 0;          ///< host time spent waiting for the split's doorbell
     double cpu_pool_s = 0;               ///< wall time of the CPU pool's jobs (start .. join)

@@ -38,12 +38,6 @@
 
 namespace strata::ds41::session {
 
-inline const char* SessionStats::stage_name(int s) {
-    static const char* const names[kStageCount] = {"embed",   "engram",       "attn_in (mHC + norm)", "attention", "attn_out (mHC)", "ffn_in (mHC + norm)",
-                                                   "router + split", "experts (GPU hits || CPU misses + shared)", "combine + ffn mHC", "head + argmax"};
-    return s >= 0 && s < kStageCount ? names[s] : "?";
-}
-
 template <class G>
 struct Ds41Session<G>::Impl {
     using Clock = std::chrono::steady_clock;
