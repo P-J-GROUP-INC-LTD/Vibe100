@@ -460,6 +460,7 @@ struct Ds41Session<G>::Impl {
         for (int t = 0; t < T; ++t) {
             const int p = p0 + t;
             tr_f32("q", p, l, attn.trace_q(t), {G::kHeads, G::kHeadDim});
+            tr_f32("attn_out", p, l, attn_out + (size_t) t * H, {H});
             tr_f32("attn_o", p, l, attn.trace_o(t), {G::kHeads, G::kHeadDim});
             tr_f32("kv_win", p, l, attn.kv_win_row(l, p), {G::kHeadDim});
             if (ratio > 0) tr_i32("topk", p, l, attn.trace_topk(t), G::kIdxTopK);

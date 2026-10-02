@@ -10,6 +10,8 @@
 #   strata-ds41-mini-emu      the SAME session and command line instantiated for MiniGeom on the emulated device, with every kernel compiled for the host (-DDS41_EMU: the
 #                             thread-model emulation, src/ds41/cuda/ds41_emu.hpp): the mini GGUF of tools/ds41/make_mini_gguf.py runs end to end on any machine.  POSIX only
 #                             (ucontext); EXCLUDE_FROM_ALL unless STRATA_BUILD_TESTS, always defined (`cmake --build <dir> --target strata-ds41-mini-emu`).
+#   ds41_session_test         unit tests: the CPU pool (bit-identical to DS-C's expert_run on each half + h0 + h1, 1..7 workers, windows, real and mini shapes, the layout for a
+#                             faked two-node topology), the MoE sum kernel (the oracle's order, emulated, three scheduling orders), the trace writer.  ctest: ds41_session_*.
 #   ds41_e2e_mini_kv_on/off   ctest: tools/ds41/ds1_e2e.py prepares the mini model + the oracle's trace (QuantConfig int8_act [+ the three KV flags]), strata-ds41-mini-emu runs the
 #                             same 8 + 56 tokens with --trace, ds1_e2e.py check compares stage by stage (needs python3 + numpy: skipped, with a message, when absent).
 #   ds41_e2e_mini_variants    ctest: the engine's own invariants on the mini model - determinism (two runs, identical logits), CPU-only vs GPU-only vs mixed expert placement,
@@ -52,6 +54,22 @@ if(NOT WIN32)
   if(NOT MSVC)
     # the kernels pin every product and sum (no contraction); the emulator's fibres re-enter functions through getcontext
     target_compile_options(strata-ds41-mini-emu PRIVATE -fno-strict-aliasing -ffp-contract=off -Wno-clobbered)
+  endif()
+
+  # unit tests of the engine's own parts (the CPU pool against DS-C's reference arrangement, the MoE sum kernel against the oracle's order, the trace writer): no GGUF, no GPU
+  add_executable(ds41_session_test ${_ds41e_all} ${_ds41e_src}/session_test.cpp ${_ds41e_src}/moe_combine_emu_impl.cpp)
+  target_include_directories(ds41_session_test PRIVATE ${PROJECT_SOURCE_DIR}/include ${_ds41e_cuda} ${_ds41e_src})
+  target_link_libraries(ds41_session_test PRIVATE strata_ds41_session)
+  if(NOT MSVC)
+    target_compile_options(ds41_session_test PRIVATE -fno-strict-aliasing -ffp-contract=off -Wno-clobbered)
+  endif()
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME ds41_session_pool COMMAND ds41_session_test --pool)
+    add_test(NAME ds41_session_combine COMMAND ds41_session_test --combine)
+    add_test(NAME ds41_session_combine_reverse COMMAND ds41_session_test --combine --order reverse)
+    add_test(NAME ds41_session_trace COMMAND ds41_session_test --trace)
+    set_tests_properties(ds41_session_pool ds41_session_combine ds41_session_combine_reverse ds41_session_trace PROPERTIES PASS_REGULAR_EXPRESSION "ALL PASS" FAIL_REGULAR_EXPRESSION "FAIL "
+                         TIMEOUT 600)
   endif()
 
   if(STRATA_BUILD_TESTS AND EXISTS ${_ds41e_prog}/e2e_mini.py)
