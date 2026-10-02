@@ -169,6 +169,19 @@ tools), and test the fixed-geometry kernels with random blocks at the real shape
 multiple of 128 and the expert FF a multiple of 256 (a CPU half is FF / 2 rows, in whole 4-block kernel groups; the CONTRACTS.md halves alone would need only
 FF % 64), so a mini expert's blob and halves can be fed to `src/ds41/cpu`'s kernels. `MiniConfig.validate` and `expert_layout.ExpertGeom` enforce the same rule.
 
+## DS-1 verification tools (engine vs the NumPy oracle; `docs/deepseek/DS1_VERIFY.md`)
+
+| Tool | What it does |
+|---|---|
+| `ds1_tokenizer.py` | DeepSeek byte-level BPE from the GGUF's `tokenizer.ggml.*` metadata (or a `tokenizer.json`), encode / decode, chat template; `selfcheck --gguf SHARD1 --tokenizer-json tokenizer.json` compares the GGUF's own token arrays with the official tokenizer (run once on the box) |
+| `ds1_compare.py` | compares an engine trace with the oracle: `trace` (whole run, onset detection) and `layers` (each stage fed the engine's own inputs: the strict check); quantiser rounding flips are counted against budgets, not failed |
+| `ds1_replay.py` | the layer-by-layer replay for the real model: oracle layer L on the engine's dumped inputs, one layer's weights in RAM (`--baseline` prints the oracle's own float32-vs-float64 noise next to the engine's) |
+| `ds1_noise.py` | measures the oracle's float32-vs-float64 noise per stage (the basis of the tolerance tables) |
+| `ds1_e2e.py` | the mini end-to-end fixture: `prepare --out DIR` (mini GGUF + oracle trace), `args --fixture DIR` (the engine command line), `check --fixture DIR --engine TRACE_DIR` (exit 0 pass / 1 fail / 2 could not run) |
+
+The trace format (`ref/ds41/trace_io.py`): one directory per run, `trace.json` (format, tokens, quant flags) and one little-endian
+`.npy` per stage, layer and position (`<stage>.L<LL>.p<POS>.npy`). On the real model the required stages are ~12.7 MB per token.
+
 ## Tests
 
 ```bash
