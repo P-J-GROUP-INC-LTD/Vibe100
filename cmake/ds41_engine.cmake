@@ -72,6 +72,24 @@ if(NOT WIN32)
                          TIMEOUT 600)
   endif()
 
+  # Ds41Session<RealGeom> constructed on the REAL file's shapes (DS1-A's sparse fixture: real metadata and tensor table, data = holes) against a ledger device and the emulated kernels: the
+  # wiring of every real layer role, Engram table, scratch size and cache size, without weights or a GPU (no token is run).  Linux only.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ds41_session_real_smoke ${_ds41e_all}
+                   ${_ds41e_src}/session_real_smoke.cpp ${_ds41e_src}/moe_combine_emu_impl.cpp
+                   ${_ds41e_cuda}/ds41_emu_impl.cpp ${_ds41e_cuda}/mhc_emu_impl.cpp ${_ds41e_cuda}/engram_emu_impl.cpp ${_ds41e_attn}/attn_emu_impl.cpp)
+    target_include_directories(ds41_session_real_smoke PRIVATE ${PROJECT_SOURCE_DIR}/include ${_ds41e_cuda} ${_ds41e_attn} ${_ds41e_src})
+    target_link_libraries(ds41_session_real_smoke PRIVATE strata_ds41_session strata_ds41_dense_emu strata_ds41_engram_host)
+    if(NOT MSVC)
+      target_compile_options(ds41_session_real_smoke PRIVATE -fno-strict-aliasing -ffp-contract=off -Wno-clobbered)
+    endif()
+    if(STRATA_BUILD_TESTS AND TARGET ds41_model_sparse_test)
+      # the fixture DS1-A's tests use (cmake/ds41_model.cmake): the sparse real shards are written by its setup test and removed by its cleanup test
+      add_test(NAME ds41_session_real_smoke COMMAND ds41_session_real_smoke ${CMAKE_BINARY_DIR}/ds41_model_fixture)
+      set_tests_properties(ds41_session_real_smoke PROPERTIES FIXTURES_REQUIRED ds41_model_fixture SKIP_RETURN_CODE 2 TIMEOUT 600 PASS_REGULAR_EXPRESSION "PASS: " FAIL_REGULAR_EXPRESSION "FAIL")
+    endif()
+  endif()
+
   if(STRATA_BUILD_TESTS AND EXISTS ${_ds41e_prog}/e2e_mini.py)
     # python3 with numpy (the oracle is NumPy); the driver itself reports "SKIPPED" and exits 2 (ctest: skipped) when numpy is missing
     set(_ds41e_python "")

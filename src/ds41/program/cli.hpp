@@ -188,6 +188,11 @@ int run_cli(DevT& dev, int argc, char** argv, const char* prog) {
         return 2;
     }
     try {
+        for (int32_t t : a.tokens)
+            if (t >= G::kVocab) {
+                std::fprintf(stderr, "%s: token id %d is outside this model's vocabulary of %d\n", prog, t, (int) G::kVocab);
+                return 2;
+            }
         const int need_ctx = (int) a.tokens.size() + a.max_new;
         if (a.max_context == 0) a.max_context = std::max(need_ctx, 1);
         if (a.max_context < need_ctx) {
