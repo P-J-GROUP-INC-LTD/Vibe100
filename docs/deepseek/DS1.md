@@ -151,3 +151,21 @@ the mini model; the real-model half of the gate needs the owner's box (runbook s
   cases + 1.4M characters; chat template; run `ds1_tokenizer.py selfcheck --gguf SHARD1 --tokenizer-json tokenizer.json` once on the box),
   `ds1_e2e.py` (mini fixture + checker, exit 0/1/2: ctest `SKIP_RETURN_CODE 2`). Quantiser flips are counted against budgets, not failed.
   The real model's 500-token oracle run is ~a day on one process (2-3 min/token): the top-1 half of the gate is a long run.
+- **DS1-E done** (bc50d75): `Ds41Session<G>` (`include/strata/ds41/session/session.hpp`: `step(tokens, T, want)`, argmax / logits,
+  `set_trace`, `stats`), the two-socket CPU expert pool (`cpu_pool.hpp`: per-half worker groups pinned per node, misses grouped by expert,
+  two phases with one socket-local barrier, static unit ownership, one partial y per socket, h0 + h1 on the host, one h2d per layer),
+  `ds41_moe_combine` (the oracle's FP32 order), the trace writer and logits dump, `strata-ds41` (RealGeom, CUDA) and
+  `strata-ds41-mini-emu` (MiniGeom, emulated) from one CLI source, `strata_ds41.py` (text front end), `Dev::mem_info` and throwing
+  `CudaDev` allocations. End-to-end on the mini model (8 prompt + 56 generated tokens, mixed GPU / CPU expert placement): layer mode
+  rms ~1e-7 per stage, kv_win / latent / index_k / topk / router_idx / cand_blocks bit-exact, 1 (kv on) and 6 (kv off) counted
+  quantiser flips, 0 failures; identical logits run to run, for 1-3 workers per group, `--numa off`, and windows of 4. Known DS-2 items:
+  the host blocks on each layer's doorbell (the GPU idles while the host issues the next layer), Engram's two blocking copies per token.
+
+### Status after integration (2026-10-02)
+
+DS-1 is integrated: a clean full build of the whole tree (Qwen engine + DS-1, 343 targets) for sm_70 with CUDA 12.8, the SASS audit
+PASS (no stack frame in any DS-1 kernel; the 160 that have one are upstream Strata / ggml); the 83 `ds41` / `ds1` ctests on that
+build: running at the time of writing (each package's suite passed in its own build; the result is recorded in the next commit).
+The mini half of Gate DS-1 is met in emulation. The real half needs the owner's box: runbook step 9e (`ds41_model_info`, the DS-1 GPU
+programs, `strata-ds41` on a short prompt with a trace, `ds1_compare.py layers` against the oracle on the real weights), then the
+500-token top-1 run. Nothing has run on a GPU yet.

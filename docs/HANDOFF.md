@@ -290,12 +290,22 @@ another process on the card, or the replica registration (`STRATA_NUMA_PIN_REPLI
 
 ---
 
-## 6. DeepSeek on this box (runbook 9) - checks only
+## 6. DeepSeek on this box (runbook 9)
 
-The DeepSeek engine does not exist yet (`strata` cannot run it); the cloud session is writing DS-1 (contract: `docs/deepseek/DS1.md`,
-geometry: `include/strata/ds41/geom.hpp`). On the box you can already: download the GGUF (~411 GB, NVMe), validate it
-(`tools/ds41/manifest.py`, `expert_layout.py verify`), run the three GPU parity programs and the CPU benchmark (runbook 9b-9d). Record the
-outputs in BOX_LOG; do not edit DeepSeek code. Limits and expectations: `docs/deepseek/PLAN.md` (memory map, PCIe-bound prefill ~22 s per
+DS-1 exists: `strata-ds41`, a separate engine (`docs/deepseek/DS1.md`), correct on a tiny model in the cloud's CPU emulation, never
+run on a GPU or the real weights. It needs a checkout newer than the Qwen-ready `da0ae45`: after the Qwen tests, make a separate branch
+from the current `claude/volta-v100-conversion-8f17vp` (`git checkout -b box/deepseek origin/claude/volta-v100-conversion-8f17vp`) and
+follow runbook 9a-9e: download (~411 GB, NVMe), validate (`manifest.py`, `ds41_model_info`), the GPU parity programs (also in
+`run_parity.sh` now), the CPU benchmark, then `strata-ds41` on a short prompt and `ds1_compare.py layers` against the oracle. It is slow
+by design in DS-1 (one token at a time, prompts included); correctness is the point. Failure playbook for 9e:
+- `ds41_model_info` refuses the file -> its message names the key / tensor / shard; a truncated download is the usual cause (re-run the
+  download, it resumes).
+- `strata-ds41` out of GPU memory -> `--n-slots 0` (every expert on the CPU) first, then a smaller `--n-slots N`; `--max-context` small.
+- "the split's doorbell never rang" -> a GPU kernel failed: re-run with `CUDA_LAUNCH_BLOCKING=1` and
+  `compute-sanitizer --tool memcheck`; record the kernel name.
+- `ds1_compare.py layers` reports a FIRST FAILURE at (position, layer, stage) -> record it with the report; the DS1-x package that owns
+  that stage is in `DS1.md` §4. Rounding "flips" counted against a budget are expected, not failures (`DS1_VERIFY.md`).
+Record everything in BOX_LOG; do not edit DeepSeek code (send the results back instead). Limits and expectations: `docs/deepseek/PLAN.md` (memory map, PCIe-bound prefill ~22 s per
 expert pass, decode bounded by the hit rate and CPU bandwidth: roughly 20-25 tok/s first, 30-45 tuned - estimates).
 
 ---

@@ -139,7 +139,7 @@ None of these is a measurement on a V100 by this port.
 
 Upstream's figures (for example 93 tokens/s on an RTX 5070) are RTX numbers and say nothing about a V100.
 
-## DeepSeek-V4.1-Flash (started: DS-0; the engine is not written)
+## DeepSeek-V4.1-Flash (DS-1: a first engine, `strata-ds41`; correct on a tiny model, not yet run on a V100)
 
 DeepSeek-V4.1-Flash is a 40-layer MoE (384 routed experts per layer, 6 active, MQA attention with compressed sparse
 selection, Engram n-gram tables, 4-copy hyper-connections; MIT-licensed weights and code). The plan keeps Strata's idea:
@@ -149,16 +149,19 @@ hot experts in V100 VRAM, the rest computed by the CPU from RAM, in the format D
 **Target file:** [mxxm-t/DeepSeek-V4.1-Flash-GGUF](https://huggingface.co/mxxm-t/DeepSeek-V4.1-Flash-GGUF) (MXFP4 experts, Q8_0
 attention, 12 shards + a DSpark sidecar). The vcruz305 Q2_K...Q8_0 GGUFs are refused by the tooling (experts not MXFP4).
 
-**What exists (DS-0):** the contract ([CONTRACTS.md](docs/deepseek/CONTRACTS.md), `include/strata/ds41/geometry.hpp`);
-the NumPy oracle `ref/ds41`; GGUF tooling `tools/ds41` (manifest, expert layout, memory plan: on a V100 32 GB with 384 GiB it
-plans ~1,150 cached experts, 269 GiB of experts in RAM split across the sockets, ~96 GiB left for Engram's page cache;
-the reserves are the plan's numbers, not measurements); MXFP4 CPU kernels `src/ds41/cpu`; V100 router and expert kernels
-`src/ds41/cuda`. Nothing in `src/program`, `src/core`, `src/prefill`, `serve` or `setup.py` refers to it: the `strata` binary
-cannot run DeepSeek, and no DeepSeek tensor data has been read (only GGUF shard headers).
+**What exists.** DS-0: the contract ([CONTRACTS.md](docs/deepseek/CONTRACTS.md)), the NumPy oracle `ref/ds41`, GGUF tooling
+`tools/ds41`, MXFP4 CPU and V100 expert kernels. **DS-1** ([DS1.md](docs/deepseek/DS1.md)): a separate engine, `strata-ds41`
+(`src/ds41/**`), that loads the GGUF (dense weights on the GPU, ~1,121 cached experts, the other experts as per-socket halves in RAM,
+Engram mmapped) and decodes token by token: CSA2 sparse attention, mHC, Engram, the router, GPU hits in parallel with a two-socket CPU
+pool for the misses, the shared expert, the head. Every kernel is written once and compiled both for sm_70 and for a CPU emulator, so
+the whole forward pass of a tiny DeepSeek-shaped model was run here and compared with the oracle stage by stage (`ds41_e2e_mini_*`:
+errors ~1e-7, top-k / router / caches bit-exact, quantiser rounding flips counted; [DS1_VERIFY.md](docs/deepseek/DS1_VERIFY.md)).
+**Not yet:** a run on the V100 or on the real weights (runbook step 9e does both, with a layer-by-layer comparison against the
+oracle), batched prefill (DS-1 reads prompts one token at a time), any speed work, the server. `strata-ds41` is separate from
+`strata`; nothing in the Qwen engine changed for it.
 
-**Next ([PLAN.md](docs/deepseek/PLAN.md) section 4):** *DS-1*, one correct token (dense GEMVs, MQA decode, compressor /
-indexer, mHC, Engram, a decode loop, layer-by-layer comparison with the oracle on real weights; gate: top-1 >= 99% vs the
-reference over 500 tokens, no NaN/inf). *DS-2*, usable (prefill, Engram on SSD with prefetch, expert cache and adaptive
+**Next ([PLAN.md](docs/deepseek/PLAN.md) section 4):** DS-1's real-model half on the box (layer-by-layer within tolerance; top-1 >=
+99% vs the oracle over 500 tokens, no NaN/inf). *DS-2*, usable (prefill, Engram on SSD with prefetch, expert cache and adaptive
 swaps, server integration, the usage ledger; gate: a measured hit rate, and below ~40% reassess). *DS-3*, fast (routing
 traces, NUMA placement, DSpark drafting). The plan itself says DeepSeek tuning only makes sense after the Volta port
 passes Gate 1 on the card.
