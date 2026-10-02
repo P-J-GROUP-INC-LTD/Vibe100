@@ -230,8 +230,8 @@ void suite_pool() {
     topo.nodes[1].cpus = {4, 5, 6, 7};
     {
         const session::CpuPoolOptions o = session::plan_cpu_pool(topo, true, 0, {});
-        check(o.pin && o.cpus[0] == std::vector<int>({0, 1, 2, 3}) && o.cpus[1] == std::vector<int>({4, 5, 6, 7}) && o.threads_per_group == 4,
-              "plan: two NUMA nodes -> one pinned group per node, a worker per CPU", o.note);
+        check(o.pin && o.cpus[0] == std::vector<int>({0, 1, 2, 3}) && o.cpus[1] == std::vector<int>({4, 5, 6, 7}) && o.threads_per_group == 3,
+              "plan: two NUMA nodes -> one pinned group per node, a worker per CPU but one (that CPU stays free for the thread that drives the GPU)", o.note);
     }
     {
         const session::CpuPoolOptions o = session::plan_cpu_pool(topo, true, 3, {0, 1, 2, 3, 4, 5, 6, 7});

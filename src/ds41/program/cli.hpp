@@ -14,6 +14,7 @@
 //   --window N           feed the prompt in windows of N tokens (1..8; default 1: the oracle-equivalent path; the numbers do not depend on it)
 //   --temperature T --top-k K --seed S   sampling instead of greedy (T > 0)
 //   --no-cpu-pool        refuse routed experts outside the GPU cache instead of computing them on the CPU;  --arena-threads N  threads that copy the experts at load
+//   --cpu-isa auto|scalar|avx2|avx512   the CPU expert kernels (default auto: the best the CPU has);  --cpu-prefetch BYTES   their software prefetch distance (default 8192)
 //   --vram-mib N         pretend the device has N MiB (the memory plan; default: what the device says);  -q  quiet
 #pragma once
 
@@ -43,6 +44,8 @@ struct CliArgs {
     int stats = 0;                      // 0 off, 1 synchronised stage times, 2 asynchronous
     bool window_kv = true, compressed_kv = true, index = true;
     bool numa = true, cpu_pool = true, quiet = false;
+    std::string cpu_isa = "auto";
+    int cpu_prefetch = -1;
     double temperature = 0, vram_mib = 0;
     uint64_t seed = 1;
 };
@@ -50,7 +53,8 @@ struct CliArgs {
 inline const char* usage_text() {
     return "usage: %s --gguf FILE --tokens 1,2,3 [--max-new N] [--max-context N] [--n-slots N|-1] [--fill LIST] [--kv-quant on|off]\n"
            "       [--threads-per-socket N] [--numa auto|off] [--trace DIR] [--dump-logits FILE] [--stats] [--window N]\n"
-           "       [--temperature T] [--top-k K] [--seed S] [--no-cpu-pool] [--arena-threads N] [--vram-mib N] [-q]\n";
+           "       [--temperature T] [--top-k K] [--seed S] [--no-cpu-pool] [--arena-threads N] [--cpu-isa auto|scalar|avx2|avx512] [--cpu-prefetch BYTES]\n"
+           "       [--vram-mib N] [-q]\n";
 }
 
 inline bool parse_onoff(const std::string& v, bool& out) {
@@ -110,6 +114,9 @@ inline std::string parse_cli(int argc, char** argv, CliArgs& a) {
             else if (o == "--seed") { if (!need(v)) return o + " needs a value"; a.seed = std::stoull(v); }
             else if (o == "--no-cpu-pool") a.cpu_pool = false;
             else if (o == "--arena-threads") { if (!need(v)) return o + " needs a value"; a.arena_threads = std::stoi(v); }
+            else if (o == "--cpu-isa") {
+                if (!need(a.cpu_isa) || (a.cpu_isa != "auto" && a.cpu_isa != "scalar" && a.cpu_isa != "avx2" && a.cpu_isa != "avx512")) return "--cpu-isa takes auto, scalar, avx2 or avx512";
+            } else if (o == "--cpu-prefetch") { if (!need(v)) return o + " needs a value"; a.cpu_prefetch = std::stoi(v); }
             else if (o == "--vram-mib") { if (!need(v)) return o + " needs a value"; a.vram_mib = std::stod(v); }
             else if (o == "-q" || o == "--quiet") a.quiet = true;
             else return "unknown option " + o;
@@ -180,6 +187,11 @@ inline void print_stats(const session::SessionStats& s, double prefill_s, int pr
 template <class G, class DevT>
 int run_cli(DevT& dev, int argc, char** argv, const char* prog) {
     using Clock = std::chrono::steady_clock;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "-h" || std::string(argv[i]) == "--help") {
+            std::printf(usage_text(), prog);
+            return 0;
+        }
     CliArgs a;
     const std::string perr = parse_cli(argc, argv, a);
     if (!perr.empty()) {
@@ -218,6 +230,15 @@ int run_cli(DevT& dev, int argc, char** argv, const char* prog) {
         const platform::NumaTopology topo = platform::numa_discover();
         session::SessionOptions so;
         so.pool = session::plan_cpu_pool(topo, a.numa, a.threads_per_socket, platform::numa_allowed_cpus());
+        {
+            const cpu::Isa isa = a.cpu_isa == "scalar" ? cpu::Isa::kScalar : a.cpu_isa == "avx2" ? cpu::Isa::kAvx2 : a.cpu_isa == "avx512" ? cpu::Isa::kAvx512 : cpu::Isa::kAuto;
+            if (!cpu::isa_supported(isa)) {
+                std::fprintf(stderr, "%s: --cpu-isa %s is not supported by this CPU\n", prog, a.cpu_isa.c_str());
+                return 2;
+            }
+            so.pool.isa = isa;
+            if (a.cpu_prefetch >= 0) cpu::set_prefetch_bytes(a.cpu_prefetch);       // global, read at the start of every kernel call: set before the workers exist
+        }
         if (!a.quiet) std::fprintf(stderr, "ds41: %s\n", so.pool.note.c_str());
 
         if (!a.fill.empty()) {

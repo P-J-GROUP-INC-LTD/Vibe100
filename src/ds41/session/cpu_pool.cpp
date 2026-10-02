@@ -98,7 +98,7 @@ CpuPoolOptions plan_cpu_pool(const platform::NumaTopology& topo, bool numa, int 
     }
     int ncpu = (int) (ok.empty() ? std::max(1u, std::thread::hardware_concurrency()) : ok.size());
     if (threads_per_socket > 0) o.threads_per_group = threads_per_socket;
-    else if (bound) o.threads_per_group = (int) std::min(o.cpus[0].size(), o.cpus[1].size());
+    else if (bound) o.threads_per_group = std::max(1, (int) std::min(o.cpus[0].size(), o.cpus[1].size()) - 1);      // one CPU per node stays free: the thread that drives the GPU
     else o.threads_per_group = std::max(1, ncpu / 2);
     o.pin = bound;
     o.note = std::string("CPU expert pool: ") + (bound ? "one worker group per socket, pinned" : "two worker groups, not pinned") + " (" + an.note + "), " +
@@ -212,7 +212,7 @@ struct CpuExpertPool::Impl {
             } catch (...) {
                 failed.fetch_add(1);
             }
-            done.fetch_add(1, std::memory_order_release);
+            if (done.fetch_add(1, std::memory_order_acq_rel) + 1 == 2 * tpg) done.notify_one();       // the last worker wakes the thread that waits in wait()
         }
     }
 
@@ -318,9 +318,13 @@ int CpuExpertPool::wait(float* out) {
     if (!m.active) throw std::logic_error("CpuExpertPool::wait: no job");
     const int nworkers = 2 * m.tpg;
     if (m.n_miss > 0) {
-        for (unsigned spins = 0; m.done.load(std::memory_order_acquire) != nworkers; ++spins) {
-            if (spins < 1000) cpu_relax();
-            else std::this_thread::yield();
+        // spin briefly (a layer's CPU work is ~1 ms on the real model, a wake-up ~50 us), then BLOCK: this thread shares a CPU with a pinned worker when the pool uses every CPU of a
+        // node, and a spinning waiter would steal cycles from the one worker everyone then waits for at the barrier
+        for (unsigned spins = 0;; ++spins) {
+            const int cur = m.done.load(std::memory_order_acquire);
+            if (cur == nworkers) break;
+            if (spins < 2000) cpu_relax();
+            else m.done.wait(cur, std::memory_order_acquire);
         }
         if (m.failed.load() != 0) throw std::runtime_error("CpuExpertPool: a worker threw an exception");
         // the two sockets' partials, added once: h0 + h1
