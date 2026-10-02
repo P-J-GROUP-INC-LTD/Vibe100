@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #include "strata/ds41/cuda/ds41_dev.hpp"
 
@@ -18,6 +20,21 @@ inline void cuda_check(cudaError_t e, const char* what) {
         std::fprintf(stderr, "FAIL cuda: %s: %s\n", what, cudaGetErrorString(e));
         std::exit(2);
     }
+}
+
+/// An allocation that failed: thrown (not exit(2)) so the caller can say what it was allocating and stop cleanly.  The message carries the request and the
+/// device's free / total memory.
+inline std::string cuda_alloc_failure_text(const char* what, size_t bytes, cudaError_t e) {
+    size_t fr = 0, tot = 0;
+    const bool known = cudaMemGetInfo(&fr, &tot) == cudaSuccess;
+    (void) cudaGetLastError();                                 // the failed allocation's sticky-looking error must not poison the next call
+    char b[512];
+    if (known)
+        std::snprintf(b, sizeof b, "%s of %.1f MiB failed: %s (device: %.1f MiB free of %.1f MiB)", what, (double) bytes / 1048576.0, cudaGetErrorString(e), (double) fr / 1048576.0,
+                      (double) tot / 1048576.0);
+    else
+        std::snprintf(b, sizeof b, "%s of %.1f MiB failed: %s", what, (double) bytes / 1048576.0, cudaGetErrorString(e));
+    return b;
 }
 
 struct CudaDev : Dev {
@@ -31,15 +48,26 @@ struct CudaDev : Dev {
     ~CudaDev() override { cudaStreamDestroy(s); }
     void* alloc(size_t bytes) override {
         void* p = nullptr;
-        cuda_check(cudaMalloc(&p, bytes ? bytes : 16), "cudaMalloc");
+        const cudaError_t e = cudaMalloc(&p, bytes ? bytes : 16);
+        if (e != cudaSuccess) throw std::runtime_error("out of device memory: cudaMalloc " + cuda_alloc_failure_text("allocation", bytes, e));
         return p;
+    }
+    bool mem_info(size_t& free_bytes, size_t& total_bytes) override {
+        free_bytes = total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            free_bytes = total_bytes = 0;
+            return false;
+        }
+        return true;
     }
     void release(void* p) override { cudaFree(p); }
     // mapped pinned host memory: the host reads it while the kernels run.  Under UVA (64-bit Linux / Windows with WDDM2 or TCC) the host pointer
     // IS the device pointer; anything else cannot be used as a kernel argument here, so it is refused.
     void* alloc_mapped(size_t bytes) override {
         void* p = nullptr;
-        cuda_check(cudaHostAlloc(&p, bytes ? bytes : 16, cudaHostAllocMapped), "cudaHostAlloc(mapped)");
+        const cudaError_t e = cudaHostAlloc(&p, bytes ? bytes : 16, cudaHostAllocMapped);
+        if (e != cudaSuccess) throw std::runtime_error("cannot allocate mapped (pinned) host memory: " + cuda_alloc_failure_text("cudaHostAlloc", bytes, e));
         std::memset(p, 0, bytes ? bytes : 16);
         void* dp = nullptr;
         cuda_check(cudaHostGetDevicePointer(&dp, p, 0), "cudaHostGetDevicePointer");

@@ -27,6 +27,8 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace strata::ds41::cuda {
@@ -36,10 +38,18 @@ using Stream = void*;
 struct Dev {
     virtual ~Dev() = default;
     // ---- memory ----
-    virtual void* alloc(size_t bytes) = 0;                 // device memory, 256-byte aligned
+    /// Device memory, 256-byte aligned.  A failed allocation THROWS (DS1-E: std::runtime_error "... out of device memory ..."): a caller (the loader,
+    /// the engine) reports it and exits cleanly instead of the process dying inside the runtime.
+    virtual void* alloc(size_t bytes) = 0;
     virtual void release(void* p) = 0;
+    /// Device memory now: bytes free / total (a GPU: cudaMemGetInfo; HostDev: the host's MemAvailable / MemTotal, so a plan made against it is
+    /// meaningful in the emulator build too).  false (and zeros) when the device cannot say.
+    virtual bool mem_info(size_t& free_bytes, size_t& total_bytes) {
+        free_bytes = total_bytes = 0;
+        return false;
+    }
     /// Memory the HOST can read while the device runs (a GPU: mapped pinned memory, cudaHostAlloc(cudaHostAllocMapped); the same pointer is
-    /// valid in kernels under UVA; the emulation: plain memory).  Zero-filled.
+    /// valid in kernels under UVA; the emulation: plain memory).  Zero-filled.  A failed allocation throws, like alloc().
     virtual void* alloc_mapped(size_t bytes) = 0;
     virtual void release_mapped(void* p) = 0;
     // ---- copies ----
@@ -124,6 +134,7 @@ struct HostDev : Dev {
         if (bytes == 0) bytes = 16;
         const size_t body = (bytes + 255) & ~(size_t) 255;
         unsigned char* base = static_cast<unsigned char*>(std::aligned_alloc(256, body + 2 * kGuard));
+        if (!base) throw std::runtime_error("out of device memory (emulation): cannot allocate " + std::to_string(bytes) + " bytes of host memory");
         std::memset(base, 0xAB, body + 2 * kGuard);
         std::memset(base + kGuard, 0xCD, body);                        // fresh "device memory" is not zero
         live[base + kGuard] = bytes;
@@ -134,6 +145,7 @@ struct HostDev : Dev {
         if (bytes == 0) bytes = 16;
         const size_t body = (bytes + 255) & ~(size_t) 255;
         void* p = std::aligned_alloc(256, body);
+        if (!p) throw std::runtime_error("cannot allocate " + std::to_string(bytes) + " bytes of mapped host memory (emulation)");
         std::memset(p, 0, body);
         mapped[p] = body;
         return p;
@@ -170,6 +182,21 @@ struct HostDev : Dev {
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
     }
     bool is_emulation() const override { return true; }
+    /// MemAvailable / MemTotal of /proc/meminfo (Linux); false elsewhere.
+    bool mem_info(size_t& free_bytes, size_t& total_bytes) override {
+        free_bytes = total_bytes = 0;
+        std::FILE* f = std::fopen("/proc/meminfo", "r");
+        if (!f) return false;
+        char line[256];
+        unsigned long long kb = 0;
+        bool have_total = false, have_avail = false;
+        while (std::fgets(line, sizeof line, f)) {
+            if (std::sscanf(line, "MemTotal: %llu kB", &kb) == 1) { total_bytes = (size_t) kb * 1024; have_total = true; }
+            else if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) { free_bytes = (size_t) kb * 1024; have_avail = true; }
+        }
+        std::fclose(f);
+        return have_total && have_avail;
+    }
 };
 
 }  // namespace strata::ds41::cuda

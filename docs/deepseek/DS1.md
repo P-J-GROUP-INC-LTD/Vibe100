@@ -79,15 +79,21 @@ Integrator (cloud session): this file, `geom.hpp`, `geometry.hpp`, `CONTRACTS.md
 ## 6. The trace (what DS1-F compares)
 
 One directory per run: `trace.json` (geometry name, quant flags, token ids, positions) and one little-endian FP32 `.npy` per
-(stage, layer, position): `embed`, `engram_out.L`, `attn_in.L` (after hc_pre + norm), `q.L`, `kv_win.L`, `latent.L`, `topk.L` (int32),
-`attn_out.L`, `ffn_in.L`, `router_idx.L` (int32), `router_w.L`, `ffn_out.L`, `block_out.L`, `pre_mix.L`, `final_hidden`, `logits`.
+(stage, layer, position): `embed`, `engram_out.L`, `attn_in.L` (after hc_pre + norm), `q.L`, `kv_win.L`, `latent.L` (the
+compressed cache row), `index_k.L`, `topk.L` (int32),
+`attn_out.L`, `ffn_in.L`, `router_idx.L` (int32), `router_w.L`, `ffn_out.L`, `block_out.L`, `pre_mix.L`, `final_hidden`, `logits`;
+optional `latent_pre.L`, `index_scores.L`, `block_scores.L`, `attn_o.L`, `cand_blocks.L`. The exact file layout, the dtypes and the
+layer-by-layer replay protocol are DS1-F's: `docs/deepseek/DS1_VERIFY.md`.
 The oracle side writes the same names from `Model.forward(..., trace=)` (DS1-F adds what is missing through `trace_io.py` without changing
 the oracle's numerics). Tolerances per stage are DS1-F's to derive and document; bit-exact where both sides do the same integer math
 (router ids at non-near-ties, top-k positions at non-near-ties).
 
 ## 7. Gate DS-1
 
-On the mini model (here, emulated): every stage within its documented tolerance for 64 tokens; greedy continuations identical.
+On the mini model (here, emulated): every stage within its documented tolerance for 64 tokens (stage-isolated `layers` mode:
+the strict check); greedy continuations identical **up to the first numerical deviation** - with int8 activation quantisers two
+correct implementations diverge eventually (the oracle in float32 vs float64 diverges at token 41 of 64 on the mini model), so a token
+difference passes only at an oracle near-tie or at / after a reported onset (`DS1_VERIFY.md` §3.4).
 On the real model (the owner's box): layer-by-layer within tolerance for 32 tokens of a real prompt; top-1 ≥ 99 % over 500 tokens
 against the oracle; no NaN / inf; then the llama.cpp comparison (tier 2 of `tools/volta/logit_identity.sh`, with the owner's
 mx-llama.cpp as reference) as information.
@@ -139,3 +145,9 @@ the mini model; the real-model half of the gate needs the owner's box (runbook s
   with aligned LDG.128 + `prmt` (k % 256 == 0) or a bit-identical 16-bit path. NaN ranks above every number in argmax / top-k (the router
   treats NaN as -inf). V100 program `ds41_dense_parity [--bench]` (not in ctest): add to run_parity. Estimates at T = 1: wq_b ~80-88 % of
   900 GB/s, the head ~1.65 ms.
+- **DS1-F done** (1c1e5f3): trace format and tolerance model (`docs/deepseek/DS1_VERIFY.md`), `ds1_compare.py` (whole-run `trace` mode
+  with onset detection; stage-isolated `layers` mode = the strict check), `ds1_replay.py` (layer-by-layer on the real model from the
+  engine's dumps, ~80 min / 40 layers / 12 GB estimated), `ds1_noise.py`, `ds1_tokenizer.py` (identical to HF `tokenizers` on 86k fuzz
+  cases + 1.4M characters; chat template; run `ds1_tokenizer.py selfcheck --gguf SHARD1 --tokenizer-json tokenizer.json` once on the box),
+  `ds1_e2e.py` (mini fixture + checker, exit 0/1/2: ctest `SKIP_RETURN_CODE 2`). Quantiser flips are counted against budgets, not failed.
+  The real model's 500-token oracle run is ~a day on one process (2-3 min/token): the top-1 half of the gate is a long run.
