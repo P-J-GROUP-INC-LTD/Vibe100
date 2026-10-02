@@ -83,8 +83,9 @@ if(NOT WIN32)
     if(NOT MSVC)
       target_compile_options(ds41_session_real_smoke PRIVATE -fno-strict-aliasing -ffp-contract=off -Wno-clobbered)
     endif()
-    if(STRATA_BUILD_TESTS AND TARGET ds41_model_sparse_test)
-      # the fixture DS1-A's tests use (cmake/ds41_model.cmake): the sparse real shards are written by its setup test and removed by its cleanup test
+    if(STRATA_BUILD_TESTS)
+      # the fixture DS1-A's tests use (cmake/ds41_model.cmake, included after this file: no `if(TARGET ...)` here): the sparse real shards are written by its setup test and removed by its
+      # cleanup test; without the fixture (no python3) the program finds no real/ directory and exits 2 = skipped
       add_test(NAME ds41_session_real_smoke COMMAND ds41_session_real_smoke ${CMAKE_BINARY_DIR}/ds41_model_fixture)
       set_tests_properties(ds41_session_real_smoke PROPERTIES FIXTURES_REQUIRED ds41_model_fixture SKIP_RETURN_CODE 2 TIMEOUT 600 PASS_REGULAR_EXPRESSION "PASS: " FAIL_REGULAR_EXPRESSION "FAIL")
     endif()
