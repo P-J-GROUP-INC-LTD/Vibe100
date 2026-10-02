@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -179,7 +180,7 @@ void suite_pool_shape(const char* tag, const model::ExpertDims& dims, int n_laye
                     std::vector<float> got(std::max<size_t>(1, c.miss.size()) * (size_t) hidden, -1.0f);
                     pool.run(layer, actq.data(), c.T, c.miss.data(), (int) c.miss.size(), got.data());
                     const std::vector<float> want = reference_rows(fx, layer, actq, c.miss);
-                    if (std::memcmp(got.data(), want.data(), want.size() * sizeof(float)) != 0) {
+                    if (!want.empty() && std::memcmp(got.data(), want.data(), want.size() * sizeof(float)) != 0) {
                         all_ok = false;
                         bad += fmt(" [%s, layer %d, rep %d]", c.name, layer, rep);
                     }
@@ -216,9 +217,9 @@ void suite_pool_shape(const char* tag, const model::ExpertDims& dims, int n_laye
 
 void suite_pool() {
     // mini shape (hidden 256, ff 256: halves of 128) and a real-shaped expert (hidden 5120, ff 2304: halves of 1152, 36 chunks, 5120 down rows)
-    suite_pool_shape("mini shape", model::expert_dims<MiniGeom>(), 3, {1, 2, 3, 5});
+    suite_pool_shape("mini shape", model::expert_dims<MiniGeom>(), 3, {1, 2, 3, 5, 9});
     model::ExpertDims real{2, 8, RealGeom::kHidden, RealGeom::kFF};
-    suite_pool_shape("real shape", real, 2, {1, 3, 7});
+    suite_pool_shape("real shape", real, 2, {1, 3, 7, 23, 40});
 
     // the pool's layout from a topology: two nodes -> pinned groups, one node -> unpinned, off -> unpinned
     strata::platform::NumaTopology topo;
@@ -432,24 +433,61 @@ void suite_trace() {
     fs::remove_all(dir);
 }
 
+/// --bench: the pool on real-shaped experts (one layer's six distinct misses, T = 1): ms per layer job and the GB/s of expert weights it consumed.  Indicative only (this machine is
+/// not the box); the arena is 8 experts, so the weights come from DRAM after the first round only if the machine's caches are smaller than 150 MB.
+void bench_pool() {
+    model::ExpertDims real{1, 8, RealGeom::kHidden, RealGeom::kFF};
+    ArenaFixture fx(real, 3);
+    std::mt19937_64 rng(1);
+    std::vector<float> xf((size_t) real.hidden);
+    for (float& v : xf) v = (float) std::normal_distribution<double>(0, 1)(rng);
+    cpu::ActQ aq;
+    cpu::quantize_acts(xf.data(), real.hidden, 1, &aq);
+    std::vector<session::CpuMiss> miss;
+    for (int k = 0; k < 6; ++k) miss.push_back({0, k, k, 0.1f + 0.1f * (float) k});
+    std::vector<float> out(6 * (size_t) real.hidden);
+    const unsigned hw = std::thread::hardware_concurrency();
+    std::printf("CPU pool, real-shaped experts, 6 misses per layer job, %u hardware threads here:\n", hw);
+    for (int tpg : {1, 2, 3, 4, 8}) {
+        session::CpuPoolOptions po;
+        po.threads_per_group = tpg;
+        po.pin = false;
+        po.max_tokens = 1;
+        po.top_k = 6;
+        session::CpuExpertPool pool(fx.arena, po);
+        for (int w = 0; w < 3; ++w) pool.run(0, &aq, 1, miss.data(), 6, out.data());
+        const int reps = 30;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < reps; ++r) pool.run(0, &aq, 1, miss.data(), 6, out.data());
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
+        std::printf("  %2d workers per group (%2d total): %7.2f ms per layer job = %6.2f ms per expert, %6.2f GB/s of expert weights\n", tpg, 2 * tpg, s * 1e3, s * 1e3 / 6.0,
+                    6.0 * (double) real.blob_bytes() / s / 1e9);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool pool = false, combine = false, trace = false;
+    bool pool = false, combine = false, trace = false, bench = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--pool") pool = true;
         else if (a == "--combine") combine = true;
         else if (a == "--trace") trace = true;
+        else if (a == "--bench") bench = true;
         else if (a == "--order" && i + 1 < argc) {
             if (!ds41_emu::set_order_from_string(argv[++i])) {
                 std::fprintf(stderr, "bad --order\n");
                 return 2;
             }
         } else {
-            std::fprintf(stderr, "usage: %s [--pool] [--combine] [--trace]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s [--pool] [--combine] [--trace] [--bench]\n", argv[0]);
             return 2;
         }
+    }
+    if (bench) {
+        bench_pool();
+        return 0;
     }
     if (!pool && !combine && !trace) pool = combine = trace = true;
     if (pool) suite_pool();

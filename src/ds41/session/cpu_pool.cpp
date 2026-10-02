@@ -216,26 +216,39 @@ struct CpuExpertPool::Impl {
         }
     }
 
+    /// The work of a phase is `per_group` units for each of the n_groups experts, cut into `tpg` contiguous parts of the FLATTENED list (group-major): worker i gets the units
+    /// [i * total / tpg, (i + 1) * total / tpg), as at most one range per group.  A worker's share is balanced to one unit however the units divide (36 chunks over 23 workers
+    /// would leave some with 1 and some with 2; 216 chunks of six experts over 23 give 9 or 10), and which worker computes a unit cannot change the unit's bits.
+    template <class Fn> void for_my_units(int per_group, int i, Fn&& fn) const {
+        const long long total = (long long) per_group * n_groups;
+        const long long f0 = total * i / tpg, f1 = total * (i + 1) / tpg;
+        for (int g = 0; g < n_groups; ++g) {
+            const long long base = (long long) g * per_group;
+            const long long lo = std::max(f0, base) - base, hi = std::min(f1, base + per_group) - base;
+            if (hi > lo) fn(g, (int) lo, (int) hi);
+        }
+    }
+
+    static constexpr int kRowUnit = 16;                                  // output rows per phase-2 unit: one 64-byte line of y
+
     void run_job(int h, int i) {
         HalfState& hs = half[h];
-        int c0, c1, r0, r1;
-        // phase 1: the chunks of the half's intermediate rows of this worker; also zero this worker's output rows of every group (phase 2 ADDS into them)
-        for (int g = 0; g < n_groups; ++g) {
+        // phase 1: the 32-row chunks of the half's intermediate (gate / up rows, SwiGLU, the int8 image of h) of this worker's share
+        const int chunks = half_ff / cpu::kChunkRows;
+        for_my_units(chunks, i, [&](int g, int c0, int c1) {
             const Group& gr = groups[(size_t) g];
-            const cpu::ExpertView v = view(h, gr.expert);
-            cpu::split_range(v.chunks(), tpg, i, 1, c0, c1);
-            cpu::split_range(hidden, tpg, i, 16, r0, r1);
-            for (int j = 0; j < gr.count; ++j)
-                if (r1 > r0) std::memset(hs.y.get() + (size_t) (gr.pos + j) * hidden + r0, 0, (size_t) (r1 - r0) * sizeof(float));
-            cpu::expert_gate_up(isa, v, gr.x, gr.count, gr.w, hs.scratch[(size_t) g], c0, c1);
-        }
+            cpu::expert_gate_up(isa, view(h, gr.expert), gr.x, gr.count, gr.w, hs.scratch[(size_t) g], c0, c1);
+        });
         hs.barrier.arrive_and_wait();                                   // every chunk of h of every group is needed by every down row
-        // phase 2: this worker's rows of every group's y (static row ownership)
-        cpu::split_range(hidden, tpg, i, 16, r0, r1);
-        for (int g = 0; g < n_groups; ++g) {
+        // phase 2: this worker's 16-row units of every group's y.  Each unit is zeroed and then ADDED to by the same worker (static ownership: no other thread, and not the other
+        // socket, ever touches these elements), so no zeroing pass and no cross-thread hand-off is needed
+        const int units = (hidden + kRowUnit - 1) / kRowUnit;
+        for_my_units(units, i, [&](int g, int u0, int u1) {
             const Group& gr = groups[(size_t) g];
+            const int r0 = u0 * kRowUnit, r1 = std::min(hidden, u1 * kRowUnit);
+            for (int j = 0; j < gr.count; ++j) std::memset(hs.y.get() + (size_t) (gr.pos + j) * hidden + r0, 0, (size_t) (r1 - r0) * sizeof(float));
             cpu::expert_down(isa, view(h, gr.expert), hs.scratch[(size_t) g], gr.count, hs.y.get() + (size_t) gr.pos * hidden, r0, r1);
-        }
+        });
     }
 };
 

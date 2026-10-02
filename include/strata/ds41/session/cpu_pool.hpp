@@ -14,9 +14,11 @@
 //   * A LAYER'S MISSES ARE ONE JOB.  The pool groups the misses by expert (a verify window can send several tokens to one expert: the group then reads the half's weights
 //     once for all of them, DS-C's T-token path), gives each group its own ExpertScratch and its own y rows, and runs  PHASE 1 of every group, ONE BARRIER inside the socket,
 //     PHASE 2 of every group.  Phase 1 and phase 2 of different experts never touch the same memory, so no per-expert barrier is needed.
-//   * ONE y PER SOCKET, STATIC ROW OWNERSHIP, NO ATOMICS.  Socket h writes its own partial `y_h` (an FP32 [n_groups-rows][hidden] buffer allocated and first-touched by the
-//     socket's own workers, i.e. in its node's memory); within the socket worker i owns the same output rows [r0, r1) in phase 2 for every group (and zeroes them before
-//     phase 1), so two threads never write one element and the reduction order of every element is fixed.  The two sockets never write one buffer.
+//   * ONE y PER SOCKET, STATIC ROW OWNERSHIP, NO ATOMICS.  Socket h writes its own partial `y_h` (an FP32 [rows][hidden] buffer written, hence first-touched, by the socket's own
+//     workers, i.e. in its node's memory).  Both phases cut their units - 32-row chunks of the intermediate in phase 1, 16-row units of the 5120 output rows in phase 2 - into
+//     one contiguous part of the FLATTENED (expert, unit) list per worker, so every worker has the same number of units to within one whatever the shapes divide into (36 chunks
+//     over 23 workers would not).  A phase-2 unit is zeroed and then added to by the SAME worker, and nobody else, in this socket or the other, touches those elements: no thread
+//     ever writes an element another thread writes, and the reduction order of every element is fixed.  The two sockets never write one buffer.
 //   * THE TWO PARTIALS ARE ADDED ON THE HOST, once per layer, after BOTH sockets are finished: rows[i] = y_0[row i] + y_1[row i] (FP32, h0 + h1 in that order) into the
 //     caller's buffer (a pinned host buffer that is uploaded to the GPU next: one h2d per layer, not two).
 //   * JOBS ARE ASYNCHRONOUS: `start()` hands the layer to the workers and returns, `wait()` joins and adds the partials, so the caller can enqueue the GPU's hits and the
@@ -46,7 +48,7 @@ struct CpuMiss {
 };
 
 struct CpuPoolOptions {
-    int threads_per_group = 0;               ///< workers per half-group (0: the group's CPU count; unpinned two-group fallback: half the CPUs, at least one)
+    int threads_per_group = 0;               ///< workers per half-group (plan_cpu_pool's default: the node's CPUs minus one - that CPU stays free for the thread that drives the GPU; unpinned two-group fallback: half the CPUs, at least one)
     bool pin = true;                         ///< pin each worker to one CPU of its group's list (when the list is non-empty)
     std::vector<int> cpus[2];                ///< the CPUs of half 0's and half 1's node (empty: unpinned)
     cpu::Isa isa = cpu::Isa::kAuto;
